@@ -1,0 +1,22 @@
+[package]
+name = "gitwtree"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Policy-based git worktree management: declare the branch structure, and everything outside it is refused"
+license = "MIT"
+readme = "README.md"
+keywords = ["git", "worktree", "branch", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+# The crate name is taken on crates.io; the command is not, and the command is
+# what gets typed. Both targets are spelled `wtree` so `cargo install gitwtree` puts
+# `wtree` on PATH and `use wtree::...` keeps working in the tests.
+[lib]
+name = "wtree"
+
+[[bin]]
+name = "wtree"
+path = "src/main.rs"
+
+[dependencies]

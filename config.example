@@ -1,0 +1,18 @@
+# Example policy config — the DESIGN.md sketch.
+
+[main]
+children = dev, group:hotfix        # bare name = declared fixed branch; created here, merges back only here
+destroyable = false                 # init template default
+merge-mode = squash                 # merges into main must be squash
+
+[dev]
+children = group:work
+merge-mode = squash
+
+[group:hotfix]
+name-allow = hotfix/*               # not strictly needed (no sibling candidate on main), kept as convention
+
+[group:work]
+name-allow = feat/*, fix/*, refactor/*   # dev/* would collide with [dev] at the git ref level
+ephemeral = true                    # local-only — collected leaf-first with a clean parent destroy
+copy = .env, .env.local             # taken from the parent's worktree; a directory needs a trailing /
