@@ -321,6 +321,21 @@ impl World {
 /// Gather the world as seen from `cwd`. `cfg` is needed only to derive the
 /// parent of fixed branches for the `unreflected` fact.
 pub fn gather(cwd: &Path, cfg: &Rules) -> Result<World, String> {
+    gather_with(cwd, cfg, true)
+}
+
+/// `gather` without the reflected-in-parent probe: every `unreflected` comes
+/// back `false`. The probe walks up to a merge-tree simulation per worktree to
+/// answer "would destroying this lose work", which only `destroy` and `land`
+/// ask; a verb that only displays pays for an answer it never reads.
+///
+/// A caller that judges work loss must use `gather` — reading `unreflected`
+/// off a light gather would read "nothing to lose" for every worktree.
+pub fn gather_light(cwd: &Path, cfg: &Rules) -> Result<World, String> {
+    gather_with(cwd, cfg, false)
+}
+
+fn gather_with(cwd: &Path, cfg: &Rules, reflection: bool) -> Result<World, String> {
     let repo = Repo::discover(cwd)?;
     let branches = repo.branches()?;
     let toplevel_raw = PathBuf::from(run_git(cwd, &["rev-parse", "--show-toplevel"])?.trim());
@@ -345,7 +360,7 @@ pub fn gather(cwd: &Path, cfg: &Rules) -> Result<World, String> {
         let dirty = is_dirty(&path)?;
         let parent = derived_parent_for_facts(cfg, &state, head.as_deref());
         let unreflected = match (&parent, &head) {
-            (Some(p), Some(h)) if branches.contains(p) => {
+            (Some(p), Some(h)) if reflection && branches.contains(p) => {
                 repo.has_unreflected_commits(p, h).unwrap_or(false)
             }
             _ => false,

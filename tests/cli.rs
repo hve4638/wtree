@@ -933,53 +933,151 @@ fn list_shows_identities_unknowns_and_bare_branches() {
     );
     assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
     fx.git(&fx.repo, &["branch", "dev", "main"]); // declared fixed, no worktree
+    fx.git(&fx.repo, &["branch", "loose", "main"]); // neither declared nor recorded
     fx.add_worktree("junk", "main"); // raw worktree, unmanaged
     let o = run_wt(&fx.repo, &["list"]);
     assert_ok(&o);
     let stdout = out(&o);
-    assert!(stdout.contains("worktrees:"), "{stdout}");
-    assert!(stdout.contains("* repo  main  fixed  root"), "{stdout}");
+    // Parentage is position in the tree now, not a `parent: X` column. Piped
+    // output uses the ASCII glyphs.
+    assert!(stdout.contains("@ main         fixed  repo"), "{stdout}");
+    assert!(stdout.contains("`-+ feature/a  group:feat"), "{stdout}");
+    assert!(stdout.contains("|-. dev        fixed"), "declared, no worktree:\n{stdout}");
+    // An unmanaged worktree has no identity, so no parent, so no place in the
+    // tree — it is listed apart with the reason it cannot be judged.
+    assert!(stdout.contains("unmanaged:"), "{stdout}");
+    assert!(stdout.contains("wtree-junk  junk  UNKNOWN"), "{stdout}");
+
+    // Each stray carries its own recovery line, and they differ: `adopt` acts
+    // on the worktree one stands in, so the branch that has none must be told
+    // to open one first. Scoped per row — a whole-stdout `contains` would let
+    // either row answer for both.
+    let reasons_under = |head: &str| -> Vec<&str> {
+        stdout
+            .lines()
+            .skip_while(|l| !l.contains(head))
+            .skip(1)
+            .take_while(|l| l.trim_start().starts_with('!'))
+            .collect()
+    };
+    let junk = reasons_under("wtree-junk  junk  UNKNOWN");
     assert!(
-        stdout.contains("feature/a  group:feat  parent: main"),
-        "{stdout}"
+        junk.iter().any(|l| l.contains("recover with: wtree adopt")),
+        "the worktree stray adopts in place: {junk:?}\n{stdout}"
     );
-    assert!(stdout.contains("junk  UNKNOWN"), "{stdout}");
-    assert!(stdout.contains("wtree adopt"), "{stdout}");
-    assert!(stdout.contains("branches without worktrees:"), "{stdout}");
-    assert!(stdout.contains("dev  fixed  parent: main"), "{stdout}");
+    let loose = reasons_under("  loose  UNKNOWN");
+    assert!(
+        loose
+            .iter()
+            .any(|l| l.contains("wtree open loose, then wtree adopt there")),
+        "the branch stray has no worktree to adopt yet: {loose:?}\n{stdout}"
+    );
 }
 
-/// The count is what tells a worktree it is due for `sync`; nothing else on
-/// screen says so. A root branch has no parent to fall behind, and a worktree
-/// level with its parent stays quiet.
+/// Depth comes from recorded parents, so a grandchild has to indent under its
+/// own parent and the run of `|` has to survive the level between them.
 #[test]
-fn list_counts_the_commits_a_worktree_is_behind_its_parent() {
+fn list_indents_a_grandchild_under_its_own_parent() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = dev, group:feat\n\n[dev]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n",
+    );
+    fx.add_worktree("dev", "main");
+    member(&fx, "feature/a", "feat", "dev");
+    member(&fx, "feature/b", "feat", "main");
+
+    let stdout = out(&run_wt(&fx.repo, &["list"]));
+    let l: Vec<&str> = stdout.lines().collect();
+    assert_eq!(l.len(), 4, "one row per branch, no section headers:\n{stdout}");
+    assert!(l[0].starts_with("@ main"), "{stdout}");
+    assert!(l[1].starts_with("|-+ dev"), "{stdout}");
+    // the leading `|` is main's line continuing past dev down to feature/b
+    assert!(l[2].starts_with("| `-+ feature/a"), "{stdout}");
+    assert!(l[3].starts_with("`-+ feature/b"), "{stdout}");
+}
+
+/// A recorded parent can name a branch that no longer exists. Dropping the
+/// child would hide a worktree that is really there, so it is shown at the root
+/// instead — the tree never loses a branch it was handed.
+#[test]
+fn list_keeps_a_branch_whose_recorded_parent_is_gone() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let wt = fx.add_worktree("feature/a", "main");
+    fx.write_state(&wt, "feature/a", "group:feat", "ghost");
+
+    let stdout = out(&run_wt(&fx.repo, &["list"]));
+    assert!(
+        stdout.lines().any(|l| l.starts_with("+ feature/a")),
+        "shown at the root, not swallowed:\n{stdout}"
+    );
+    assert!(stdout.contains("@ main"), "{stdout}");
+}
+
+/// The counts are what say `sync` or `merge` is due; nothing else on screen
+/// does. Both directions are read off one walk, a root branch has no parent to
+/// diverge from, and a worktree level with its parent stays quiet. Piped
+/// output spells the arrows `^`/`v`.
+#[test]
+fn list_counts_divergence_from_the_parent_in_both_directions() {
     let fx = Fixture::new();
     write_rules(
         &fx,
         "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n",
     );
     assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
+    let wt = default_dest(&fx, "feature/a");
 
     let level = out(&run_wt(&fx.repo, &["list"]));
     assert!(
-        !level.contains("[behind"),
-        "just created, nothing behind:\n{level}"
+        level.contains("`-+ feature/a  group:feat  feature-a\n"),
+        "just created, level with main, so no counts at all:\n{level}"
     );
 
     commit_other(&fx, &fx.repo, "one.txt", "one");
     commit_other(&fx, &fx.repo, "two.txt", "two");
+    let behind = out(&run_wt(&fx.repo, &["list"]));
+    assert!(
+        behind.contains("`-+ feature/a  group:feat  feature-a  v2"),
+        "{behind}"
+    );
+
+    fx.commit(&wt, "work of its own");
+    let both = out(&run_wt(&fx.repo, &["list"]));
+    assert!(
+        both.contains("`-+ feature/a  group:feat  feature-a  ^1 v2"),
+        "ahead is listed before behind:\n{both}"
+    );
+    assert!(
+        both.lines()
+            .any(|l| l.contains("@ main") && !l.contains("^") && !l.contains("v2")),
+        "main is the root — it has no parent to diverge from:\n{both}"
+    );
+}
+
+/// `list` never asks whether work would be lost, so it must not pay for the
+/// answer. The probe behind `[unreflected]` runs a merge-tree simulation per
+/// worktree; `destroy` is where that question is asked and answered.
+#[test]
+fn list_does_not_run_the_work_loss_probe() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "unmerged work");
 
     let stdout = out(&run_wt(&fx.repo, &["list"]));
     assert!(
-        stdout.contains("feature/a  group:feat  parent: main [behind 2]"),
-        "{stdout}"
+        !stdout.contains("unreflected"),
+        "the fact is not gathered, so it cannot be shown:\n{stdout}"
     );
+    // The same branch, asked the same question by the verb that needs it.
+    let o = run_wt(&wt, &["destroy"]);
+    assert_fail(&o);
     assert!(
-        stdout
-            .lines()
-            .any(|l| l.contains("* repo  main") && !l.contains("[behind")),
-        "main is the root — it has no parent to fall behind:\n{stdout}"
+        err(&o).contains("commits not reflected in parent"),
+        "destroy still gathers it:\n{}",
+        err(&o)
     );
 }
 

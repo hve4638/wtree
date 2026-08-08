@@ -5,7 +5,7 @@
 //! files, executes approved plans (git commands, state records, hooks) and
 //! renders output.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -973,102 +973,308 @@ fn run_post_create(common: &Path, wt: &Path, branch: &str, parent: &str, repo_ro
 
 // ------------------------------------------------------------------ list ----
 
-/// Commits the parent has that `branch` does not — the signal that `sync` is
-/// due. Display only: judgment needs the `unreflected` boolean, not a count, so
-/// this stays out of `repo::gather` where every verb would pay for it.
-/// `None` when the count cannot be taken, which is the case for a fixed branch
+/// Commits each of `branch` and `parent` holds that the other does not — the
+/// signal that `merge` or `sync` is due. One `--left-right` walk answers both
+/// directions, so a row costs one process rather than two.
+///
+/// Display only, and deliberately a different question from the one
+/// `Repo::has_unreflected_commits` answers: this counts commits by ancestry,
+/// that judges whether the content is already in the parent. A branch can be
+/// several commits ahead with nothing left to lose. `destroy` is what needs
+/// the second answer, and it gathers the fact for itself.
+///
+/// `None` when the walk cannot be taken, which is the case for a fixed branch
 /// whose rules-derived parent has not been created yet.
-fn behind_count(dir: &Path, branch: &str, parent: &str) -> Option<u32> {
-    let range = format!("{branch}..{parent}");
-    repo::run_git(dir, &["rev-list", "--count", &range])
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+fn divergence(dir: &Path, branch: &str, parent: &str) -> Option<(u32, u32)> {
+    let range = format!("{parent}...{branch}");
+    let out = repo::run_git(dir, &["rev-list", "--left-right", "--count", &range]).ok()?;
+    let mut counts = out.split_whitespace();
+    // `--left-right` orders the pair by the range: left of `...` first.
+    let behind = counts.next()?.parse().ok()?;
+    let ahead = counts.next()?.parse().ok()?;
+    Some((ahead, behind))
+}
+
+/// `  ↑3 ↓1` for a branch three commits past its parent and one behind it.
+/// Empty when the two are level, so a settled tree carries no noise.
+fn divergence_text(g: &Glyphs, d: Option<(u32, u32)>) -> String {
+    let Some((ahead, behind)) = d else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if ahead > 0 {
+        parts.push(format!("{}{ahead}", g.ahead));
+    }
+    if behind > 0 {
+        parts.push(format!("{}{behind}", g.behind));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", parts.join(" "))
+    }
+}
+
+/// Tree glyphs: box-drawing on a TTY, ASCII through a pipe so redirected output
+/// stays greppable. `mid`/`last` must share a display width with `bar`/`gap`,
+/// or every level of descent shifts the subtree by the difference.
+struct Glyphs {
+    mid: &'static str,
+    last: &'static str,
+    bar: &'static str,
+    gap: &'static str,
+    /// Marker for a branch that has no worktree.
+    bare: &'static str,
+    /// Commits this branch holds that its parent does not, and the reverse.
+    ahead: &'static str,
+    behind: &'static str,
+}
+
+const TREE_PRETTY: Glyphs = Glyphs {
+    mid: "├─",
+    last: "└─",
+    bar: "│ ",
+    gap: "  ",
+    bare: "·",
+    ahead: "↑",
+    behind: "↓",
+};
+const TREE_PLAIN: Glyphs = Glyphs {
+    mid: "|-",
+    last: "`-",
+    bar: "| ",
+    gap: "  ",
+    bare: ".",
+    ahead: "^",
+    behind: "v",
+};
+
+/// Terminal columns `s` occupies. Branch names and worktree directory names can
+/// hold CJK, which is two columns wide; sizing the branch column by `chars()`
+/// would leave everything right of such a name a column short per wide char.
+fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c as u32 {
+            0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF
+            | 0x20000..=0x3FFFD => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// One branch of the tree. Parentage is resolved by name in a second pass, so
+/// the node itself only carries what gets printed.
+struct Node {
+    branch: String,
+    /// Declared fixed branches sort above the group/free churn beneath them.
+    fixed: bool,
+    /// `@` current worktree, `+` some other worktree, `Glyphs::bare` for none.
+    mark: &'static str,
+    /// Everything printed to the right of the branch name.
+    tail: String,
+    kids: Vec<usize>,
+}
+
+/// A worktree or branch with no identity, and so no parent to hang it from.
+struct Stray {
+    head: String,
+    tail: String,
+    reasons: Vec<String>,
+}
+
+/// Recovery line for a branch that no worktree claims and no `[branch]`
+/// declares. The judge's own adopt hint cannot stand in here: it is written for
+/// a worktree being judged, where `adopt` acts on the checkout one is standing
+/// in. This branch has none, so a worktree has to be opened before there is
+/// anything to adopt — the same shape `unmanaged_parent` uses when the branch
+/// it names is somewhere other than here.
+fn unadopted_branch(branch: &str, reasons: &[String]) -> Vec<String> {
+    let mut rs = reasons.to_vec();
+    rs.push(format!(
+        "manage it with: wtree open {branch}, then wtree adopt there"
+    ));
+    rs
 }
 
 pub fn list(cwd: &Path) -> CmdResult {
     let repo = Repo::discover(cwd)?;
     let cfg = load_rules(&repo)?;
-    let world = repo::gather(cwd, &cfg)?;
+    // Light: nothing here judges work loss, and the reflected-in-parent probe
+    // is the most expensive fact gather takes. `↑`/`↓` answer the neighbouring
+    // question — how far apart — from a single ancestry walk per row.
+    let world = repo::gather_light(cwd, &cfg)?;
     let ctx = Ctx {
         world: &world,
         cfg: &cfg,
         label: RULES_LABEL,
     };
+    let g = if io::stdout().is_terminal() { &TREE_PRETTY } else { &TREE_PLAIN };
 
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    println!("worktrees:");
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut parent_of: Vec<Option<String>> = Vec::new();
+    let mut by_branch: BTreeMap<String, usize> = BTreeMap::new();
+    let mut strays: Vec<Stray> = Vec::new();
+    // Every branch a worktree has checked out, judged or not. A worktree that
+    // came out unmanaged still owns its branch, so the branch pass must not
+    // list it a second time.
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+
+    // Worktrees first: a worktree's record outranks a declaration (the
+    // grandfather rule `branch_identity` encodes), so the branches they claim
+    // are the ones the branch pass below skips.
     for (i, wt) in world.facts.iter().enumerate() {
-        let marker = if i == world.current { '*' } else { ' ' };
-        let name = wt
+        if let Some(h) = &wt.head {
+            claimed.insert(h.clone());
+        }
+        let dir = wt
             .path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| wt.path.display().to_string());
-        let head = wt.head.clone().unwrap_or_else(|| "(detached)".into());
-        if let Some(h) = &wt.head {
-            seen.insert(h.clone());
-        }
         let mut flags = String::new();
         if wt.dirty {
             flags.push_str(" [dirty]");
         }
-        if wt.unreflected {
-            flags.push_str(" [unreflected]");
-        }
         let id = ctx.identity_of(wt);
-        match &id {
-            Identity::Unknown { reasons } => {
-                println!("{marker} {name}  {head}  UNKNOWN{flags}");
-                for r in reasons {
-                    println!("      ! {r}");
-                }
+        if let Identity::Unknown { reasons } = &id {
+            let head = wt.head.clone().unwrap_or_else(|| "(detached)".into());
+            strays.push(Stray {
+                head: format!("{dir}  {head}"),
+                tail: format!("UNKNOWN{flags}"),
+                reasons: reasons.clone(),
+            });
+            continue;
+        }
+        let branch = id.branch().expect("a judged identity names its branch").to_string();
+        let (parent, div) = match ctx.parent_of(&id) {
+            Some((p, _)) => {
+                let d = divergence_text(g, divergence(&repo.common_dir, &branch, &p));
+                (Some(p), d)
             }
-            _ => {
-                let ident = describe_identity(&ctx, &id);
-                let (parent, behind) = match ctx.parent_of(&id) {
-                    Some((p, _)) => {
-                        let n = wt
-                            .head
-                            .as_deref()
-                            .and_then(|h| behind_count(&repo.common_dir, h, &p))
-                            .filter(|n| *n > 0)
-                            .map(|n| format!(" [behind {n}]"))
-                            .unwrap_or_default();
-                        (format!("parent: {p}"), n)
-                    }
-                    None => ("root".to_string(), String::new()),
-                };
-                println!("{marker} {name}  {head}  {ident}  {parent}{flags}{behind}");
-            }
+            None => (None, String::new()),
+        };
+        by_branch.insert(branch.clone(), nodes.len());
+        parent_of.push(parent);
+        nodes.push(Node {
+            branch,
+            fixed: matches!(id, Identity::Fixed { .. }),
+            mark: if i == world.current { "@" } else { "+" },
+            tail: format!("{}  {dir}{div}{flags}", describe_identity(&ctx, &id)),
+            kids: Vec::new(),
+        });
+    }
+
+    for b in &world.branches {
+        if claimed.contains(b) {
+            continue;
+        }
+        let id = ctx.branch_identity(b);
+        if let Identity::Unknown { reasons } = &id {
+            strays.push(Stray {
+                head: b.clone(),
+                tail: "UNKNOWN".to_string(),
+                reasons: unadopted_branch(b, reasons),
+            });
+            continue;
+        }
+        let parent = ctx.parent_of(&id).map(|(p, _)| p);
+        // A branch with no worktree still has a parent to be measured against,
+        // and being the one nobody has opened is exactly when how far it has
+        // drifted is worth knowing.
+        let div = parent
+            .as_deref()
+            .map(|p| divergence_text(g, divergence(&repo.common_dir, b, p)))
+            .unwrap_or_default();
+        by_branch.insert(b.clone(), nodes.len());
+        parent_of.push(parent);
+        nodes.push(Node {
+            branch: b.clone(),
+            fixed: matches!(id, Identity::Fixed { .. }),
+            mark: g.bare,
+            tail: format!("{}{div}", describe_identity(&ctx, &id)),
+            kids: Vec::new(),
+        });
+    }
+
+    // A node whose recorded parent is absent — or is itself — becomes a root
+    // rather than vanishing: the tree shows every branch it was given.
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, parent) in parent_of.iter().enumerate() {
+        match parent.as_ref().and_then(|p| by_branch.get(p)) {
+            Some(&p) if p != i => nodes[p].kids.push(i),
+            _ => roots.push(i),
+        }
+    }
+    let key = |n: &Node| (!n.fixed, n.branch.clone());
+    roots.sort_by_key(|&i| key(&nodes[i]));
+    for i in 0..nodes.len() {
+        let mut kids = std::mem::take(&mut nodes[i].kids);
+        kids.sort_by_key(|&j| key(&nodes[j]));
+        nodes[i].kids = kids;
+    }
+
+    // Flatten depth-first into (gutter, node) so the branch column can be
+    // measured in one pass and padded in the next — the gutter's width varies
+    // by depth, so the two cannot be done together.
+    let mut rows: Vec<(String, usize)> = Vec::new();
+    let mut seen = vec![false; nodes.len()];
+    let mut stack: Vec<(usize, String, String)> = roots
+        .iter()
+        .rev()
+        .map(|&r| (r, String::new(), String::new()))
+        .collect();
+    while let Some((i, gutter, prefix)) = stack.pop() {
+        if seen[i] {
+            continue;
+        }
+        seen[i] = true;
+        rows.push((gutter, i));
+        for (n, &k) in nodes[i].kids.iter().enumerate().rev() {
+            let last = n == nodes[i].kids.len() - 1;
+            stack.push((
+                k,
+                format!("{prefix}{}", if last { g.last } else { g.mid }),
+                format!("{prefix}{}", if last { g.gap } else { g.bar }),
+            ));
+        }
+    }
+    // Recorded parents that form a cycle leave their nodes unreachable from any
+    // root. Print them flat rather than drop them.
+    for (i, visited) in seen.iter().enumerate() {
+        if !visited {
+            rows.push((String::new(), i));
         }
     }
 
-    let rest: Vec<&String> = world
-        .branches
-        .iter()
-        .filter(|b| !seen.contains(*b))
-        .collect();
-    if !rest.is_empty() {
-        println!("branches without worktrees:");
-        for b in rest {
-            let id = ctx.branch_identity(b);
-            match &id {
-                Identity::Unknown { .. } => {
-                    println!("  {b}  UNKNOWN");
-                    println!(
-                        "      ! no worktree and no [branch] declaration — to manage it, create a worktree for it, then run: wtree adopt"
-                    );
-                }
-                _ => {
-                    let ident = describe_identity(&ctx, &id);
-                    let parent = match ctx.parent_of(&id) {
-                        Some((p, _)) => format!("parent: {p}"),
-                        None => "root".to_string(),
-                    };
-                    println!("  {b}  {ident}  {parent}");
-                }
+    let head_of = |(gutter, i): &(String, usize)| {
+        let n: &Node = &nodes[*i];
+        format!("{gutter}{} {}", n.mark, n.branch)
+    };
+    let width = rows.iter().map(|r| display_width(&head_of(r))).max().unwrap_or(0);
+    for r in &rows {
+        let head = head_of(r);
+        let pad = " ".repeat(width - display_width(&head));
+        println!("{}", format!("{head}{pad}  {}", nodes[r.1].tail).trim_end());
+    }
+
+    if !strays.is_empty() {
+        println!("\nunmanaged:");
+        for s in &strays {
+            println!("  {}  {}", s.head, s.tail);
+            for r in &s.reasons {
+                println!("      ! {r}");
             }
         }
     }
