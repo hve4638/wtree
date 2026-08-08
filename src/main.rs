@@ -40,6 +40,13 @@ fn main() -> ExitCode {
     // `rest` rather than `args[1..]`, which panics on the bare invocation.
     let verb = args.first().map(String::as_str).unwrap_or("help");
     let rest: &[String] = args.get(1..).unwrap_or(&[]);
+    // `--help` outranks everything else on the line, wherever it sits. Asking a
+    // verb what it does and having it do the thing instead is the one answer
+    // that cannot be taken back, and no verb here wants `--help` as a value.
+    if args.iter().any(|a| a == "--help") {
+        help_for(verb);
+        return ExitCode::SUCCESS;
+    }
     let result = match verb {
         "help" => {
             if rest.iter().any(|a| a == "--all") {
@@ -428,44 +435,78 @@ fn parse_save_args(rest: &[String]) -> Result<(Option<PathBuf>, bool), String> {
     Ok((dest, force))
 }
 
+/// Every verb, in the order the manual prints them. `--help` for a single verb
+/// reads one row out of the same table, so the two can never disagree.
+const ROWS: &[(&str, &str, &str)] = &[
+    ("new", NEW_USAGE, "create a branch and its worktree"),
+    ("open", OPEN_USAGE, "give an existing branch a worktree"),
+    ("close", CLOSE_USAGE, "remove a worktree, keep the branch"),
+    (
+        "merge",
+        "usage: wtree merge [--squash|--rebase|--no-ff|--ff] [-m <msg>]",
+        "merge into the parent",
+    ),
+    (
+        "sync",
+        "usage: wtree sync",
+        "merge the parent into this branch",
+    ),
+    (
+        "land",
+        "usage: wtree land [--squash|--rebase|--no-ff|--ff] [-m <msg>]",
+        "merge, then destroy",
+    ),
+    ("destroy", DESTROY_USAGE, "delete a branch and its worktree"),
+    (
+        "adopt",
+        ADOPT_USAGE,
+        "record what a branch is, and whose child",
+    ),
+    ("list", "usage: wtree list", "worktrees in this repo"),
+    (
+        "info",
+        "usage: wtree info",
+        "rules and previews for one worktree",
+    ),
+    (
+        "init",
+        INIT_USAGE,
+        "write starter rules, or load them from a .wtree/ (asks when given neither)",
+    ),
+    (
+        "save",
+        SAVE_USAGE,
+        "copy the rules out to a .wtree/ you can commit",
+    ),
+    (
+        "check",
+        "usage: wtree check <rules-path>",
+        "parse and validate a rules file (dev-only)",
+    ),
+];
+
+/// `wtree <verb> --help`. Whatever has no row of its own — `help`, a misspelled
+/// verb, or `wtree --help` with no verb at all — gets the whole manual, which
+/// is never a worse answer than the one line it was reaching for.
+fn help_for(verb: &str) {
+    match ROWS.iter().find(|(v, ..)| *v == verb) {
+        Some((_, usage, note)) => println!("{usage}\n    {note}"),
+        None => manual(),
+    }
+}
+
 /// `wtree help --all` — every verb, judged against nothing. It reads no repo
 /// and no rules on purpose: broken rules are when a user most needs to look
 /// something up, and that is exactly when the contextual menu cannot be built.
 fn manual() {
     println!("usage: wtree <verb> [args]\n");
-    let rows: &[(&str, &str)] = &[
-        (NEW_USAGE, "create a branch and its worktree"),
-        (OPEN_USAGE, "give an existing branch a worktree"),
-        (CLOSE_USAGE, "remove a worktree, keep the branch"),
-        (
-            "usage: wtree merge [--squash|--rebase|--no-ff|--ff] [-m <msg>]",
-            "merge into the parent",
-        ),
-        ("usage: wtree sync", "merge the parent into this branch"),
-        (
-            "usage: wtree land [--squash|--rebase|--no-ff|--ff] [-m <msg>]",
-            "merge, then destroy",
-        ),
-        (DESTROY_USAGE, "delete a branch and its worktree"),
-        (ADOPT_USAGE, "record what a branch is, and whose child"),
-        ("usage: wtree list", "worktrees in this repo"),
-        ("usage: wtree info", "rules and previews for one worktree"),
-        (
-            INIT_USAGE,
-            "write starter rules, or load them from a .wtree/ (asks when given neither)",
-        ),
-        (SAVE_USAGE, "copy the rules out to a .wtree/ you can commit"),
-        (
-            "usage: wtree check <rules-path>",
-            "parse and validate a rules file (dev-only)",
-        ),
-    ];
-    for (usage, note) in rows {
+    for (_, usage, note) in ROWS {
         println!("  {}\n      {note}", usage.trim_start_matches("usage: "));
     }
     println!("\n-m is required for --squash and --no-ff, and rejected for --rebase and --ff.");
     println!("--key and --force appear only when a verb asks for them.");
     println!("\nwtree (no verb) lists just the verbs available where you are.");
+    println!("wtree <verb> --help prints that verb's line on its own.");
 }
 
 fn cmd_check(path: Option<&str>) -> ExitCode {

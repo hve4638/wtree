@@ -2759,6 +2759,53 @@ fn the_manual_needs_neither_a_repo_nor_a_readable_rules() {
     assert_fail(&run_wt(&fx.repo, &[]));
 }
 
+/// `--help` used to be read as an argument: verbs that parse their flags called
+/// it unknown, and the ones that ignore theirs (`list`, `info`) just ran. Both
+/// are wrong — a user reaching for `--help` gets help, and nothing else happens.
+#[test]
+fn help_anywhere_on_the_line_beats_the_verb() {
+    let fx = Fixture::new();
+
+    // The verb that would have written files does not write them.
+    let o = run_wt(&fx.repo, &["init", "--help"]);
+    assert_ok(&o);
+    assert!(out(&o).contains("wtree init [--new"), "{}", out(&o));
+    assert!(
+        !fx.repo.join(".git/wtree").exists(),
+        "init --help must not init"
+    );
+
+    // ... including behind flags the verb does accept, and on a verb that
+    // ignores its arguments entirely.
+    assert_ok(&run_wt(&fx.repo, &["init", "--new", "--force", "--help"]));
+    assert!(
+        !fx.repo.join(".git/wtree").exists(),
+        "still nothing written"
+    );
+    let o = run_wt(&fx.repo, &["list", "--help"]);
+    assert_ok(&o);
+    assert!(out(&o).contains("worktrees in this repo"), "{}", out(&o));
+
+    // No row of its own falls back to the manual rather than to nothing: a
+    // typo'd verb, and `--help` with no verb at all.
+    for a in [vec!["bogus", "--help"], vec!["--help"]] {
+        let o = run_wt(&fx.repo, &a);
+        assert_ok(&o);
+        assert!(
+            out(&o).contains("usage: wtree <verb>"),
+            "{a:?}: {}",
+            out(&o)
+        );
+    }
+
+    // Broken rules are when a verb's usage is most needed, so it reads none.
+    write_rules(&fx, "[main]\nbogus-key = 1\n");
+    assert_fail(&run_wt(&fx.repo, &[]));
+    let o = run_wt(&fx.repo, &["merge", "--help"]);
+    assert_ok(&o);
+    assert!(out(&o).contains("merge into the parent"), "{}", out(&o));
+}
+
 #[test]
 fn a_non_utf8_argument_is_refused_instead_of_panicking() {
     use std::ffi::OsStr;
