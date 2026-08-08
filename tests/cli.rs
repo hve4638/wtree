@@ -382,6 +382,28 @@ fn a_symlinked_entry_crosses_as_a_link_and_is_not_followed() {
     assert_eq!(fs::read_link(&link).unwrap(), Path::new("real_modules"));
 }
 
+/// The mirror near miss: a trailing slash no longer reaches a symlink, so the
+/// pattern that used to copy one has to say what changed instead of going quiet.
+#[test]
+fn a_slashed_pattern_names_the_symlink_it_no_longer_takes() {
+    let fx = Fixture::new();
+    write_config(
+        &fx,
+        "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\ncopy = node_modules/\n",
+    );
+    fs::create_dir(fx.repo.join("real_modules")).unwrap();
+    std::os::unix::fs::symlink("real_modules", fx.repo.join("node_modules")).unwrap();
+
+    let o = run_wt(&fx.repo, &["new", "feature/a"]);
+    assert_ok(&o);
+    assert!(
+        out(&o).contains("skipped 'node_modules': a symlink crosses as a link"),
+        "{}",
+        out(&o)
+    );
+    assert!(!default_dest(&fx, "feature/a").join("node_modules").exists());
+}
+
 /// Copying over a tracked file would leave the worktree dirty before the user
 /// has touched anything, so what the branch already carries wins.
 #[test]

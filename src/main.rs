@@ -19,10 +19,9 @@ fn restore_sigpipe() {
 fn main() -> ExitCode {
     restore_sigpipe();
     // `env::args` panics on a non-UTF-8 argument, and a git refname is only a
-    // byte string — `wtree open $'\xff'` is reachable. Every name this tool
-    // handles is a `String` all the way down to the state file, so the honest
-    // answer is to refuse the input rather than lossily fold it into `U+FFFD`
-    // and act on a branch the user did not name.
+    // byte string — `wtree open $'\xff'` is reachable. Every name here is a
+    // `String` down to the state file, so refuse it rather than act on a
+    // lossily converted branch the user did not name.
     let args: Vec<String> = match env::args_os().skip(1).map(OsString::into_string).collect() {
         Ok(a) => a,
         Err(_) => {

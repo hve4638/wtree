@@ -10,11 +10,8 @@
 //! anything that does not parse to exactly the known fields is `Invalid` with
 //! a reason. Writing goes through a temp file in the same directory + rename,
 //! so a reader sees either the whole previous record or the whole new one,
-//! never a half-written file. A process killed before the rename can leave its
-//! temp file behind. Nothing is fsynced, so durability across a system crash is
-//! not promised — a lost record reads as unmanaged and refuses the destructive
-//! verbs until `wtree adopt` rebuilds it, so fsyncing every write would buy
-//! convenience rather than safety.
+//! never a half-written file. Nothing is fsynced: a record lost to a system
+//! crash reads as unmanaged, which fails closed and `wtree adopt` rebuilds.
 
 use std::fmt;
 use std::fs;
@@ -171,8 +168,7 @@ pub fn serialize(state: &State) -> String {
 }
 
 /// Atomic write: temp file in the same directory, then rename over the target.
-/// The temp name carries the pid so that concurrent `wtree` processes do not
-/// write and rename the same temporary file.
+/// The pid in the temp name keeps concurrent `wtree` processes off each other.
 pub fn write(private_git_dir: &Path, state: &State) -> io::Result<()> {
     let tmp = private_git_dir.join(format!("{STATE_FILE}.{}.tmp", std::process::id()));
     fs::write(&tmp, serialize(state))?;

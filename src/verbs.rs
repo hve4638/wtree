@@ -125,10 +125,8 @@ pub fn init(cwd: &Path) -> CmdResult {
 /// file or hook written by hand before it ran has to survive it.
 fn write_if_absent(path: &Path, body: &str, mode: u32) -> Result<(), String> {
     let write_error = |e| format!("cannot write {}: {e}", path.display());
-    // `create_new` rather than a prior `exists()`: the check and the write have
-    // to be one step, or a second `init` racing the first overwrites the file
-    // this is supposed to be preserving. Contents and permissions then go
-    // through the handle that won the create, so nothing re-resolves the path.
+    // `create_new` keeps the check and the write in one step: a second `init`
+    // racing the first must not overwrite what this is meant to preserve.
     let mut f = match fs::OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
@@ -328,15 +326,19 @@ fn copy_from_parent(
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         // A symlink is not a directory here even when it points at one: it is
-        // recreated as a link, so it drags in no tree and the trailing-slash
-        // rule has nothing to guard against.
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // recreated as a link, so it drags in no tree.
+        let ft = entry.file_type().ok();
+        let is_dir = ft.is_some_and(|t| t.is_dir());
         if !patterns.iter().any(|p| p.matches(&name, is_dir)) {
-            // A directory named by a pattern that lacks the trailing slash is
-            // the one near-miss worth naming: the rule looks like it applies.
-            if is_dir && patterns.iter().any(|p| !p.dir_only && config::glob_match(&p.glob, &name))
-            {
+            // Both near misses: the trailing slash is there and shouldn't be, or
+            // it isn't and should be. Either way the rule looks like it applies.
+            let named = |dir_only: bool| {
+                patterns.iter().any(|p| p.dir_only == dir_only && config::glob_match(&p.glob, &name))
+            };
+            if is_dir && named(false) {
                 notes.push(format!("skipped '{name}': a directory needs a trailing '/'"));
+            } else if ft.is_some_and(|t| t.is_symlink()) && named(true) {
+                notes.push(format!("skipped '{name}': a symlink crosses as a link — drop the '/'"));
             }
             continue;
         }
@@ -365,9 +367,7 @@ fn copy_from_parent(
 /// Symlinks are recreated, not followed — the entry named by a pattern as much
 /// as anything under it. A copied dependency tree is the case this matters for:
 /// pnpm's `node_modules` links packages to each other, and dereferencing those
-/// both explodes the copy and dies on the cycles that circular dependencies
-/// produce. The link check therefore has to come first and must not follow the
-/// link itself, which rules out `Path::is_dir`.
+/// both explodes the copy and dies on the cycles circular dependencies produce.
 fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
     let ft = fs::symlink_metadata(from)?.file_type();
     if ft.is_symlink() {
