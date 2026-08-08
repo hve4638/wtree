@@ -96,6 +96,17 @@ In `rules`, `[X]` is a fixed branch and `[group:X]` is a group of work branches 
 | `copy` | `[X]` `[group:X]` | untracked files a new worktree takes from its parent's |
 | `description` | `[X]` `[group:X]` | one line on what the branch is for, printed by `wtree` and `info` |
 
+What each `merge-mode` leaves in the parent:
+
+| mode | the parent gets | the branch's commits |
+|---|---|---|
+| `ff` | the branch's commits as they are | kept |
+| `rebase` | the same commits, replayed on its tip | kept, rewritten if the parent moved |
+| `squash` | one commit | folded into it |
+| `no-ff` | one merge commit | kept, on its second parent |
+
+`no-ff` reads as a squash without discarding anything. `git log --first-parent` shows one line per branch, and plain `git log` still has every commit.
+
 ## License
 
 MIT

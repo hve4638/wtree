@@ -1053,26 +1053,71 @@ const TREE_PLAIN: Glyphs = Glyphs {
 /// hold CJK, which is two columns wide; sizing the branch column by `chars()`
 /// would leave everything right of such a name a column short per wide char.
 fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| match c as u32 {
-            0x1100..=0x115F
-            | 0x2E80..=0x303E
-            | 0x3041..=0x33FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xA000..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE30..=0xFE6F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x1F300..=0x1F64F
-            | 0x1F900..=0x1F9FF
-            | 0x20000..=0x3FFFD => 2,
-            _ => 1,
-        })
-        .sum()
+    s.chars().map(char_width).sum()
 }
+
+fn char_width(c: char) -> usize {
+    match c as u32 {
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE6F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+/// Columns the terminal on stdout has, `None` when stdout is not one or the
+/// kernel will not say. A row longer than this wraps, and a wrapped row puts
+/// its tail under the next row's gutter — the tree stops being one.
+fn terminal_width() -> Option<usize> {
+    if !io::stdout().is_terminal() {
+        return None;
+    }
+    // SAFETY: `ws` is a fully-owned `winsize` for the kernel to fill in, and
+    // `TIOCGWINSZ` writes nothing else. A non-zero return leaves it untouched,
+    // which is why the result is checked before the field is read.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    (rc == 0 && ws.ws_col > 0).then_some(ws.ws_col as usize)
+}
+
+/// Cut `s` to `width` columns, spending the last one on `…` so the cut is
+/// visible. Returns `s` whole when it already fits.
+fn truncate_to(s: &str, width: usize) -> String {
+    if display_width(s) <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let budget = width - 1;
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = char_width(c);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Floor for the branch column, so a narrow terminal does not shave names down
+/// to nothing in the name of leaving room for what follows them.
+const MIN_NAME_COL: usize = 24;
 
 /// One branch of the tree. Parentage is resolved by name in a second pass, so
 /// the node itself only carries what gets printed.
@@ -1262,11 +1307,25 @@ pub fn list(cwd: &Path) -> CmdResult {
         let n: &Node = &nodes[*i];
         format!("{gutter}{} {}", n.mark, n.branch)
     };
-    let width = rows.iter().map(|r| display_width(&head_of(r))).max().unwrap_or(0);
+    let natural = rows.iter().map(|r| display_width(&head_of(r))).max().unwrap_or(0);
+    // Piped output is never cut: a reader that is not a terminal is grepping or
+    // diffing, and half a branch name serves neither. On a terminal, one long
+    // name would otherwise push every row's tail past the right edge, so the
+    // names give way first and only past half the screen.
+    let term = terminal_width();
+    let name_w = match term {
+        Some(t) => natural.min((t / 2).max(MIN_NAME_COL)),
+        None => natural,
+    };
     for r in &rows {
-        let head = head_of(r);
-        let pad = " ".repeat(width - display_width(&head));
-        println!("{}", format!("{head}{pad}  {}", nodes[r.1].tail).trim_end());
+        let head = truncate_to(&head_of(r), name_w);
+        let pad = " ".repeat(name_w.saturating_sub(display_width(&head)));
+        let line = format!("{head}{pad}  {}", nodes[r.1].tail);
+        let line = line.trim_end();
+        match term {
+            Some(t) => println!("{}", truncate_to(line, t)),
+            None => println!("{line}"),
+        }
     }
 
     if !strays.is_empty() {
@@ -2422,6 +2481,42 @@ fn short_head(wt: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cut has to land on a character boundary and inside the budget, and
+    /// a wide character that would straddle the last column has to be dropped
+    /// rather than pushed over it — one column past the edge wraps the row,
+    /// which is the whole failure being avoided.
+    #[test]
+    fn truncate_to_never_exceeds_the_width() {
+        for s in [
+            "feat/short",
+            "feat/an-extremely-long-branch-name-that-keeps-going",
+            "feat/아주-긴-한글-브랜치-이름",
+            "├─+ feat/혼합-mixed-이름",
+        ] {
+            for w in 0..40 {
+                let cut = truncate_to(s, w);
+                assert!(
+                    display_width(&cut) <= w,
+                    "{s:?} cut to {w}: {cut:?} is {} wide",
+                    display_width(&cut)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_to_leaves_what_already_fits() {
+        assert_eq!(truncate_to("feat/a", 6), "feat/a");
+        assert_eq!(truncate_to("feat/a", 99), "feat/a");
+        assert_eq!(truncate_to("한글", 4), "한글");
+        // One column short: the marker replaces the last character it can.
+        assert_eq!(truncate_to("feat/a", 5), "feat…");
+        // Two columns for the wide character, one for the marker, exactly 3.
+        assert_eq!(truncate_to("한글", 3), "한…");
+        // Only the marker fits beside a character that needs two columns.
+        assert_eq!(truncate_to("한글", 2), "…");
+    }
 
     #[test]
     fn conflicted_files_parsed_from_merge_tree_output() {

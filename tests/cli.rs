@@ -1056,6 +1056,27 @@ fn list_counts_divergence_from_the_parent_in_both_directions() {
     );
 }
 
+/// Cutting rows to the terminal is for terminals. A reader that is not one is
+/// grepping, diffing or feeding another tool, and half a branch name serves
+/// none of those — so piped output stays whole however long the names get.
+#[test]
+fn list_never_cuts_piped_output() {
+    let long = "feature/an-extremely-long-branch-name-that-keeps-going-and-going";
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    assert_ok(&run_wt(&fx.repo, &["new", long]));
+
+    let stdout = out(&run_wt(&fx.repo, &["list"]));
+    assert!(stdout.contains(long), "the branch name survives:\n{stdout}");
+    assert!(!stdout.contains('…'), "nothing was cut:\n{stdout}");
+    // The directory name is derived from the branch, so it is long too and sits
+    // past the branch column — the far end of the row is intact as well.
+    assert!(
+        stdout.contains("feature-an-extremely-long-branch-name-that-keeps-going-and-going"),
+        "{stdout}"
+    );
+}
+
 /// `list` never asks whether work would be lost, so it must not pay for the
 /// answer. The probe behind `[unreflected]` runs a merge-tree simulation per
 /// worktree; `destroy` is where that question is asked and answered.
