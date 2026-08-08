@@ -297,9 +297,11 @@ pub fn parse(text: &str, label: &str) -> (Config, Vec<String>) {
     (cfg, errors)
 }
 
-const BRANCH_KEYS: &[&str] = &["children", "destroyable", "merge-mode", "copy"];
+// `description` is free text, printed and never acted on — the one key with no
+// valid set to validate against.
+const BRANCH_KEYS: &[&str] = &["children", "destroyable", "merge-mode", "copy", "description"];
 const GROUP_KEYS: &[&str] =
-    &["children", "name-allow", "name-deny", "ephemeral", "merge-mode", "copy"];
+    &["children", "name-allow", "name-deny", "ephemeral", "merge-mode", "copy", "description"];
 
 /// One entry of a `copy` list. A trailing `/` marks it as matching directories
 /// only (the gitignore convention), so a bare `node_modules` cannot drag in a
@@ -757,6 +759,20 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
         let l = load("[main]\nname-allow = x/*\n\n[group:g]\ndestroyable = true\n");
         assert!(has(&l.errors, "unknown key 'name-allow' in [main]"), "{:?}", l.errors);
         assert!(has(&l.errors, "unknown key 'destroyable' in [group:g]"), "{:?}", l.errors);
+    }
+
+    #[test]
+    fn description_is_free_text_on_both_section_kinds() {
+        let l = load("[main]\ndescription = release only, never commit here\n\n[group:g]\ndescription = throwaway work\n");
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert_eq!(
+            l.config.get(SectionKind::Branch, "main", "description"),
+            Some("release only, never commit here")
+        );
+        assert_eq!(
+            l.config.get(SectionKind::Group, "g", "description"),
+            Some("throwaway work")
+        );
     }
 
     #[test]

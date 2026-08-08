@@ -205,6 +205,7 @@ fn template(root: &str) -> String {
          [{root}]\n\
          destroyable = false\n\
          # children = group:work\n\
+         # description = release line\n\
          \n\
          # [group:work]\n\
          # ephemeral = true\n\
@@ -683,6 +684,9 @@ pub fn info(cwd: &Path) -> CmdResult {
         }
         Identity::Unknown { .. } => unreachable!("handled above"),
     }
+    if let Some(d) = description_of(&ctx, &id) {
+        println!("description: {d}");
+    }
     match ctx.parent_of(&id) {
         Some((p, how)) => println!("parent: {p} ({how})"),
         None => println!("parent: none (root branch)"),
@@ -767,7 +771,13 @@ pub fn help(cwd: &Path) -> CmdResult {
     let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
 
     let head = world.current().head.clone().unwrap_or_else(|| "(detached)".into());
-    println!("{head} ({})", identity_word(&ctx.current_identity()));
+    let id = ctx.current_identity();
+    println!("{head} ({})", identity_word(&id));
+    // Only the current branch's: one per screen, or the line that applies
+    // gets buried under the groups `new` could create here.
+    if let Some(d) = description_of(&ctx, &id) {
+        println!("  {d}");
+    }
     println!();
 
     let mut rows: Vec<(String, String)> = Vec::new();
@@ -833,6 +843,17 @@ fn mode_flags(modes: &[MergeMode]) -> String {
         1 => flags[0].clone(),
         _ => format!("[{}]", flags.join("|")),
     }
+}
+
+/// The `description` of the section declaring `id`. Free and unknown branches
+/// are declared nowhere, so they never have one.
+fn description_of<'a>(ctx: &Ctx<'a>, id: &Identity) -> Option<&'a str> {
+    let (kind, name) = match id {
+        Identity::Fixed { branch } => (SectionKind::Branch, branch),
+        Identity::GroupMember { group, .. } => (SectionKind::Group, group),
+        Identity::Free { .. } | Identity::Unknown { .. } => return None,
+    };
+    ctx.cfg.get(kind, name, "description")
 }
 
 fn identity_word(id: &Identity) -> String {

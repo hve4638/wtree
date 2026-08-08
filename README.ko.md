@@ -90,6 +90,7 @@ main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크
 | `ephemeral` | `[group:X]` | 부모를 destroy할 때 안전 조건을 통과하면 함께 삭제. 기본값 `false` |
 | `merge-mode` | `[X]` `[group:X]` | 이 브랜치가 받아들이는 병합 방식. `squash`, `rebase`, `no-ff`, `ff`를 쉼표로 나열 |
 | `copy` | `[X]` `[group:X]` | 부모 워크트리에서 새 워크트리로 복사할 추적되지 않은 파일 |
+| `description` | `[X]` `[group:X]` | 이 브랜치가 무엇을 위한 것인지 한 줄. `wtree`와 `info`가 출력한다 |
 
 ## 라이선스
 

@@ -1787,6 +1787,44 @@ fn the_menu_lists_what_policy_allows_and_hides_what_it_refuses() {
 }
 
 #[test]
+fn description_says_what_the_current_branch_is_for() {
+    let fx = Fixture::new();
+    write_config(
+        &fx,
+        "[main]\nchildren = group:feat\ndestroyable = false\ndescription = release line\n\n\
+         [group:feat]\nname-allow = feature/*\ndescription = one feature each, land into main\n",
+    );
+
+    // Menu: under the head line, above the verbs.
+    let menu = out(&run_wt(&fx.repo, &[]));
+    assert!(menu.starts_with("main (fixed)\n  release line\n"), "{menu}");
+    assert!(out(&run_wt(&fx.repo, &["info"])).contains("description: release line"));
+
+    // Standing in a group member, the group's description is the one that
+    // applies — main's does not follow the merge target into view.
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
+    let wt = default_dest(&fx, "feature/a");
+    let menu = out(&run_wt(&wt, &[]));
+    assert!(
+        menu.starts_with("feature/a (group:feat)\n  one feature each, land into main\n"),
+        "{menu}"
+    );
+    assert!(!menu.contains("release line"), "{menu}");
+    assert!(
+        out(&run_wt(&wt, &["info"])).contains("description: one feature each, land into main")
+    );
+}
+
+#[test]
+fn description_absent_prints_no_line() {
+    let fx = Fixture::new();
+    write_config(&fx, "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n");
+    let menu = out(&run_wt(&fx.repo, &[]));
+    assert!(menu.starts_with("main (fixed)\n\n"), "no blank description line:\n{menu}");
+    assert!(!out(&run_wt(&fx.repo, &["info"])).contains("description:"), "{menu}");
+}
+
+#[test]
 fn the_menu_spells_merge_modes_but_never_key_or_force() {
     let fx = Fixture::new();
     // main takes one mode, so merge names it; the group takes two, so the
