@@ -8,8 +8,13 @@
 //!
 //! Reading is fail-closed: a missing file is `Missing` (unmanaged), and
 //! anything that does not parse to exactly the known fields is `Invalid` with
-//! a reason. Writing goes through a temp file + rename so a crash never
-//! leaves a half-written state file behind.
+//! a reason. Writing goes through a temp file in the same directory + rename,
+//! so a reader sees either the whole previous record or the whole new one,
+//! never a half-written file. A process killed before the rename can leave its
+//! temp file behind. Nothing is fsynced, so durability across a system crash is
+//! not promised — a lost record reads as unmanaged and refuses the destructive
+//! verbs until `wtree adopt` rebuilds it, so fsyncing every write would buy
+//! convenience rather than safety.
 
 use std::fmt;
 use std::fs;
@@ -166,8 +171,10 @@ pub fn serialize(state: &State) -> String {
 }
 
 /// Atomic write: temp file in the same directory, then rename over the target.
+/// The temp name carries the pid so that concurrent `wtree` processes do not
+/// write and rename the same temporary file.
 pub fn write(private_git_dir: &Path, state: &State) -> io::Result<()> {
-    let tmp = private_git_dir.join(format!("{STATE_FILE}.tmp"));
+    let tmp = private_git_dir.join(format!("{STATE_FILE}.{}.tmp", std::process::id()));
     fs::write(&tmp, serialize(state))?;
     fs::rename(&tmp, state_path(private_git_dir))
 }
@@ -226,8 +233,14 @@ mod tests {
         };
         write(&dir.0, &s2).unwrap();
         assert_eq!(read(&dir.0), StateRead::Valid(s2));
-        // no temp residue left behind
-        assert!(!dir.0.join(format!("{STATE_FILE}.tmp")).exists());
+        // no temp residue left behind, whatever the temp file was named
+        let residue: Vec<String> = fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != STATE_FILE)
+            .collect();
+        assert!(residue.is_empty(), "left behind: {residue:?}");
     }
 
     #[test]

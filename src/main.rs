@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -9,19 +10,26 @@ use wtree::{config, verbs};
 /// Rust's runtime sets SIGPIPE to SIG_IGN before main, so a closed reader turns
 /// every later `println!` into a panic (`head`, `less`, `grep -q` all do this).
 /// Restoring the default makes the process die quietly like any other unix tool.
-/// Declared here rather than pulled from `libc` to keep the dependency set empty.
 fn restore_sigpipe() {
-    const SIGPIPE: i32 = 13;
-    const SIG_DFL: usize = 0;
-    unsafe extern "C" {
-        fn signal(sig: i32, handler: usize) -> usize;
-    }
-    unsafe { signal(SIGPIPE, SIG_DFL) };
+    // SAFETY: `SIG_DFL` is a valid handler for `SIGPIPE`, and this runs once at
+    // startup, before anything else can be looking at the disposition.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
 }
 
 fn main() -> ExitCode {
     restore_sigpipe();
-    let args: Vec<String> = env::args().skip(1).collect();
+    // `env::args` panics on a non-UTF-8 argument, and a git refname is only a
+    // byte string — `wtree open $'\xff'` is reachable. Every name this tool
+    // handles is a `String` all the way down to the state file, so the honest
+    // answer is to refuse the input rather than lossily fold it into `U+FFFD`
+    // and act on a branch the user did not name.
+    let args: Vec<String> = match env::args_os().skip(1).map(OsString::into_string).collect() {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("wtree: arguments must be valid UTF-8");
+            return ExitCode::from(2);
+        }
+    };
     let cwd: PathBuf = match env::current_dir() {
         Ok(d) => d,
         Err(e) => {

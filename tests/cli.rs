@@ -359,6 +359,29 @@ fn a_directory_crosses_only_when_the_pattern_ends_in_a_slash() {
     assert!(!default_dest(&fx, "feature/a").join("node_modules").exists());
 }
 
+/// The entry a pattern names is recreated when it is a link, not followed —
+/// otherwise the trailing-slash rule leaks: a bare pattern would drag in the
+/// whole tree behind a symlinked `node_modules`.
+#[test]
+fn a_symlinked_entry_crosses_as_a_link_and_is_not_followed() {
+    let fx = Fixture::new();
+    write_config(
+        &fx,
+        "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\ncopy = node_modules\n",
+    );
+    fs::create_dir(fx.repo.join("real_modules")).unwrap();
+    fs::write(fx.repo.join("real_modules/index.js"), "x\n").unwrap();
+    std::os::unix::fs::symlink("real_modules", fx.repo.join("node_modules")).unwrap();
+
+    let o = run_wt(&fx.repo, &["new", "feature/a"]);
+    assert_ok(&o);
+    assert!(out(&o).contains("copied node_modules"), "{}", out(&o));
+    let link = default_dest(&fx, "feature/a").join("node_modules");
+    let ft = fs::symlink_metadata(&link).unwrap().file_type();
+    assert!(ft.is_symlink(), "the link was dereferenced into a copied tree");
+    assert_eq!(fs::read_link(&link).unwrap(), Path::new("real_modules"));
+}
+
 /// Copying over a tracked file would leave the worktree dirty before the user
 /// has touched anything, so what the branch already carries wins.
 #[test]
@@ -1841,6 +1864,23 @@ fn the_manual_needs_neither_a_repo_nor_a_readable_config() {
 
     // The contextual menu cannot be built from that config, and says so.
     assert_fail(&run_wt(&fx.repo, &[]));
+}
+
+#[test]
+fn a_non_utf8_argument_is_refused_instead_of_panicking() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fx = Fixture::new();
+    let o = Command::new(env!("CARGO_BIN_EXE_wtree"))
+        .current_dir(&fx.repo)
+        .arg("open")
+        .arg(OsStr::from_bytes(b"feature/\xff"))
+        .output()
+        .expect("failed to spawn wtree");
+    // Invalid encoding is a usage error, not an internal failure.
+    assert_eq!(o.status.code(), Some(2), "stderr:\n{}", err(&o));
+    assert!(err(&o).contains("must be valid UTF-8"), "{}", err(&o));
 }
 
 #[test]

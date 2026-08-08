@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -124,11 +124,18 @@ pub fn init(cwd: &Path) -> CmdResult {
 /// Only fills a gap. `init` is guarded on the config file alone, so a settings
 /// file or hook written by hand before it ran has to survive it.
 fn write_if_absent(path: &Path, body: &str, mode: u32) -> Result<(), String> {
-    if path.exists() {
-        return Ok(());
-    }
-    fs::write(path, body).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    let write_error = |e| format!("cannot write {}: {e}", path.display());
+    // `create_new` rather than a prior `exists()`: the check and the write have
+    // to be one step, or a second `init` racing the first overwrites the file
+    // this is supposed to be preserving. Contents and permissions then go
+    // through the handle that won the create, so nothing re-resolves the path.
+    let mut f = match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => return Err(write_error(e)),
+    };
+    f.write_all(body.as_bytes()).map_err(write_error)?;
+    f.set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|e| format!("cannot set mode on {}: {e}", path.display()))
 }
 
@@ -320,7 +327,10 @@ fn copy_from_parent(
     let (mut taken, mut notes) = (Vec::new(), Vec::new());
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_dir = entry.path().is_dir();
+        // A symlink is not a directory here even when it points at one: it is
+        // recreated as a link, so it drags in no tree and the trailing-slash
+        // rule has nothing to guard against.
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if !patterns.iter().any(|p| p.matches(&name, is_dir)) {
             // A directory named by a pattern that lacks the trailing slash is
             // the one near-miss worth naming: the rule looks like it applies.
@@ -337,7 +347,7 @@ fn copy_from_parent(
             notes.push(format!("skipped '{name}': already in the worktree"));
             continue;
         }
-        match copy_entry(&entry.path(), &to, is_dir) {
+        match copy_entry(&entry.path(), &to) {
             Ok(()) => taken.push(name),
             Err(e) => notes.push(format!("warning: cannot copy '{name}': {e}")),
         }
@@ -352,31 +362,28 @@ fn copy_from_parent(
     out
 }
 
-fn copy_entry(from: &Path, to: &Path, is_dir: bool) -> io::Result<()> {
-    if is_dir {
+/// Symlinks are recreated, not followed — the entry named by a pattern as much
+/// as anything under it. A copied dependency tree is the case this matters for:
+/// pnpm's `node_modules` links packages to each other, and dereferencing those
+/// both explodes the copy and dies on the cycles that circular dependencies
+/// produce. The link check therefore has to come first and must not follow the
+/// link itself, which rules out `Path::is_dir`.
+fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
+    let ft = fs::symlink_metadata(from)?.file_type();
+    if ft.is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(from)?, to)
+    } else if ft.is_dir() {
         copy_tree(from, to)
     } else {
         fs::copy(from, to).map(|_| ())
     }
 }
 
-/// Symlinks are recreated, not followed. A copied dependency tree is the case
-/// this matters for: pnpm's `node_modules` links packages to each other, and
-/// dereferencing those both explodes the copy and dies on the cycles that
-/// circular dependencies produce.
 fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
-        let (src, dst) = (entry.path(), to.join(entry.file_name()));
-        let ft = entry.file_type()?;
-        if ft.is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(&src)?, &dst)?;
-        } else if ft.is_dir() {
-            copy_tree(&src, &dst)?;
-        } else {
-            fs::copy(&src, &dst)?;
-        }
+        copy_entry(&entry.path(), &to.join(entry.file_name()))?;
     }
     Ok(())
 }
