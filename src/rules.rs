@@ -1,4 +1,4 @@
-//! Policy config (`.git/wtree/config`) parser and strict validation.
+//! Policy rules (`.git/wtree/rules`) parser and strict validation.
 //!
 //! Syntax: INI-like. `[<branch>]` / `[group:<name>]` headers, `key = value`
 //! entries where a value may be a comma-separated list. `#` starts a comment,
@@ -7,7 +7,7 @@
 //!
 //! All load and validation problems are collected and reported together;
 //! nothing stops at the first failure. Messages cite `(label:line)` so later
-//! verbs can quote rules as `(.git/wtree/config:14)`.
+//! verbs can quote rules as `(.git/wtree/rules:14)`.
 
 use std::collections::HashMap;
 
@@ -18,7 +18,7 @@ pub enum SectionKind {
 }
 
 impl SectionKind {
-    /// The section's header as written in the config — the spelling every
+    /// The section's header as written in the rules — the spelling every
     /// message quotes, so that a citation can be pasted back into the file.
     pub fn header(self, name: &str) -> String {
         match self {
@@ -94,26 +94,26 @@ impl Section {
 }
 
 #[derive(Debug, Default)]
-pub struct Config {
+pub struct Rules {
     pub sections: Vec<Section>,
 }
 
-/// Result of loading a config text: the parsed structure plus every collected
-/// load/validation error and warning. `config` is usable even with errors
+/// Result of loading rules text: the parsed structure plus every collected
+/// load/validation error and warning. `rules` is usable even with errors
 /// (best-effort parse) but callers must treat any error as load failure.
 #[derive(Debug)]
 pub struct Loaded {
-    pub config: Config,
+    pub rules: Rules,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
 
 pub fn load_str(text: &str, label: &str) -> Loaded {
-    let (config, mut errors) = parse(text, label);
-    let (verrors, warnings) = config.validate(label);
+    let (rules, mut errors) = parse(text, label);
+    let (verrors, warnings) = rules.validate(label);
     errors.extend(verrors);
     Loaded {
-        config,
+        rules,
         errors,
         warnings,
     }
@@ -165,7 +165,7 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 enum Cursor {
     /// Before any section header.
     None,
-    /// Index into `Config::sections`.
+    /// Index into `Rules::sections`.
     At(usize),
     /// Header was invalid (malformed, bad name, duplicate) — the header
     /// error already covers the whole section, so its entries are swallowed
@@ -173,8 +173,8 @@ enum Cursor {
     Skip,
 }
 
-pub fn parse(text: &str, label: &str) -> (Config, Vec<String>) {
-    let mut cfg = Config::default();
+pub fn parse(text: &str, label: &str) -> (Rules, Vec<String>) {
+    let mut cfg = Rules::default();
     let mut errors = Vec::new();
     let mut cursor = Cursor::None;
 
@@ -219,9 +219,7 @@ pub fn parse(text: &str, label: &str) -> (Config, Vec<String>) {
                 None => (SectionKind::Branch, inner),
             };
             if name.is_empty() {
-                errors.push(format!(
-                    "empty section name '{line}' ({label}:{lineno})"
-                ));
+                errors.push(format!("empty section name '{line}' ({label}:{lineno})"));
                 continue;
             }
             // git forbids both in a ref name, so neither can be part of a
@@ -299,9 +297,22 @@ pub fn parse(text: &str, label: &str) -> (Config, Vec<String>) {
 
 // `description` is free text, printed and never acted on — the one key with no
 // valid set to validate against.
-const BRANCH_KEYS: &[&str] = &["children", "destroyable", "merge-mode", "copy", "description"];
-const GROUP_KEYS: &[&str] =
-    &["children", "name-allow", "name-deny", "ephemeral", "merge-mode", "copy", "description"];
+const BRANCH_KEYS: &[&str] = &[
+    "children",
+    "destroyable",
+    "merge-mode",
+    "copy",
+    "description",
+];
+const GROUP_KEYS: &[&str] = &[
+    "children",
+    "name-allow",
+    "name-deny",
+    "ephemeral",
+    "merge-mode",
+    "copy",
+    "description",
+];
 
 /// One entry of a `copy` list. A trailing `/` marks it as matching directories
 /// only (the gitignore convention), so a bare `node_modules` cannot drag in a
@@ -315,8 +326,14 @@ pub struct CopyPattern {
 impl CopyPattern {
     fn parse(tok: &str) -> Self {
         match tok.strip_suffix('/') {
-            Some(g) => CopyPattern { glob: g.to_string(), dir_only: true },
-            None => CopyPattern { glob: tok.to_string(), dir_only: false },
+            Some(g) => CopyPattern {
+                glob: g.to_string(),
+                dir_only: true,
+            },
+            None => CopyPattern {
+                glob: tok.to_string(),
+                dir_only: false,
+            },
         }
     }
 
@@ -328,13 +345,17 @@ impl CopyPattern {
     }
 }
 
-impl Config {
+impl Rules {
     pub fn section(&self, kind: SectionKind, name: &str) -> Option<&Section> {
-        self.sections.iter().find(|s| s.kind == kind && s.name == name)
+        self.sections
+            .iter()
+            .find(|s| s.kind == kind && s.name == name)
     }
 
     pub fn get(&self, kind: SectionKind, name: &str, key: &str) -> Option<&str> {
-        self.section(kind, name)?.entry(key).map(|e| e.value.as_str())
+        self.section(kind, name)?
+            .entry(key)
+            .map(|e| e.value.as_str())
     }
 
     pub fn line_of(&self, kind: SectionKind, name: &str, key: &str) -> Option<usize> {
@@ -363,7 +384,7 @@ impl Config {
     }
 
     /// `[branch]` sections that list `branch` bare in their `children` — the
-    /// parent(s) of a fixed branch. A validated config has at most one.
+    /// parent(s) of a fixed branch. Validated rules have at most one.
     pub fn bare_parent_sections(&self, branch: &str) -> Vec<&Section> {
         self.sections
             .iter()
@@ -437,7 +458,9 @@ impl Config {
                 if !allowed.contains(&e.key.as_str()) {
                     errors.push(format!(
                         "unknown key '{}' in {} ({label}:{})",
-                        e.key, s.header(), e.line
+                        e.key,
+                        s.header(),
+                        e.line
                     ));
                     continue;
                 }
@@ -553,7 +576,11 @@ impl Config {
 
         // Declared branch name vs group name patterns: refs 'dev' and 'dev/*'
         // cannot coexist at the git level.
-        for s in self.sections.iter().filter(|s| s.kind == SectionKind::Group) {
+        for s in self
+            .sections
+            .iter()
+            .filter(|s| s.kind == SectionKind::Group)
+        {
             for key in ["name-allow", "name-deny"] {
                 let Some(e) = s.entry(key) else { continue };
                 for pat in split_list(&e.value) {
@@ -573,7 +600,9 @@ impl Config {
         // one in the same children list makes every name matching the
         // constrained pattern ambiguous.
         for s in &self.sections {
-            let Some(e) = s.entry("children") else { continue };
+            let Some(e) = s.entry("children") else {
+                continue;
+            };
             let refs: Vec<String> = split_list(&e.value)
                 .map(parse_child)
                 .filter_map(|c| match c {
@@ -603,7 +632,7 @@ impl Config {
 mod tests {
     use super::*;
 
-    // Verbatim config sketch from DESIGN.md ("config 스케치" section).
+    // Verbatim rules sketch from DESIGN.md ("config 스케치" section).
     const SKETCH: &str = "[main]
 children = dev, group:hotfix        # bare 이름 = 선언된 고정 브랜치 참조. 여기서 생성되고, 여기로만 돌아온다
 destroyable = false                 # init 템플릿 기본값
@@ -623,7 +652,7 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
 ";
 
     fn load(text: &str) -> Loaded {
-        load_str(text, ".git/wtree/config")
+        load_str(text, ".git/wtree/rules")
     }
 
     fn has(list: &[String], needle: &str) -> bool {
@@ -634,22 +663,23 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
     fn sketch_parses_clean() {
         let l = load(SKETCH);
         assert!(l.errors.is_empty(), "unexpected errors: {:?}", l.errors);
-        assert!(l.warnings.is_empty(), "unexpected warnings: {:?}", l.warnings);
-        assert_eq!(l.config.sections.len(), 4);
+        assert!(
+            l.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            l.warnings
+        );
+        assert_eq!(l.rules.sections.len(), 4);
     }
 
     #[test]
     fn sketch_children_parsed() {
         let l = load(SKETCH);
         assert_eq!(
-            l.config.children_of(SectionKind::Branch, "main"),
-            vec![
-                Child::Bare("dev".into()),
-                Child::GroupRef("hotfix".into())
-            ]
+            l.rules.children_of(SectionKind::Branch, "main"),
+            vec![Child::Bare("dev".into()), Child::GroupRef("hotfix".into())]
         );
         assert_eq!(
-            l.config.children_of(SectionKind::Branch, "dev"),
+            l.rules.children_of(SectionKind::Branch, "dev"),
             vec![Child::GroupRef("work".into())]
         );
     }
@@ -658,27 +688,28 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
     fn defaults_applied() {
         let l = load("[main]\nchildren = group:g\n\n[group:g]\nname-allow = g/*\n");
         assert!(l.errors.is_empty(), "{:?}", l.errors);
-        let c = &l.config;
+        let c = &l.rules;
         assert!(c.destroyable("main"));
         assert!(!c.ephemeral("g"));
         assert_eq!(c.merge_modes(SectionKind::Branch, "main"), None);
         assert_eq!(c.children_of(SectionKind::Group, "g"), vec![]);
         // sketch overrides
         let s = load(SKETCH);
-        assert!(!s.config.destroyable("main"));
-        assert!(s.config.ephemeral("work"));
+        assert!(!s.rules.destroyable("main"));
+        assert!(s.rules.ephemeral("work"));
         assert_eq!(
-            s.config.merge_modes(SectionKind::Branch, "main"),
+            s.rules.merge_modes(SectionKind::Branch, "main"),
             Some(vec![MergeMode::Squash])
         );
     }
 
     #[test]
     fn inline_comment_and_comma_list() {
-        let l = load("[main]\nchildren = dev , group:g , *   # tail comment\n\n[dev]\n\n[group:g]\n");
+        let l =
+            load("[main]\nchildren = dev , group:g , *   # tail comment\n\n[dev]\n\n[group:g]\n");
         assert!(l.errors.is_empty(), "{:?}", l.errors);
         assert_eq!(
-            l.config.children_of(SectionKind::Branch, "main"),
+            l.rules.children_of(SectionKind::Branch, "main"),
             vec![
                 Child::Bare("dev".into()),
                 Child::GroupRef("g".into()),
@@ -692,7 +723,7 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
         let l = load("[main]\nmerge-mode = squash, no-ff\n");
         assert!(l.errors.is_empty(), "{:?}", l.errors);
         assert_eq!(
-            l.config.merge_modes(SectionKind::Branch, "main"),
+            l.rules.merge_modes(SectionKind::Branch, "main"),
             Some(vec![MergeMode::Squash, MergeMode::NoFf])
         );
     }
@@ -700,9 +731,13 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
     #[test]
     fn duplicate_key_is_error() {
         let l = load("[main]\ndestroyable = false\ndestroyable = true\n");
-        assert!(has(&l.errors, "duplicate key 'destroyable'"), "{:?}", l.errors);
+        assert!(
+            has(&l.errors, "duplicate key 'destroyable'"),
+            "{:?}",
+            l.errors
+        );
         // first occurrence wins in the parsed structure
-        assert!(!l.config.destroyable("main"));
+        assert!(!l.rules.destroyable("main"));
     }
 
     #[test]
@@ -714,32 +749,49 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
     #[test]
     fn empty_value_is_error() {
         let l = load("[main]\nchildren =\n");
-        assert!(has(&l.errors, "empty value for 'children'"), "{:?}", l.errors);
+        assert!(
+            has(&l.errors, "empty value for 'children'"),
+            "{:?}",
+            l.errors
+        );
     }
 
     #[test]
     fn bad_section_name_is_error() {
         let l = load("[node main]\nchildren = x\n");
-        assert!(has(&l.errors, "invalid section name 'node main'"), "{:?}", l.errors);
+        assert!(
+            has(&l.errors, "invalid section name 'node main'"),
+            "{:?}",
+            l.errors
+        );
         // entries of the bad section are swallowed, not double-reported
         assert_eq!(l.errors.len(), 1, "{:?}", l.errors);
         assert!(has(&load("[]\n").errors, "empty section name '[]'"));
-        assert!(has(&load("[group:]\n").errors, "empty section name '[group:]'"));
-        assert!(has(&load("[group:a:b]\n").errors, "invalid section name 'a:b'"));
+        assert!(has(
+            &load("[group:]\n").errors,
+            "empty section name '[group:]'"
+        ));
+        assert!(has(
+            &load("[group:a:b]\n").errors,
+            "invalid section name 'a:b'"
+        ));
     }
 
     #[test]
     fn old_section_syntax_points_at_the_new_one() {
         let l = load("[main]\n\n[branch dev]\n\n[group develop]\n");
         assert!(
-            has(&l.errors, "old section syntax '[branch dev]' — use '[dev]' (.git/wtree/config:3)"),
+            has(
+                &l.errors,
+                "old section syntax '[branch dev]' — use '[dev]' (.git/wtree/rules:3)"
+            ),
             "{:?}",
             l.errors
         );
         assert!(
             has(
                 &l.errors,
-                "old section syntax '[group develop]' — use '[group:develop]' (.git/wtree/config:5)"
+                "old section syntax '[group develop]' — use '[group:develop]' (.git/wtree/rules:5)"
             ),
             "{:?}",
             l.errors
@@ -757,20 +809,30 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
     #[test]
     fn unknown_key_is_error() {
         let l = load("[main]\nname-allow = x/*\n\n[group:g]\ndestroyable = true\n");
-        assert!(has(&l.errors, "unknown key 'name-allow' in [main]"), "{:?}", l.errors);
-        assert!(has(&l.errors, "unknown key 'destroyable' in [group:g]"), "{:?}", l.errors);
+        assert!(
+            has(&l.errors, "unknown key 'name-allow' in [main]"),
+            "{:?}",
+            l.errors
+        );
+        assert!(
+            has(&l.errors, "unknown key 'destroyable' in [group:g]"),
+            "{:?}",
+            l.errors
+        );
     }
 
     #[test]
     fn description_is_free_text_on_both_section_kinds() {
-        let l = load("[main]\ndescription = release only, never commit here\n\n[group:g]\ndescription = throwaway work\n");
+        let l = load(
+            "[main]\ndescription = release only, never commit here\n\n[group:g]\ndescription = throwaway work\n",
+        );
         assert!(l.errors.is_empty(), "{:?}", l.errors);
         assert_eq!(
-            l.config.get(SectionKind::Branch, "main", "description"),
+            l.rules.get(SectionKind::Branch, "main", "description"),
             Some("release only, never commit here")
         );
         assert_eq!(
-            l.config.get(SectionKind::Group, "g", "description"),
+            l.rules.get(SectionKind::Group, "g", "description"),
             Some("throwaway work")
         );
     }
@@ -778,28 +840,41 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
     #[test]
     fn undeclared_group_ref_is_error() {
         let l = load("[main]\nchildren = group:ghost\n");
-        assert!(has(&l.errors, "undeclared group 'group:ghost'"), "{:?}", l.errors);
+        assert!(
+            has(&l.errors, "undeclared group 'group:ghost'"),
+            "{:?}",
+            l.errors
+        );
     }
 
     #[test]
     fn undeclared_bare_ref_is_error() {
         let l = load("[main]\nchildren = ghost\n");
-        assert!(has(&l.errors, "undeclared branch 'ghost'"), "{:?}", l.errors);
+        assert!(
+            has(&l.errors, "undeclared branch 'ghost'"),
+            "{:?}",
+            l.errors
+        );
     }
 
     #[test]
     fn bare_in_group_children_is_error() {
         let l = load("[main]\n\n[group:g]\nchildren = main\n");
-        assert!(has(&l.errors, "bare branch name 'main' not allowed"), "{:?}", l.errors);
+        assert!(
+            has(&l.errors, "bare branch name 'main' not allowed"),
+            "{:?}",
+            l.errors
+        );
     }
 
     #[test]
     fn bare_parent_uniqueness_is_error() {
-        let l = load(
-            "[main]\nchildren = dev\n\n[other]\nchildren = dev\n\n[dev]\n",
-        );
+        let l = load("[main]\nchildren = dev\n\n[other]\nchildren = dev\n\n[dev]\n");
         assert!(
-            has(&l.errors, "'dev' listed in children of both [main] and [other]"),
+            has(
+                &l.errors,
+                "'dev' listed in children of both [main] and [other]"
+            ),
             "{:?}",
             l.errors
         );
@@ -808,7 +883,11 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
     #[test]
     fn cycle_is_error() {
         let l = load("[main]\nchildren = dev\n\n[dev]\nchildren = main\n");
-        assert!(has(&l.errors, "fixed-branch cycle: dev -> main -> dev"), "{:?}", l.errors);
+        assert!(
+            has(&l.errors, "fixed-branch cycle: dev -> main -> dev"),
+            "{:?}",
+            l.errors
+        );
         assert_eq!(
             l.errors.iter().filter(|e| e.contains("cycle")).count(),
             1,
@@ -817,14 +896,16 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
         );
         // self-loop
         let l2 = load("[main]\nchildren = main\n");
-        assert!(has(&l2.errors, "fixed-branch cycle: main -> main"), "{:?}", l2.errors);
+        assert!(
+            has(&l2.errors, "fixed-branch cycle: main -> main"),
+            "{:?}",
+            l2.errors
+        );
     }
 
     #[test]
     fn ref_namespace_conflict_is_error() {
-        let l = load(
-            "[dev]\n\n[group:g]\nname-allow = dev/*\n\n[group:h]\nname-deny = dev/?\n",
-        );
+        let l = load("[dev]\n\n[group:g]\nname-allow = dev/*\n\n[group:h]\nname-deny = dev/?\n");
         assert!(
             has(&l.errors, "[group:g] pattern 'dev/*' conflicts with [dev]"),
             "{:?}",
@@ -842,9 +923,21 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
         let l = load(
             "[main]\ndestroyable = maybe\nmerge-mode = squash, octopus\n\n[group:g]\nephemeral = nah\n",
         );
-        assert!(has(&l.errors, "invalid value 'maybe' for 'destroyable'"), "{:?}", l.errors);
-        assert!(has(&l.errors, "invalid merge-mode 'octopus'"), "{:?}", l.errors);
-        assert!(has(&l.errors, "invalid value 'nah' for 'ephemeral'"), "{:?}", l.errors);
+        assert!(
+            has(&l.errors, "invalid value 'maybe' for 'destroyable'"),
+            "{:?}",
+            l.errors
+        );
+        assert!(
+            has(&l.errors, "invalid merge-mode 'octopus'"),
+            "{:?}",
+            l.errors
+        );
+        assert!(
+            has(&l.errors, "invalid value 'nah' for 'ephemeral'"),
+            "{:?}",
+            l.errors
+        );
         assert_eq!(l.errors.len(), 3, "{:?}", l.errors);
     }
 
@@ -854,7 +947,11 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
             "[main]\nchildren = group:strict, group:loose\n\n[group:strict]\nname-allow = s/*\n\n[group:loose]\n",
         );
         assert!(l.errors.is_empty(), "{:?}", l.errors);
-        assert!(has(&l.warnings, "mixes unconstrained group(s)"), "{:?}", l.warnings);
+        assert!(
+            has(&l.warnings, "mixes unconstrained group(s)"),
+            "{:?}",
+            l.warnings
+        );
         assert!(has(&l.warnings, "loose"), "{:?}", l.warnings);
         assert!(has(&l.warnings, "strict"), "{:?}", l.warnings);
     }
@@ -862,24 +959,31 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
     #[test]
     fn all_problems_collected_not_first_only() {
         let l = load("[main]\nbogus = 1\nchildren = ghost\ndestroyable = maybe\n");
-        assert!(l.errors.len() >= 3, "expected all errors collected: {:?}", l.errors);
+        assert!(
+            l.errors.len() >= 3,
+            "expected all errors collected: {:?}",
+            l.errors
+        );
     }
 
     #[test]
     fn line_numbers_accurate() {
-        let c = load(SKETCH).config;
-        assert_eq!(c.line_of(SectionKind::Branch, "main", "merge-mode"), Some(4));
+        let c = load(SKETCH).rules;
+        assert_eq!(
+            c.line_of(SectionKind::Branch, "main", "merge-mode"),
+            Some(4)
+        );
         assert_eq!(c.line_of(SectionKind::Branch, "dev", "children"), Some(7));
         assert_eq!(c.line_of(SectionKind::Group, "work", "ephemeral"), Some(15));
         assert_eq!(c.section(SectionKind::Group, "hotfix").unwrap().line, 10);
         // error messages cite label:line
         let l = load("[main]\n\nbogus = 1\n");
-        assert!(has(&l.errors, "(.git/wtree/config:3)"), "{:?}", l.errors);
+        assert!(has(&l.errors, "(.git/wtree/rules:3)"), "{:?}", l.errors);
     }
 
     #[test]
     fn bare_parent_section_helper() {
-        let c = load(SKETCH).config;
+        let c = load(SKETCH).rules;
         let parents = c.bare_parent_sections("dev");
         assert_eq!(parents.len(), 1);
         assert_eq!(parents[0].name, "main");
@@ -906,8 +1010,8 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
     fn name_allow_deny_accessors() {
         let l = load("[group:g]\nname-allow = a/*, b/*\nname-deny = a/wip-*\n");
         assert!(l.errors.is_empty(), "{:?}", l.errors);
-        assert_eq!(l.config.name_allow("g"), vec!["a/*", "b/*"]);
-        assert_eq!(l.config.name_deny("g"), vec!["a/wip-*"]);
-        assert!(l.config.name_allow("missing").is_empty());
+        assert_eq!(l.rules.name_allow("g"), vec!["a/*", "b/*"]);
+        assert_eq!(l.rules.name_deny("g"), vec!["a/wip-*"]);
+        assert!(l.rules.name_allow("missing").is_empty());
     }
 }

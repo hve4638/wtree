@@ -9,7 +9,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::config::{Config, SectionKind};
+use crate::rules::{Rules, SectionKind};
 use crate::state::{self, StateRead};
 
 pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -75,7 +75,11 @@ impl Repo {
         let out = run_git(dir, &["rev-parse", "--git-common-dir"])?;
         let raw = PathBuf::from(out.trim());
         // --git-common-dir may print a path relative to cwd.
-        let abs = if raw.is_absolute() { raw } else { dir.join(raw) };
+        let abs = if raw.is_absolute() {
+            raw
+        } else {
+            dir.join(raw)
+        };
         let common_dir = abs
             .canonicalize()
             .map_err(|e| format!("cannot resolve git common dir {}: {e}", abs.display()))?;
@@ -93,7 +97,12 @@ impl Repo {
     pub fn branch_exists(&self, name: &str) -> bool {
         git_ok(
             &self.common_dir,
-            &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}")],
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{name}"),
+            ],
         )
     }
 
@@ -139,7 +148,9 @@ impl Repo {
         //    FROM the merge base, so it says "this branch changed nothing", not
         //    "the parent already has this" — a squashed branch still looks like
         //    it added its own changes here, which is what test 4 is for.
-        let base = run_git(dir, &["merge-base", parent, branch])?.trim().to_string();
+        let base = run_git(dir, &["merge-base", parent, branch])?
+            .trim()
+            .to_string();
         if oid(&format!("{base}^{{tree}}"))? == oid(&format!("{branch}^{{tree}}"))? {
             return Ok(true);
         }
@@ -147,7 +158,8 @@ impl Repo {
         //    tree as it stands. This is the one that recognizes content the
         //    parent absorbed under a different commit — a squash merge — and it
         //    keeps holding after the parent advances with unrelated changes.
-        if let Ok((0, stdout, _)) = run_git_code(dir, &["merge-tree", "--write-tree", parent, branch])
+        if let Ok((0, stdout, _)) =
+            run_git_code(dir, &["merge-tree", "--write-tree", parent, branch])
         {
             let merged = stdout.lines().next().unwrap_or_default().trim();
             if !merged.is_empty() && merged == oid(&format!("{parent}^{{tree}}"))? {
@@ -173,9 +185,7 @@ impl Repo {
                 });
             } else if let Some(wt) = cur.as_mut() {
                 if let Some(b) = line.strip_prefix("branch ") {
-                    wt.head_branch = Some(
-                        b.strip_prefix("refs/heads/").unwrap_or(b).to_string(),
-                    );
+                    wt.head_branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
                 } else if line == "bare" {
                     wt.bare = true;
                 }
@@ -227,7 +237,9 @@ pub fn head_branch(worktree: &Path) -> Result<Option<String>, String> {
 
 /// Uncommitted changes, staged or not, including untracked files.
 pub fn is_dirty(worktree: &Path) -> Result<bool, String> {
-    Ok(!run_git(worktree, &["status", "--porcelain"])?.trim().is_empty())
+    Ok(!run_git(worktree, &["status", "--porcelain"])?
+        .trim()
+        .is_empty())
 }
 
 /// First 5 hex chars of a hash over (HEAD oid, diff vs HEAD, untracked file
@@ -275,7 +287,7 @@ pub struct WtFact {
     pub state: StateRead,
     pub dirty: bool,
     /// Commits not reflected in the derived parent (recorded parent for
-    /// group/free records, config-derived for fixed). `false` when there is
+    /// group/free records, rules-derived for fixed). `false` when there is
     /// no derivable/existing parent.
     pub unreflected: bool,
     /// `None` when it cannot be computed (e.g. unborn HEAD).
@@ -308,13 +320,16 @@ impl World {
 
 /// Gather the world as seen from `cwd`. `cfg` is needed only to derive the
 /// parent of fixed branches for the `unreflected` fact.
-pub fn gather(cwd: &Path, cfg: &Config) -> Result<World, String> {
+pub fn gather(cwd: &Path, cfg: &Rules) -> Result<World, String> {
     let repo = Repo::discover(cwd)?;
     let branches = repo.branches()?;
     let toplevel_raw = PathBuf::from(run_git(cwd, &["rev-parse", "--show-toplevel"])?.trim());
-    let toplevel = toplevel_raw
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve worktree root {}: {e}", toplevel_raw.display()))?;
+    let toplevel = toplevel_raw.canonicalize().map_err(|e| {
+        format!(
+            "cannot resolve worktree root {}: {e}",
+            toplevel_raw.display()
+        )
+    })?;
 
     let mut facts = Vec::new();
     for wt in repo.list_worktrees()? {
@@ -383,17 +398,12 @@ pub fn gather(cwd: &Path, cfg: &Config) -> Result<World, String> {
 /// `unreflected` fact at gather time (`judge::Ctx::parent_of` is the
 /// authoritative rule): valid matching record -> recorded parent; missing
 /// record on a declared fixed branch -> its unique bare-listing section.
-fn derived_parent_for_facts(
-    cfg: &Config,
-    state: &StateRead,
-    head: Option<&str>,
-) -> Option<String> {
+fn derived_parent_for_facts(cfg: &Rules, state: &StateRead, head: Option<&str>) -> Option<String> {
     match (state, head) {
         (StateRead::Valid(s), Some(h)) if s.branch == h => Some(s.parent.clone()),
-        (StateRead::Missing, Some(h)) if cfg.section(SectionKind::Branch, h).is_some() => cfg
-            .bare_parent_sections(h)
-            .first()
-            .map(|s| s.name.clone()),
+        (StateRead::Missing, Some(h)) if cfg.section(SectionKind::Branch, h).is_some() => {
+            cfg.bare_parent_sections(h).first().map(|s| s.name.clone())
+        }
         _ => None,
     }
 }
@@ -401,21 +411,24 @@ fn derived_parent_for_facts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
+    use crate::rules;
     use crate::state::Kind;
     use crate::testutil::Fixture;
 
-    fn cfg(text: &str) -> Config {
-        let l = config::load_str(text, ".git/wtree/config");
-        assert!(l.errors.is_empty(), "config errors: {:?}", l.errors);
-        l.config
+    fn cfg(text: &str) -> Rules {
+        let l = rules::load_str(text, ".git/wtree/rules");
+        assert!(l.errors.is_empty(), "rules errors: {:?}", l.errors);
+        l.rules
     }
 
     #[test]
     fn discover_and_private_dirs() {
         let fx = Fixture::new();
         let repo = Repo::discover(&fx.repo).unwrap();
-        assert_eq!(repo.common_dir, fx.repo.join(".git").canonicalize().unwrap());
+        assert_eq!(
+            repo.common_dir,
+            fx.repo.join(".git").canonicalize().unwrap()
+        );
         // same common dir when discovered from a secondary worktree
         let wt = fx.add_worktree("feature/a", "main");
         let repo2 = Repo::discover(&wt).unwrap();

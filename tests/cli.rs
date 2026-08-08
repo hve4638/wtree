@@ -48,10 +48,10 @@ fn assert_fail(o: &Output) {
     );
 }
 
-fn write_config(fx: &Fixture, text: &str) {
+fn write_rules(fx: &Fixture, text: &str) {
     let dir = fx.repo.join(".git/wtree");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("config"), text).unwrap();
+    fs::write(dir.join("rules"), text).unwrap();
 }
 
 /// Default placement base used by `wtree new`: `<tmp>/repo.worktrees`.
@@ -62,17 +62,16 @@ fn default_dest(fx: &Fixture, branch: &str) -> PathBuf {
         .join(branch.replace('/', "-"))
 }
 
-const GROUP_CFG: &str =
-    "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n";
+const GROUP_CFG: &str = "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n";
 
 // -------------------------------------------------------------------- init ----
 
 #[test]
 fn init_creates_template_and_refuses_rerun() {
     let fx = Fixture::new();
-    let o = run_wt(&fx.repo, &["init"]);
+    let o = run_wt(&fx.repo, &["init", "--new"]);
     assert_ok(&o);
-    let cfg_path = fx.repo.join(".git/wtree/config");
+    let cfg_path = fx.repo.join(".git/wtree/rules");
     let text = fs::read_to_string(&cfg_path).unwrap();
     assert!(text.contains("[main]"), "{text}");
     assert!(text.contains("destroyable = false"), "{text}");
@@ -82,10 +81,10 @@ fn init_creates_template_and_refuses_rerun() {
     // the template must load clean
     let check = run_wt(&fx.repo, &["check", cfg_path.to_str().unwrap()]);
     assert_ok(&check);
-    // re-run refused, config untouched
-    let o2 = run_wt(&fx.repo, &["init"]);
+    // re-run refused, rules untouched
+    let o2 = run_wt(&fx.repo, &["init", "--new"]);
     assert_fail(&o2);
-    assert!(err(&o2).contains("already exists"), "{}", err(&o2));
+    assert!(err(&o2).contains("already has rules"), "{}", err(&o2));
     assert_eq!(fs::read_to_string(&cfg_path).unwrap(), text);
 }
 
@@ -97,18 +96,26 @@ fn init_creates_template_and_refuses_rerun() {
 #[test]
 fn init_seeds_a_commented_settings_file_and_an_inert_hook_sample() {
     let fx = Fixture::new();
-    assert_ok(&run_wt(&fx.repo, &["init"]));
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
 
     let sett = fs::read_to_string(fx.repo.join(".git/wtree/settings")).unwrap();
-    assert!(sett.contains("# worktree-dir"), "the knob is shown, not set:\n{sett}");
     assert!(
-        !sett.lines().any(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty()),
+        sett.contains("# worktree-dir"),
+        "the knob is shown, not set:\n{sett}"
+    );
+    assert!(
+        !sett
+            .lines()
+            .any(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty()),
         "every line must be a comment:\n{sett}"
     );
 
     let sample = fx.repo.join(".git/wtree/hooks/post-create.sample");
     assert!(sample.is_file(), "hook sample written");
-    assert!(!fx.repo.join(".git/wtree/hooks/post-create").exists(), "not enabled");
+    assert!(
+        !fx.repo.join(".git/wtree/hooks/post-create").exists(),
+        "not enabled"
+    );
     assert_ne!(
         fs::metadata(&sample).unwrap().permissions().mode() & 0o111,
         0,
@@ -116,24 +123,41 @@ fn init_seeds_a_commented_settings_file_and_an_inert_hook_sample() {
     );
 
     // The defaults still apply and nothing warns about the sample.
-    write_config(&fx, "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n");
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n",
+    );
     let o = run_wt(&fx.repo, &["new", "feature/a"]);
     assert_ok(&o);
-    assert!(!err(&o).contains("hook"), "the sample must not be found:\n{}", err(&o));
-    assert!(default_dest(&fx, "feature/a").is_dir(), "default placement unchanged");
+    assert!(
+        !err(&o).contains("hook"),
+        "the sample must not be found:\n{}",
+        err(&o)
+    );
+    assert!(
+        default_dest(&fx, "feature/a").is_dir(),
+        "default placement unchanged"
+    );
 }
 
-/// `init` is guarded on the config file alone, so anything else it writes has
-/// to give way to a file that was already there.
+/// `init` is guarded on either file, not just the rules: a settings written by
+/// hand is someone's work, and replacing it silently because there happened to
+/// be no rules next to it is the same loss.
 #[test]
-fn init_keeps_a_settings_file_that_was_written_by_hand() {
+fn init_refuses_a_settings_file_that_was_written_by_hand() {
     let fx = Fixture::new();
     let sett = fx.repo.join(".git/wtree/settings");
     fs::create_dir_all(sett.parent().unwrap()).unwrap();
     fs::write(&sett, "worktree-dir = ../mine\n").unwrap();
 
-    assert_ok(&run_wt(&fx.repo, &["init"]));
-    assert_eq!(fs::read_to_string(&sett).unwrap(), "worktree-dir = ../mine\n");
+    let o = run_wt(&fx.repo, &["init", "--new"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("already has settings"), "{}", err(&o));
+    assert_eq!(
+        fs::read_to_string(&sett).unwrap(),
+        "worktree-dir = ../mine\n",
+        "a refusal writes nothing"
+    );
 }
 
 #[test]
@@ -142,24 +166,28 @@ fn init_root_detection_order() {
     let fx = Fixture::new();
     fx.git(
         &fx.repo,
-        &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
     );
-    assert_ok(&run_wt(&fx.repo, &["init"]));
-    let text = fs::read_to_string(fx.repo.join(".git/wtree/config")).unwrap();
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
+    let text = fs::read_to_string(fx.repo.join(".git/wtree/rules")).unwrap();
     assert!(text.contains("[trunk]"), "{text}");
 
     // no origin/HEAD: master existence
     let fx = Fixture::new();
     fx.git(&fx.repo, &["branch", "-m", "master"]);
-    assert_ok(&run_wt(&fx.repo, &["init"]));
-    let text = fs::read_to_string(fx.repo.join(".git/wtree/config")).unwrap();
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
+    let text = fs::read_to_string(fx.repo.join(".git/wtree/rules")).unwrap();
     assert!(text.contains("[master]"), "{text}");
 
     // no origin/HEAD, no main/master: current branch
     let fx = Fixture::new();
     fx.git(&fx.repo, &["branch", "-m", "work"]);
-    assert_ok(&run_wt(&fx.repo, &["init"]));
-    let text = fs::read_to_string(fx.repo.join(".git/wtree/config")).unwrap();
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
+    let text = fs::read_to_string(fx.repo.join(".git/wtree/rules")).unwrap();
     assert!(text.contains("[work]"), "{text}");
 }
 
@@ -169,9 +197,395 @@ fn init_refuses_bare_repo() {
     let bare = fx.tmp.0.join("bare.git");
     fs::create_dir_all(&bare).unwrap();
     fx.git(&bare, &["init", "-q", "--bare"]);
-    let o = run_wt(&bare, &["init"]);
+    let o = run_wt(&bare, &["init", "--new"]);
     assert_fail(&o);
     assert!(err(&o).contains("bare"), "{}", err(&o));
+}
+
+// ------------------------------------------------------- init --load / save ----
+
+/// A committed `.wtree/` under `root`.
+fn write_seed(root: &Path, rules: Option<&str>, settings: Option<&str>) -> PathBuf {
+    let dir = root.join(".wtree");
+    fs::create_dir_all(&dir).unwrap();
+    if let Some(t) = rules {
+        fs::write(dir.join("rules"), t).unwrap();
+    }
+    if let Some(t) = settings {
+        fs::write(dir.join("settings"), t).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn load_takes_both_files_from_a_named_directory() {
+    let fx = Fixture::new();
+    let seed = write_seed(
+        &fx.repo,
+        Some(GROUP_CFG),
+        Some("worktree-dir = ../shared\n"),
+    );
+
+    let o = run_wt(&fx.repo, &["init", "--load", seed.to_str().unwrap()]);
+    assert_ok(&o);
+    assert_eq!(
+        fs::read_to_string(fx.repo.join(".git/wtree/rules")).unwrap(),
+        GROUP_CFG
+    );
+    assert_eq!(
+        fs::read_to_string(fx.repo.join(".git/wtree/settings")).unwrap(),
+        "worktree-dir = ../shared\n"
+    );
+    // hooks are never part of a load, but the sample still gets seeded
+    assert!(
+        fx.repo
+            .join(".git/wtree/hooks/post-create.sample")
+            .is_file()
+    );
+    assert!(
+        !seed.join("hooks").exists(),
+        "load reads, it does not write"
+    );
+}
+
+/// The file that is there is taken; the one that is not falls back to the
+/// template, which is what makes a `.wtree/` holding only rules useful.
+#[test]
+fn load_fills_the_missing_half_from_the_template() {
+    let fx = Fixture::new();
+    let seed = write_seed(&fx.repo, Some(GROUP_CFG), None);
+
+    assert_ok(&run_wt(
+        &fx.repo,
+        &["init", "--load", seed.to_str().unwrap()],
+    ));
+    assert_eq!(
+        fs::read_to_string(fx.repo.join(".git/wtree/rules")).unwrap(),
+        GROUP_CFG
+    );
+    let sett = fs::read_to_string(fx.repo.join(".git/wtree/settings")).unwrap();
+    assert!(sett.contains("# worktree-dir"), "{sett}");
+}
+
+/// Validation runs before anything is written, so a source that does not parse
+/// costs nothing: no rules, no settings, no `.git/wtree` at all.
+#[test]
+fn load_refuses_broken_rules_and_writes_nothing() {
+    let fx = Fixture::new();
+    let seed = write_seed(&fx.repo, Some("[branch dev]\nnonsense = 1\n"), None);
+
+    let o = run_wt(&fx.repo, &["init", "--load", seed.to_str().unwrap()]);
+    assert_fail(&o);
+    assert!(err(&o).contains("nothing was written"), "{}", err(&o));
+    assert!(err(&o).contains("old section syntax"), "{}", err(&o));
+    assert!(
+        !fx.repo.join(".git/wtree/rules").exists(),
+        "the repo must be untouched"
+    );
+    assert!(!fx.repo.join(".git/wtree/settings").exists());
+}
+
+#[test]
+fn load_refuses_a_wtree_dir_with_nothing_in_it() {
+    let fx = Fixture::new();
+    let seed = write_seed(&fx.repo, None, None);
+
+    let o = run_wt(&fx.repo, &["init", "--load", seed.to_str().unwrap()]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("no rules or settings to load"),
+        "{}",
+        err(&o)
+    );
+}
+
+/// In the main worktree the two candidate roots are the same directory, so a
+/// bare `--load` has exactly one answer and takes it.
+#[test]
+fn bare_load_uses_the_wtree_of_the_worktree_you_are_in() {
+    let fx = Fixture::new();
+    write_seed(&fx.repo, Some(GROUP_CFG), None);
+
+    assert_ok(&run_wt(&fx.repo, &["init", "--load"]));
+    assert_eq!(
+        fs::read_to_string(fx.repo.join(".git/wtree/rules")).unwrap(),
+        GROUP_CFG
+    );
+}
+
+/// Resolved from the worktree root, not the cwd, so how deep you are standing
+/// makes no difference.
+#[test]
+fn bare_load_works_from_a_subdirectory() {
+    let fx = Fixture::new();
+    write_seed(&fx.repo, Some(GROUP_CFG), None);
+    let deep = fx.repo.join("src/inner");
+    fs::create_dir_all(&deep).unwrap();
+
+    assert_ok(&run_wt(&deep, &["init", "--load"]));
+    assert_eq!(
+        fs::read_to_string(fx.repo.join(".git/wtree/rules")).unwrap(),
+        GROUP_CFG
+    );
+}
+
+/// Two candidates cannot be told apart without asking, and `--load` has no way
+/// to ask — so it refuses and hands over both commands it could not choose
+/// between. Same when the only `.wtree/` belongs to the other worktree:
+/// reaching across for it would be a guess about which branch's policy wins.
+#[test]
+fn bare_load_refuses_every_answer_it_would_have_to_guess() {
+    let fx = Fixture::new();
+    let wt = fx.add_worktree("feat/x", "main");
+    write_seed(&fx.repo, Some(GROUP_CFG), None);
+
+    // main has one, this worktree does not
+    let o = run_wt(&wt, &["init", "--load"]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("no .wtree/ in this worktree"),
+        "{}",
+        err(&o)
+    );
+    assert!(err(&o).contains("main worktree"), "{}", err(&o));
+    assert!(
+        err(&o).contains(fx.repo.join(".wtree").to_str().unwrap()),
+        "the refusal spells the command that works:\n{}",
+        err(&o)
+    );
+
+    // both have one
+    write_seed(&wt, Some(GROUP_CFG), None);
+    let o = run_wt(&wt, &["init", "--load"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("ambiguous"), "{}", err(&o));
+    assert!(err(&o).contains("this worktree"), "{}", err(&o));
+    assert!(err(&o).contains("main worktree"), "{}", err(&o));
+
+    // neither
+    let fx2 = Fixture::new();
+    let o = run_wt(&fx2.repo, &["init", "--load"]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("no .wtree/ in this worktree or the main worktree"),
+        "{}",
+        err(&o)
+    );
+}
+
+fn backups(fx: &Fixture) -> Vec<PathBuf> {
+    let mut b: Vec<PathBuf> = fs::read_dir(fx.repo.join(".git/wtree/.backup"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    b.sort();
+    b
+}
+
+/// `--force` moves what it replaces into `.backup/<UTC>/` rather than dropping
+/// it, and the backup itself never becomes part of the next one.
+#[test]
+fn force_backs_up_what_it_replaces() {
+    let fx = Fixture::new();
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
+    let before = fs::read_to_string(fx.repo.join(".git/wtree/rules")).unwrap();
+    let seed = write_seed(
+        &fx.repo,
+        Some(GROUP_CFG),
+        Some("worktree-dir = ../shared\n"),
+    );
+
+    let o = run_wt(&fx.repo, &["init", "--load", seed.to_str().unwrap()]);
+    assert_fail(&o);
+    assert!(err(&o).contains("--force"), "{}", err(&o));
+
+    let o = run_wt(
+        &fx.repo,
+        &["init", "--load", seed.to_str().unwrap(), "--force"],
+    );
+    assert_ok(&o);
+    assert_eq!(
+        fs::read_to_string(fx.repo.join(".git/wtree/rules")).unwrap(),
+        GROUP_CFG
+    );
+
+    let kept = &backups(&fx)[0];
+    assert_eq!(backups(&fx).len(), 1);
+    assert_eq!(fs::read_to_string(kept.join("rules")).unwrap(), before);
+    assert!(kept.join("settings").is_file(), "both were replaced");
+    assert!(!kept.join(".backup").exists(), "a backup never nests");
+    assert!(!kept.join("hooks").exists(), "hooks are not backed up");
+    assert!(
+        fx.repo
+            .join(".git/wtree/hooks/post-create.sample")
+            .is_file(),
+        "and they survive in place"
+    );
+}
+
+/// `worktree-dir` is this machine's, and a `.wtree/` carrying only rules says
+/// nothing about it. Loading the rules must not quietly move where every later
+/// `wtree new` puts its worktrees.
+#[test]
+fn a_load_without_settings_leaves_the_local_settings_alone() {
+    let fx = Fixture::new();
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
+    let sett = fx.repo.join(".git/wtree/settings");
+    fs::write(&sett, "worktree-dir = ../mine\n").unwrap();
+    let seed = write_seed(&fx.repo, Some(GROUP_CFG), None);
+
+    let o = run_wt(
+        &fx.repo,
+        &["init", "--load", seed.to_str().unwrap(), "--force"],
+    );
+    assert_ok(&o);
+    assert_eq!(
+        fs::read_to_string(&sett).unwrap(),
+        "worktree-dir = ../mine\n",
+        "the machine-local file is not the seed's to replace"
+    );
+    assert!(out(&o).contains("left as it was"), "{}", out(&o));
+
+    // and what was never replaced was never backed up either
+    let kept = &backups(&fx)[0];
+    assert!(kept.join("rules").is_file());
+    assert!(!kept.join("settings").exists(), "{:?}", kept);
+}
+
+/// Backing up costs nothing when there is nothing there, so `--force` on a
+/// fresh repo is not an error — just a flag that had no work to do.
+#[test]
+fn force_with_nothing_to_replace_is_not_an_error() {
+    let fx = Fixture::new();
+    let o = run_wt(&fx.repo, &["init", "--new", "--force"]);
+    assert_ok(&o);
+    assert!(!fx.repo.join(".git/wtree/.backup").exists());
+}
+
+/// The interactive path is the only one that can ask, and it needs a terminal
+/// to ask on. Tests run on pipes, which is exactly the case that has to fail
+/// fast rather than block on a prompt nobody can see.
+#[test]
+fn init_without_a_terminal_names_the_two_flags() {
+    let fx = Fixture::new();
+    let o = run_wt(&fx.repo, &["init"]);
+    assert_fail(&o);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(err(&o).contains("no terminal"), "{}", err(&o));
+    assert!(err(&o).contains("wtree init --new"), "{}", err(&o));
+    assert!(err(&o).contains("wtree init --load"), "{}", err(&o));
+    assert!(!fx.repo.join(".git/wtree/rules").exists());
+}
+
+#[test]
+fn init_flag_combinations() {
+    let fx = Fixture::new();
+    for (args, needle) in [
+        (vec!["init", "--new", "--load"], "mutually exclusive"),
+        (vec!["init", "--force"], "--force only applies"),
+        (vec!["init", "--nope"], "unknown argument"),
+    ] {
+        let o = run_wt(&fx.repo, &args);
+        assert_fail(&o);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(err(&o).contains(needle), "{args:?}: {}", err(&o));
+    }
+}
+
+#[test]
+fn save_round_trips_through_a_committed_wtree_dir() {
+    let fx = Fixture::new();
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
+    write_rules(&fx, GROUP_CFG);
+
+    let o = run_wt(&fx.repo, &["save"]);
+    assert_ok(&o);
+    let seed = fx.repo.join(".wtree");
+    assert_eq!(fs::read_to_string(seed.join("rules")).unwrap(), GROUP_CFG);
+    assert!(seed.join("settings").is_file());
+    assert!(!seed.join("hooks").exists(), "hooks stay behind");
+
+    // a second save refuses; --force replaces without keeping a backup
+    let o = run_wt(&fx.repo, &["save"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("--force"), "{}", err(&o));
+    write_rules(&fx, "[main]\ndestroyable = false\n");
+    assert_ok(&run_wt(&fx.repo, &["save", "--force"]));
+    assert_eq!(
+        fs::read_to_string(seed.join("rules")).unwrap(),
+        "[main]\ndestroyable = false\n"
+    );
+    assert!(
+        !seed.join(".backup").exists(),
+        "git already holds the old one"
+    );
+
+    // and what it wrote loads back
+    let fx2 = Fixture::new();
+    let carried = write_seed(
+        &fx2.repo,
+        Some(&fs::read_to_string(seed.join("rules")).unwrap()),
+        None,
+    );
+    assert_ok(&run_wt(
+        &fx2.repo,
+        &["init", "--load", carried.to_str().unwrap()],
+    ));
+}
+
+#[test]
+fn save_writes_where_you_are_standing_or_where_you_say() {
+    let fx = Fixture::new();
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
+    write_rules(&fx, GROUP_CFG);
+    let wt = fx.add_worktree("feat/x", "main");
+
+    // the linked worktree gets its own copy, so the commit lands on its branch
+    assert_ok(&run_wt(&wt, &["save"]));
+    assert!(wt.join(".wtree/rules").is_file());
+    assert!(!fx.repo.join(".wtree").exists());
+
+    // an explicit path wins, resolved against the cwd
+    assert_ok(&run_wt(&fx.repo, &["save", ".wtree.strategy-b"]));
+    assert!(fx.repo.join(".wtree.strategy-b/rules").is_file());
+}
+
+/// A settings left over from an earlier save would keep travelling with rules
+/// it no longer belongs to, so `--force` clears it rather than stepping over it.
+#[test]
+fn save_force_clears_a_settings_this_clone_no_longer_has() {
+    let fx = Fixture::new();
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
+    write_rules(&fx, GROUP_CFG);
+    assert_ok(&run_wt(&fx.repo, &["save"]));
+    assert!(fx.repo.join(".wtree/settings").is_file());
+
+    fs::remove_file(fx.repo.join(".git/wtree/settings")).unwrap();
+    let o = run_wt(&fx.repo, &["save", "--force"]);
+    assert_ok(&o);
+    assert!(
+        !fx.repo.join(".wtree/settings").exists(),
+        "the stale copy is gone"
+    );
+    assert!(out(&o).contains("settings removed"), "{}", out(&o));
+}
+
+#[test]
+fn save_refuses_rules_that_do_not_parse() {
+    let fx = Fixture::new();
+    write_rules(&fx, "[branch dev]\n");
+    let o = run_wt(&fx.repo, &["save"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("nothing was written"), "{}", err(&o));
+    assert!(!fx.repo.join(".wtree").exists());
+}
+
+#[test]
+fn save_before_init_says_so() {
+    let fx = Fixture::new();
+    let o = run_wt(&fx.repo, &["save"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("wtree init"), "{}", err(&o));
 }
 
 // --------------------------------------------------------------------- new ----
@@ -179,14 +593,17 @@ fn init_refuses_bare_repo() {
 #[test]
 fn new_group_member_records_state_at_default_placement() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let o = run_wt(&fx.repo, &["new", "feature/a"]);
     assert_ok(&o);
     let dest = default_dest(&fx, "feature/a");
     assert!(dest.is_dir(), "worktree missing at {}", dest.display());
     let stdout = out(&o);
     assert!(stdout.contains("group:feat"), "{stdout}");
-    assert!(stdout.contains(&format!("cd {}", dest.display())), "{stdout}");
+    assert!(
+        stdout.contains(&format!("cd {}", dest.display())),
+        "{stdout}"
+    );
     // state record: (branch, kind, parent) as judged
     let private = repo::private_git_dir(&dest).unwrap();
     match state::read(&private) {
@@ -202,7 +619,7 @@ fn new_group_member_records_state_at_default_placement() {
 #[test]
 fn new_fixed_branch_leaves_no_state() {
     let fx = Fixture::new();
-    write_config(&fx, "[main]\nchildren = dev\n\n[dev]\n");
+    write_rules(&fx, "[main]\nchildren = dev\n\n[dev]\n");
     let o = run_wt(&fx.repo, &["new", "dev"]);
     assert_ok(&o);
     assert!(out(&o).contains("(fixed)"), "{}", out(&o));
@@ -215,7 +632,7 @@ fn new_fixed_branch_leaves_no_state() {
 #[test]
 fn new_refusal_prints_judge_reasons_and_creates_nothing() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let o = run_wt(&fx.repo, &["new", "junk/x"]);
     assert_fail(&o);
     let stderr = err(&o);
@@ -224,7 +641,10 @@ fn new_refusal_prints_judge_reasons_and_creates_nothing() {
     assert!(stderr.contains("rule: name-allow"), "{stderr}");
     // neither a worktree nor a branch was created
     assert!(!default_dest(&fx, "junk/x").exists());
-    let refs = fx.git(&fx.repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+    let refs = fx.git(
+        &fx.repo,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    );
     assert_eq!(refs.trim(), "main");
 }
 
@@ -232,7 +652,7 @@ fn new_refusal_prints_judge_reasons_and_creates_nothing() {
 fn new_placement_settings_override() {
     // absolute worktree-dir
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let abs = fx.tmp.0.join("abs-wts");
     fs::write(
         fx.repo.join(".git/wtree/settings"),
@@ -244,14 +664,14 @@ fn new_placement_settings_override() {
 
     // relative worktree-dir resolves against the primary worktree root
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     fs::write(fx.repo.join(".git/wtree/settings"), "worktree-dir = wts\n").unwrap();
     assert_ok(&run_wt(&fx.repo, &["new", "feature/b"]));
     assert!(fx.repo.join("wts/feature-b").is_dir());
 
     // a settings typo aborts instead of silently using the default
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     fs::write(fx.repo.join(".git/wtree/settings"), "worktreedir = x\n").unwrap();
     let o = run_wt(&fx.repo, &["new", "feature/c"]);
     assert_fail(&o);
@@ -269,7 +689,7 @@ fn install_hook(fx: &Fixture, body: &str) {
 #[test]
 fn new_runs_post_create_hook_with_wt_env() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     install_hook(
         &fx,
         "#!/bin/sh\nprintf '%s|%s|%s|%s|%s' \"$WT_BRANCH\" \"$WT_PARENT\" \"$WT_REPO\" \"$WT_INTERACTIVE\" \"$(pwd)\" > \"$WT_PATH/hook-ran\"\n",
@@ -296,11 +716,15 @@ fn new_runs_post_create_hook_with_wt_env() {
 #[test]
 fn new_hook_failure_warns_but_keeps_worktree() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     install_hook(&fx, "#!/bin/sh\nexit 3\n");
     let o = run_wt(&fx.repo, &["new", "feature/a"]);
     assert_ok(&o); // hook failure is not a verb failure
-    assert!(err(&o).contains("post-create hook failed (exit 3)"), "{}", err(&o));
+    assert!(
+        err(&o).contains("post-create hook failed (exit 3)"),
+        "{}",
+        err(&o)
+    );
     let dest = default_dest(&fx, "feature/a");
     assert!(dest.is_dir());
     assert!(matches!(
@@ -316,7 +740,7 @@ fn new_hook_failure_warns_but_keeps_worktree() {
 #[test]
 fn new_carries_the_files_the_policy_lists_from_the_parent_worktree() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\ncopy = .env, .env.*, .vscode/\n",
     );
@@ -328,13 +752,26 @@ fn new_carries_the_files_the_policy_lists_from_the_parent_worktree() {
 
     let o = run_wt(&fx.repo, &["new", "feature/a"]);
     assert_ok(&o);
-    assert!(out(&o).contains("copied .env, .env.local, .vscode from 'main'"), "{}", out(&o));
+    assert!(
+        out(&o).contains("copied .env, .env.local, .vscode from 'main'"),
+        "{}",
+        out(&o)
+    );
 
     let dest = default_dest(&fx, "feature/a");
     assert_eq!(fs::read_to_string(dest.join(".env")).unwrap(), "SECRET=1\n");
-    assert_eq!(fs::read_to_string(dest.join(".env.local")).unwrap(), "LOCAL=2\n");
-    assert_eq!(fs::read_to_string(dest.join(".vscode/settings.json")).unwrap(), "{}\n");
-    assert!(!dest.join("untouched").exists(), "only listed patterns cross");
+    assert_eq!(
+        fs::read_to_string(dest.join(".env.local")).unwrap(),
+        "LOCAL=2\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.join(".vscode/settings.json")).unwrap(),
+        "{}\n"
+    );
+    assert!(
+        !dest.join("untouched").exists(),
+        "only listed patterns cross"
+    );
 }
 
 /// The trailing slash is what makes a directory deliberate. Without it the rule
@@ -342,7 +779,7 @@ fn new_carries_the_files_the_policy_lists_from_the_parent_worktree() {
 #[test]
 fn a_directory_crosses_only_when_the_pattern_ends_in_a_slash() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\ncopy = node_modules\n",
     );
@@ -365,7 +802,7 @@ fn a_directory_crosses_only_when_the_pattern_ends_in_a_slash() {
 #[test]
 fn a_symlinked_entry_crosses_as_a_link_and_is_not_followed() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\ncopy = node_modules\n",
     );
@@ -378,7 +815,10 @@ fn a_symlinked_entry_crosses_as_a_link_and_is_not_followed() {
     assert!(out(&o).contains("copied node_modules"), "{}", out(&o));
     let link = default_dest(&fx, "feature/a").join("node_modules");
     let ft = fs::symlink_metadata(&link).unwrap().file_type();
-    assert!(ft.is_symlink(), "the link was dereferenced into a copied tree");
+    assert!(
+        ft.is_symlink(),
+        "the link was dereferenced into a copied tree"
+    );
     assert_eq!(fs::read_link(&link).unwrap(), Path::new("real_modules"));
 }
 
@@ -387,7 +827,7 @@ fn a_symlinked_entry_crosses_as_a_link_and_is_not_followed() {
 #[test]
 fn a_slashed_pattern_names_the_symlink_it_no_longer_takes() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\ncopy = node_modules/\n",
     );
@@ -409,7 +849,7 @@ fn a_slashed_pattern_names_the_symlink_it_no_longer_takes() {
 #[test]
 fn copy_never_overwrites_what_the_branch_already_tracks() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\ncopy = tracked.txt\n",
     );
@@ -420,19 +860,26 @@ fn copy_never_overwrites_what_the_branch_already_tracks() {
 
     let o = run_wt(&fx.repo, &["new", "feature/a"]);
     assert_ok(&o);
-    assert!(out(&o).contains("skipped 'tracked.txt': already in the worktree"), "{}", out(&o));
+    assert!(
+        out(&o).contains("skipped 'tracked.txt': already in the worktree"),
+        "{}",
+        out(&o)
+    );
     let dest = default_dest(&fx, "feature/a");
-    assert_eq!(fs::read_to_string(dest.join("tracked.txt")).unwrap(), "committed\n");
+    assert_eq!(
+        fs::read_to_string(dest.join("tracked.txt")).unwrap(),
+        "committed\n"
+    );
     assert_eq!(fx.git(&dest, &["status", "--porcelain"]).trim(), "");
 }
 
-/// `open` reads the parent from the config, so the source can be a worktree
+/// `open` reads the parent from the rules, so the source can be a worktree
 /// that is not currently checked out. The worktree is still created — it is
 /// usable without the files, and undoing it would be the larger surprise.
 #[test]
 fn open_says_so_when_the_parent_has_no_worktree_to_copy_from() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = dev\n\n[dev]\nchildren = staging\n\n[staging]\ncopy = .env\n",
     );
@@ -441,8 +888,15 @@ fn open_says_so_when_the_parent_has_no_worktree_to_copy_from() {
 
     let o = run_wt(&fx.repo, &["open", "staging"]);
     assert_ok(&o);
-    assert!(out(&o).contains("copied nothing: parent 'dev' has no worktree"), "{}", out(&o));
-    assert!(default_dest(&fx, "staging").exists(), "the worktree is created regardless");
+    assert!(
+        out(&o).contains("copied nothing: parent 'dev' has no worktree"),
+        "{}",
+        out(&o)
+    );
+    assert!(
+        default_dest(&fx, "staging").exists(),
+        "the worktree is created regardless"
+    );
 }
 
 /// A pattern with a separator can never match — entries are matched by name at
@@ -450,7 +904,10 @@ fn open_says_so_when_the_parent_has_no_worktree_to_copy_from() {
 #[test]
 fn a_copy_pattern_with_a_path_separator_is_a_load_error() {
     let fx = Fixture::new();
-    write_config(&fx, "[main]\nchildren = group:feat\n\n[group:feat]\ncopy = config/*.json\n");
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:feat\n\n[group:feat]\ncopy = config/*.json\n",
+    );
     let o = run_wt(&fx.repo, &["list"]);
     assert_fail(&o);
     assert!(
@@ -458,7 +915,11 @@ fn a_copy_pattern_with_a_path_separator_is_a_load_error() {
         "{}",
         err(&o)
     );
-    assert!(err(&o).contains(":5"), "the offending line is cited:\n{}", err(&o));
+    assert!(
+        err(&o).contains(":5"),
+        "the offending line is cited:\n{}",
+        err(&o)
+    );
 }
 
 // --------------------------------------------------------------- list/info ----
@@ -466,7 +927,7 @@ fn a_copy_pattern_with_a_path_separator_is_a_load_error() {
 #[test]
 fn list_shows_identities_unknowns_and_bare_branches() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = dev, group:feat\n\n[dev]\n\n[group:feat]\nname-allow = feature/*\n",
     );
@@ -478,7 +939,10 @@ fn list_shows_identities_unknowns_and_bare_branches() {
     let stdout = out(&o);
     assert!(stdout.contains("worktrees:"), "{stdout}");
     assert!(stdout.contains("* repo  main  fixed  root"), "{stdout}");
-    assert!(stdout.contains("feature/a  group:feat  parent: main"), "{stdout}");
+    assert!(
+        stdout.contains("feature/a  group:feat  parent: main"),
+        "{stdout}"
+    );
     assert!(stdout.contains("junk  UNKNOWN"), "{stdout}");
     assert!(stdout.contains("wtree adopt"), "{stdout}");
     assert!(stdout.contains("branches without worktrees:"), "{stdout}");
@@ -491,14 +955,17 @@ fn list_shows_identities_unknowns_and_bare_branches() {
 #[test]
 fn list_counts_the_commits_a_worktree_is_behind_its_parent() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n",
     );
     assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
 
     let level = out(&run_wt(&fx.repo, &["list"]));
-    assert!(!level.contains("[behind"), "just created, nothing behind:\n{level}");
+    assert!(
+        !level.contains("[behind"),
+        "just created, nothing behind:\n{level}"
+    );
 
     commit_other(&fx, &fx.repo, "one.txt", "one");
     commit_other(&fx, &fx.repo, "two.txt", "two");
@@ -509,7 +976,9 @@ fn list_counts_the_commits_a_worktree_is_behind_its_parent() {
         "{stdout}"
     );
     assert!(
-        stdout.lines().any(|l| l.contains("* repo  main") && !l.contains("[behind")),
+        stdout
+            .lines()
+            .any(|l| l.contains("* repo  main") && !l.contains("[behind")),
         "main is the root — it has no parent to fall behind:\n{stdout}"
     );
 }
@@ -517,7 +986,7 @@ fn list_counts_the_commits_a_worktree_is_behind_its_parent() {
 #[test]
 fn info_managed_shows_rules_and_previews() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat\nmerge-mode = squash\n\n[group:feat]\nname-allow = feature/*\n",
     );
@@ -528,10 +997,22 @@ fn info_managed_shows_rules_and_previews() {
     let stdout = out(&o);
     assert!(stdout.contains("identity: group:feat"), "{stdout}");
     assert!(stdout.contains("parent: main (recorded)"), "{stdout}");
-    assert!(stdout.contains("merge to 'main': squash (flag optional"), "{stdout}");
-    assert!(stdout.contains("merge: 'feature/a' -> 'main' (--squash)"), "{stdout}");
-    assert!(stdout.contains("sync: merge 'main' into 'feature/a'"), "{stdout}");
-    assert!(stdout.contains("destroy: would remove 'feature/a'"), "{stdout}");
+    assert!(
+        stdout.contains("merge to 'main': squash (flag optional"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("merge: 'feature/a' -> 'main' (--squash)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("sync: merge 'main' into 'feature/a'"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("destroy: would remove 'feature/a'"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("children: none declared — nothing may be created here"),
         "{stdout}"
@@ -541,7 +1022,7 @@ fn info_managed_shows_rules_and_previews() {
 #[test]
 fn info_unknown_shows_reasons_and_adopt_hint() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let junk = fx.add_worktree("junk", "main");
     let o = run_wt(&junk, &["info"]);
     assert_ok(&o);
@@ -550,7 +1031,7 @@ fn info_unknown_shows_reasons_and_adopt_hint() {
     assert!(stdout.contains("not a declared [branch]"), "{stdout}");
     assert!(stdout.contains("wtree adopt"), "{stdout}");
     assert!(
-        stdout.contains("allowed verbs here: open, close, list, info, init, adopt"),
+        stdout.contains("allowed verbs here: open, close, list, info, init, save, adopt"),
         "{stdout}"
     );
 }
@@ -585,7 +1066,7 @@ fn merge_cfg(modes: &str) -> String {
 #[test]
 fn merge_squash_lands_one_commit_and_converges() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("squash"));
+    write_rules(&fx, &merge_cfg("squash"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     fx.commit(&wt, "two");
@@ -593,20 +1074,35 @@ fn merge_squash_lands_one_commit_and_converges() {
     // single allowed mode: the flag may be omitted
     let o = run_wt(&wt, &["merge", "-m", "feat: a"]);
     assert_ok(&o);
-    assert!(out(&o).contains("merged 'feature/a' onto 'main'"), "{}", out(&o));
-    let count = fx.git(&fx.repo, &["rev-list", "--count", &format!("{before}..main")]);
+    assert!(
+        out(&o).contains("merged 'feature/a' onto 'main'"),
+        "{}",
+        out(&o)
+    );
+    let count = fx.git(
+        &fx.repo,
+        &["rev-list", "--count", &format!("{before}..main")],
+    );
     assert_eq!(count.trim(), "1", "squash lands exactly one commit");
-    assert_eq!(fx.git(&fx.repo, &["log", "-1", "--format=%s", "main"]).trim(), "feat: a");
+    assert_eq!(
+        fx.git(&fx.repo, &["log", "-1", "--format=%s", "main"])
+            .trim(),
+        "feat: a"
+    );
     // convergence: the branch sits exactly on the target
     assert_eq!(rev(&fx, "main"), rev(&fx, "feature/a"));
     // the target's checked-out worktree received the files
-    assert!(fs::read_to_string(fx.repo.join("f.txt")).unwrap().contains("two"));
+    assert!(
+        fs::read_to_string(fx.repo.join("f.txt"))
+            .unwrap()
+            .contains("two")
+    );
 }
 
 #[test]
 fn merge_rebase_replays_each_commit_onto_moved_target() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("rebase"));
+    write_rules(&fx, &merge_cfg("rebase"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     fx.commit(&wt, "two");
@@ -615,7 +1111,10 @@ fn merge_rebase_replays_each_commit_onto_moved_target() {
     let o = run_wt(&wt, &["merge"]);
     assert_ok(&o);
     assert!(out(&o).contains("2 commits"), "{}", out(&o));
-    let count = fx.git(&fx.repo, &["rev-list", "--count", &format!("{before}..main")]);
+    let count = fx.git(
+        &fx.repo,
+        &["rev-list", "--count", &format!("{before}..main")],
+    );
     assert_eq!(count.trim(), "3", "2 replayed + the target's own commit");
     let subjects = fx.git(&fx.repo, &["log", "-3", "--format=%s", "main"]);
     assert_eq!(subjects.trim(), "two\none\nmain moved");
@@ -625,7 +1124,7 @@ fn merge_rebase_replays_each_commit_onto_moved_target() {
 #[test]
 fn merge_no_ff_creates_merge_commit_without_target_checkout() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("no-ff"));
+    write_rules(&fx, &merge_cfg("no-ff"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     let main_before = rev(&fx, "main");
@@ -637,24 +1136,33 @@ fn merge_no_ff_creates_merge_commit_without_target_checkout() {
     assert_eq!(rev(&fx, "main^1"), main_before);
     assert_eq!(rev(&fx, "main^2"), feat_before);
     assert_eq!(
-        fx.git(&fx.repo, &["log", "-1", "--format=%s", "main"]).trim(),
+        fx.git(&fx.repo, &["log", "-1", "--format=%s", "main"])
+            .trim(),
         "merge feature/a"
     );
     assert_eq!(rev(&fx, "main"), rev(&fx, "feature/a")); // convergence
     // the primary worktree (main checked out) moved with the ff
-    assert!(fs::read_to_string(fx.repo.join("f.txt")).unwrap().contains("one"));
+    assert!(
+        fs::read_to_string(fx.repo.join("f.txt"))
+            .unwrap()
+            .contains("one")
+    );
 }
 
 #[test]
 fn merge_ff_moves_target_and_refuses_without_fallback() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("ff"));
+    write_rules(&fx, &merge_cfg("ff"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     let feat_tip = rev(&fx, "feature/a");
     let o = run_wt(&wt, &["merge"]);
     assert_ok(&o);
-    assert!(out(&o).contains("fast-forwarded 'main' to 'feature/a'"), "{}", out(&o));
+    assert!(
+        out(&o).contains("fast-forwarded 'main' to 'feature/a'"),
+        "{}",
+        out(&o)
+    );
     assert_eq!(rev(&fx, "main"), feat_tip); // ff: no new commit objects
 
     // fork again, let the target move: refused with the sync hint, no fallback
@@ -676,7 +1184,7 @@ fn merge_ff_moves_target_and_refuses_without_fallback() {
 #[test]
 fn merge_conflict_precheck_refuses_before_touching_anything() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("squash"));
+    write_rules(&fx, &merge_cfg("squash"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "branch side");
     fx.commit(&fx.repo, "main side"); // same spot in f.txt -> conflict
@@ -696,7 +1204,7 @@ fn merge_conflict_precheck_refuses_before_touching_anything() {
 #[test]
 fn merge_nothing_to_merge_is_refused() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("squash"));
+    write_rules(&fx, &merge_cfg("squash"));
     let wt = member(&fx, "feature/a", "feat", "main"); // no commits of its own
     let o = run_wt(&wt, &["merge", "-m", "empty"]);
     assert_fail(&o);
@@ -706,7 +1214,7 @@ fn merge_nothing_to_merge_is_refused() {
 #[test]
 fn merge_stashes_and_restores_uncommitted_work() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("squash"));
+    write_rules(&fx, &merge_cfg("squash"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     // dirty on top: a tracked edit and an untracked file
@@ -717,17 +1225,24 @@ fn merge_stashes_and_restores_uncommitted_work() {
     let o = run_wt(&wt, &["merge", "-m", "feat: a"]);
     assert_ok(&o);
     // only committed work landed
-    assert!(!fs::read_to_string(fx.repo.join("f.txt")).unwrap().contains("WIP"));
+    assert!(
+        !fs::read_to_string(fx.repo.join("f.txt"))
+            .unwrap()
+            .contains("WIP")
+    );
     // and the uncommitted work came back, not left in the stash
     assert!(fs::read_to_string(&f).unwrap().contains("WIP"));
-    assert_eq!(fs::read_to_string(wt.join("scratch.txt")).unwrap(), "notes\n");
+    assert_eq!(
+        fs::read_to_string(wt.join("scratch.txt")).unwrap(),
+        "notes\n"
+    );
     assert_eq!(fx.git(&wt, &["stash", "list"]).trim(), "");
 }
 
 #[test]
 fn merge_moves_uncheckedout_target_by_ref_update() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = dev\n\n[dev]\nchildren = group:feat\nmerge-mode = squash\n\n[group:feat]\nname-allow = feature/*\n",
     );
@@ -739,13 +1254,17 @@ fn merge_moves_uncheckedout_target_by_ref_update() {
     assert_ok(&o);
     assert_eq!(rev(&fx, "dev"), rev(&fx, "feature/a"));
     assert_eq!(rev(&fx, "main"), main_before); // main untouched
-    assert!(!fs::read_to_string(fx.repo.join("f.txt")).unwrap().contains("one"));
+    assert!(
+        !fs::read_to_string(fx.repo.join("f.txt"))
+            .unwrap()
+            .contains("one")
+    );
 }
 
 #[test]
 fn merge_rolls_back_branch_and_stash_when_target_ff_fails() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("squash"));
+    write_rules(&fx, &merge_cfg("squash"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     // work in progress in the target's worktree touching the same file: git
@@ -761,7 +1280,10 @@ fn merge_rolls_back_branch_and_stash_when_target_ff_fails() {
     assert!(stderr.contains("nothing merged"), "{stderr}");
     // branch restored to its original commit, stash restored
     assert_eq!(rev(&fx, "feature/a"), before);
-    assert_eq!(fs::read_to_string(wt.join("scratch.txt")).unwrap(), "notes\n");
+    assert_eq!(
+        fs::read_to_string(wt.join("scratch.txt")).unwrap(),
+        "notes\n"
+    );
     assert_eq!(fx.git(&wt, &["stash", "list"]).trim(), "");
 }
 
@@ -769,7 +1291,7 @@ fn merge_rolls_back_branch_and_stash_when_target_ff_fails() {
 fn merge_flag_and_message_rules() {
     let fx = Fixture::new();
     // two allowed modes: the flag is mandatory
-    write_config(&fx, &merge_cfg("squash, rebase"));
+    write_rules(&fx, &merge_cfg("squash, rebase"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     let o = run_wt(&wt, &["merge", "-m", "x"]);
@@ -778,7 +1300,11 @@ fn merge_flag_and_message_rules() {
     // a mode outside the allowed set is refused by the judge
     let o = run_wt(&wt, &["merge", "--ff"]);
     assert_fail(&o);
-    assert!(err(&o).contains("accepts squash, rebase merges only"), "{}", err(&o));
+    assert!(
+        err(&o).contains("accepts squash, rebase merges only"),
+        "{}",
+        err(&o)
+    );
     // --rebase with -m: nothing to name
     let o = run_wt(&wt, &["merge", "--rebase", "-m", "x"]);
     assert_fail(&o);
@@ -798,7 +1324,7 @@ fn merge_flag_and_message_rules() {
 #[test]
 fn sync_merges_parent_and_is_idempotent() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let wt = member(&fx, "feature/a", "feat", "main");
     // own work + parent work in different files: a true merge, no conflict
     commit_other(&fx, &wt, "mine.txt", "mine");
@@ -807,12 +1333,23 @@ fn sync_merges_parent_and_is_idempotent() {
     fs::write(wt.join("scratch.txt"), "notes\n").unwrap();
     let o = run_wt(&wt, &["sync"]);
     assert_ok(&o);
-    assert!(out(&o).contains("synced 'feature/a' with 'main'"), "{}", out(&o));
+    assert!(
+        out(&o).contains("synced 'feature/a' with 'main'"),
+        "{}",
+        out(&o)
+    );
     // parent contained; own commit kept; uncommitted work restored
     fx.git(&wt, &["merge-base", "--is-ancestor", "main", "feature/a"]);
-    assert!(fs::read_to_string(wt.join("f.txt")).unwrap().contains("parent work"));
+    assert!(
+        fs::read_to_string(wt.join("f.txt"))
+            .unwrap()
+            .contains("parent work")
+    );
     assert!(wt.join("mine.txt").exists());
-    assert_eq!(fs::read_to_string(wt.join("scratch.txt")).unwrap(), "notes\n");
+    assert_eq!(
+        fs::read_to_string(wt.join("scratch.txt")).unwrap(),
+        "notes\n"
+    );
     assert_eq!(fx.git(&wt, &["stash", "list"]).trim(), "");
     // a second sync has nothing to do
     let o2 = run_wt(&wt, &["sync"]);
@@ -823,7 +1360,7 @@ fn sync_merges_parent_and_is_idempotent() {
 #[test]
 fn sync_conflict_refused_with_guidance() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "branch side");
     fx.commit(&fx.repo, "main side"); // same spot in f.txt -> conflict
@@ -873,7 +1410,7 @@ fn state_read(wt: &Path) -> StateRead {
 #[test]
 fn adopt_records_a_raw_worktree() {
     let fx = Fixture::new();
-    write_config(&fx, ADOPT_CFG);
+    write_rules(&fx, ADOPT_CFG);
     let wt = fx.add_worktree("feature/a", "main"); // made with raw git: no record
     assert_eq!(state_read(&wt), StateRead::Missing);
     let o = run_wt(&wt, &["adopt", "--group", "feat", "--parent", "main"]);
@@ -883,7 +1420,10 @@ fn adopt_records_a_raw_worktree() {
         stdout.contains("adopted 'feature/a' (group:feat) with parent 'main'"),
         "{stdout}"
     );
-    assert!(!stdout.contains("replacing"), "nothing to replace: {stdout}");
+    assert!(
+        !stdout.contains("replacing"),
+        "nothing to replace: {stdout}"
+    );
     let s = state_of(&wt);
     assert_eq!(s.branch, "feature/a");
     assert_eq!(s.kind, Kind::Group("feat".into()));
@@ -891,13 +1431,17 @@ fn adopt_records_a_raw_worktree() {
     // managed from here on
     let info = run_wt(&wt, &["info"]);
     assert_ok(&info);
-    assert!(out(&info).contains("identity: group:feat"), "{}", out(&info));
+    assert!(
+        out(&info).contains("identity: group:feat"),
+        "{}",
+        out(&info)
+    );
 }
 
 #[test]
 fn adopt_free_needs_a_star_in_the_parents_children() {
     let fx = Fixture::new();
-    write_config(&fx, ADOPT_CFG);
+    write_rules(&fx, ADOPT_CFG);
     fx.git(&fx.repo, &["branch", "dev", "main"]);
     let wt = fx.add_worktree("junk", "main");
     // main lists '*'
@@ -914,14 +1458,16 @@ fn adopt_free_needs_a_star_in_the_parents_children() {
 #[test]
 fn readopt_corrects_group_and_parent_after_showing_the_old_record() {
     let fx = Fixture::new();
-    write_config(&fx, ADOPT_CFG);
+    write_rules(&fx, ADOPT_CFG);
     fx.git(&fx.repo, &["branch", "dev", "main"]);
     let wt = member(&fx, "feature/a", "feat", "main");
     let o = run_wt(&wt, &["adopt", "--group", "feat2", "--parent", "dev"]);
     assert_ok(&o);
     let stdout = out(&o);
     assert!(
-        stdout.contains("replacing the existing record: branch=feature/a, kind=group:feat, parent=main"),
+        stdout.contains(
+            "replacing the existing record: branch=feature/a, kind=group:feat, parent=main"
+        ),
         "{stdout}"
     );
     assert!(
@@ -936,7 +1482,7 @@ fn readopt_corrects_group_and_parent_after_showing_the_old_record() {
 #[test]
 fn adopt_recovers_a_record_head_mismatch() {
     let fx = Fixture::new();
-    write_config(&fx, ADOPT_CFG);
+    write_rules(&fx, ADOPT_CFG);
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.git(&wt, &["switch", "-q", "-c", "oops"]); // raw switch: the record now lies
     let refused = run_wt(&wt, &["sync"]);
@@ -964,7 +1510,7 @@ fn adopt_recovers_a_record_head_mismatch() {
 #[test]
 fn adopt_refusals_write_nothing() {
     let fx = Fixture::new();
-    write_config(&fx, ADOPT_CFG);
+    write_rules(&fx, ADOPT_CFG);
 
     // a declared group that is not in the parent's children
     let a = fx.add_worktree("feature/a", "main");
@@ -994,7 +1540,12 @@ fn adopt_refusals_write_nothing() {
     ] {
         let o = run_wt(&dev, &flags);
         assert_fail(&o);
-        assert!(err(&o).contains("name reservation"), "{:?}: {}", flags, err(&o));
+        assert!(
+            err(&o).contains("name reservation"),
+            "{:?}: {}",
+            flags,
+            err(&o)
+        );
     }
     assert_eq!(state_read(&dev), StateRead::Missing);
 
@@ -1013,27 +1564,45 @@ fn adopt_refusals_write_nothing() {
     // a nonexistent parent
     let o = run_wt(&a, &["adopt", "--group", "feat", "--parent", "ghost"]);
     assert_fail(&o);
-    assert!(err(&o).contains("parent branch 'ghost' does not exist"), "{}", err(&o));
+    assert!(
+        err(&o).contains("parent branch 'ghost' does not exist"),
+        "{}",
+        err(&o)
+    );
 }
 
 #[test]
 fn adopt_flag_combinations_fail_as_usage_errors() {
     let fx = Fixture::new();
-    write_config(&fx, ADOPT_CFG);
+    write_rules(&fx, ADOPT_CFG);
     let a = fx.add_worktree("feature/a", "main");
     for (flags, needle) in [
         (
             vec!["adopt", "--group", "feat", "--free", "--parent", "main"],
             "mutually exclusive",
         ),
-        (vec!["adopt", "--parent", "main"], "one of --group <X> or --free"),
-        (vec!["adopt", "--group", "feat"], "--parent <branch> is required"),
-        (vec!["adopt", "--free", "--parent", "main", "x"], "unknown argument 'x'"),
+        (
+            vec!["adopt", "--parent", "main"],
+            "one of --group <X> or --free",
+        ),
+        (
+            vec!["adopt", "--group", "feat"],
+            "--parent <branch> is required",
+        ),
+        (
+            vec!["adopt", "--free", "--parent", "main", "x"],
+            "unknown argument 'x'",
+        ),
     ] {
         let o = run_wt(&a, &flags);
         assert_eq!(o.status.code(), Some(2), "{flags:?} must be a usage error");
         assert!(err(&o).contains(needle), "{:?}: {}", flags, err(&o));
-        assert!(err(&o).contains("usage: wtree adopt"), "{:?}: {}", flags, err(&o));
+        assert!(
+            err(&o).contains("usage: wtree adopt"),
+            "{:?}: {}",
+            flags,
+            err(&o)
+        );
     }
     assert_eq!(state_read(&a), StateRead::Missing);
 }
@@ -1041,7 +1610,7 @@ fn adopt_flag_combinations_fail_as_usage_errors() {
 #[test]
 fn merge_refused_while_unmanaged_then_allowed_after_adopt() {
     let fx = Fixture::new();
-    write_config(&fx, ADOPT_CFG);
+    write_rules(&fx, ADOPT_CFG);
     let wt = fx.add_worktree("feature/a", "main"); // raw worktree, unmanaged
     fx.commit(&wt, "one");
     let o = run_wt(&wt, &["merge", "-m", "feat: a"]);
@@ -1052,7 +1621,10 @@ fn merge_refused_while_unmanaged_then_allowed_after_adopt() {
     assert!(stderr.contains("wtree adopt"), "{stderr}");
     let main_before = rev(&fx, "main");
 
-    assert_ok(&run_wt(&wt, &["adopt", "--group", "feat", "--parent", "main"]));
+    assert_ok(&run_wt(
+        &wt,
+        &["adopt", "--group", "feat", "--parent", "main"],
+    ));
     let o = run_wt(&wt, &["merge", "-m", "feat: a"]);
     assert_ok(&o);
     assert_ne!(rev(&fx, "main"), main_before);
@@ -1062,10 +1634,13 @@ fn merge_refused_while_unmanaged_then_allowed_after_adopt() {
 // ----------------------------------------------------------------- destroy ----
 
 fn branches(fx: &Fixture) -> Vec<String> {
-    fx.git(&fx.repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])
-        .lines()
-        .map(str::to_string)
-        .collect()
+    fx.git(
+        &fx.repo,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+    .lines()
+    .map(str::to_string)
+    .collect()
 }
 
 /// The confirmation key out of a refusal that issued one.
@@ -1110,7 +1685,7 @@ const EPH_CFG: &str = "[main]\n\
 #[test]
 fn destroy_clean_leaf_removes_worktree_and_branch() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let wt = member(&fx, "feature/a", "feat", "main");
     let o = run_wt(&wt, &["destroy"]);
     assert_ok(&o);
@@ -1119,13 +1694,16 @@ fn destroy_clean_leaf_removes_worktree_and_branch() {
     assert!(!wt.exists(), "worktree directory survived");
     assert_eq!(branches(&fx), vec!["main".to_string()]);
     // git no longer knows the worktree either
-    assert!(!fx.git(&fx.repo, &["worktree", "list"]).contains("wtree-feature-a"));
+    assert!(
+        !fx.git(&fx.repo, &["worktree", "list"])
+            .contains("wtree-feature-a")
+    );
 }
 
 #[test]
 fn destroy_refuses_undestroyable_branch_even_with_force() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = dev\n\n[dev]\nchildren = group:feat\ndestroyable = false\n\n\
          [group:feat]\nname-allow = feature/*\n",
@@ -1138,8 +1716,14 @@ fn destroy_refuses_undestroyable_branch_even_with_force() {
         let o = run_wt(&dev, &flags);
         assert_fail(&o);
         let stderr = err(&o);
-        assert!(stderr.contains("destroyable = false"), "{flags:?}: {stderr}");
-        assert!(stderr.contains("--force cannot override"), "{flags:?}: {stderr}");
+        assert!(
+            stderr.contains("destroyable = false"),
+            "{flags:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("--force cannot override"),
+            "{flags:?}: {stderr}"
+        );
     }
     assert_eq!(branches(&fx), vec!["dev".to_string(), "main".into()]);
     assert!(dev.join("f.txt").exists());
@@ -1148,7 +1732,7 @@ fn destroy_refuses_undestroyable_branch_even_with_force() {
 #[test]
 fn destroy_refuses_the_primary_worktree() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let o = run_wt(&fx.repo, &["destroy", "--force"]);
     assert_fail(&o);
     assert!(err(&o).contains("primary worktree"), "{}", err(&o));
@@ -1159,7 +1743,7 @@ fn destroy_refuses_the_primary_worktree() {
 #[test]
 fn destroy_refuses_a_live_non_ephemeral_child_even_with_force() {
     let fx = Fixture::new();
-    write_config(&fx, NESTED_CFG);
+    write_rules(&fx, NESTED_CFG);
     let a = member(&fx, "feature/a", "feat", "main");
     let s = member(&fx, "sub/x", "sub", "feature/a");
     for flags in [vec!["destroy"], vec!["destroy", "--force"]] {
@@ -1168,7 +1752,10 @@ fn destroy_refuses_a_live_non_ephemeral_child_even_with_force() {
         let stderr = err(&o);
         assert!(stderr.contains("'sub/x'"), "{flags:?}: {stderr}");
         assert!(stderr.contains("not ephemeral"), "{flags:?}: {stderr}");
-        assert!(stderr.contains("--force cannot override"), "{flags:?}: {stderr}");
+        assert!(
+            stderr.contains("--force cannot override"),
+            "{flags:?}: {stderr}"
+        );
     }
     assert!(a.is_dir() && s.is_dir());
     assert_eq!(branches(&fx).len(), 3);
@@ -1177,16 +1764,26 @@ fn destroy_refuses_a_live_non_ephemeral_child_even_with_force() {
 #[test]
 fn destroy_cascades_ephemeral_children_leaf_first() {
     let fx = Fixture::new();
-    write_config(&fx, EPH_CFG);
+    write_rules(&fx, EPH_CFG);
     let mid = member(&fx, "mid/a", "mid", "main");
     let e1 = member(&fx, "eph/1", "eph", "mid/a");
     let e2 = member(&fx, "eph/2", "eph", "eph/1");
     let o = run_wt(&mid, &["destroy"]);
     assert_ok(&o);
     let stdout = out(&o);
-    let at = |s: &str| stdout.find(s).unwrap_or_else(|| panic!("missing {s} in:\n{stdout}"));
-    assert!(at("wtree-eph-2") < at("wtree-eph-1"), "leaf first:\n{stdout}");
-    assert!(at("wtree-eph-1") < at("wtree-mid-a"), "children before the parent:\n{stdout}");
+    let at = |s: &str| {
+        stdout
+            .find(s)
+            .unwrap_or_else(|| panic!("missing {s} in:\n{stdout}"))
+    };
+    assert!(
+        at("wtree-eph-2") < at("wtree-eph-1"),
+        "leaf first:\n{stdout}"
+    );
+    assert!(
+        at("wtree-eph-1") < at("wtree-mid-a"),
+        "children before the parent:\n{stdout}"
+    );
     assert!(!mid.exists() && !e1.exists() && !e2.exists());
     assert_eq!(branches(&fx), vec!["main".to_string()]);
 }
@@ -1194,7 +1791,7 @@ fn destroy_cascades_ephemeral_children_leaf_first() {
 #[test]
 fn destroy_refuses_the_whole_cascade_when_one_child_is_dirty() {
     let fx = Fixture::new();
-    write_config(&fx, EPH_CFG);
+    write_rules(&fx, EPH_CFG);
     let mid = member(&fx, "mid/a", "mid", "main");
     let e1 = member(&fx, "eph/1", "eph", "mid/a");
     let e2 = member(&fx, "eph/2", "eph", "eph/1");
@@ -1212,7 +1809,7 @@ fn destroy_refuses_the_whole_cascade_when_one_child_is_dirty() {
 #[test]
 fn destroy_requires_the_confirmation_key_when_work_would_be_lost() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "unmerged work");
     fx.make_dirty(&wt);
@@ -1247,7 +1844,7 @@ fn destroy_requires_the_confirmation_key_when_work_would_be_lost() {
 #[test]
 fn destroy_after_a_squash_merge_needs_no_key() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     fx.commit(&wt, "two");
@@ -1256,7 +1853,8 @@ fn destroy_after_a_squash_merge_needs_no_key() {
     fx.git(&fx.repo, &["commit", "-q", "-m", "squashed"]);
     commit_other(&fx, &fx.repo, "other.txt", "main moved on");
     assert!(
-        !fx.git(&fx.repo, &["branch", "--merged", "main"]).contains("feature/a"),
+        !fx.git(&fx.repo, &["branch", "--merged", "main"])
+            .contains("feature/a"),
         "the fixture must be a real squash, not an ancestry merge"
     );
     let o = run_wt(&wt, &["destroy"]);
@@ -1287,15 +1885,21 @@ const MIDDLE_CFG: &str = "[main]\n\
 #[test]
 fn open_fixed_branch_creates_a_worktree_without_a_record() {
     let fx = Fixture::new();
-    write_config(&fx, MIDDLE_CFG);
+    write_rules(&fx, MIDDLE_CFG);
     fx.git(&fx.repo, &["branch", "dev", "main"]); // exists, has no worktree
     let o = run_wt(&fx.repo, &["open", "dev"]);
     assert_ok(&o);
     let dest = default_dest(&fx, "dev");
     let stdout = out(&o);
     assert!(stdout.contains("opened 'dev' (fixed)"), "{stdout}");
-    assert!(stdout.contains(&format!("cd {}", dest.display())), "{stdout}");
-    assert!(!stdout.contains("wtree adopt"), "a declared branch is managed already: {stdout}");
+    assert!(
+        stdout.contains(&format!("cd {}", dest.display())),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("wtree adopt"),
+        "a declared branch is managed already: {stdout}"
+    );
     assert_eq!(repo::head_branch(&dest).unwrap().as_deref(), Some("dev"));
     // [dev] IS the identity, so open writes nothing
     assert_eq!(state_read(&dest), StateRead::Missing);
@@ -1307,7 +1911,7 @@ fn open_fixed_branch_creates_a_worktree_without_a_record() {
 #[test]
 fn open_unknown_branch_stays_unknown_until_adopted() {
     let fx = Fixture::new();
-    write_config(&fx, ADOPT_CFG);
+    write_rules(&fx, ADOPT_CFG);
     fx.git(&fx.repo, &["branch", "feature/a", "main"]);
     let o = run_wt(&fx.repo, &["open", "feature/a"]);
     assert_ok(&o);
@@ -1323,7 +1927,10 @@ fn open_unknown_branch_stays_unknown_until_adopted() {
         out(&run_wt(&dest, &["info"]))
     );
     // the hint is the whole point: adopt runs in the worktree open just made
-    assert_ok(&run_wt(&dest, &["adopt", "--group", "feat", "--parent", "main"]));
+    assert_ok(&run_wt(
+        &dest,
+        &["adopt", "--group", "feat", "--parent", "main"],
+    ));
     let s = state_of(&dest);
     assert_eq!(s.branch, "feature/a");
     assert_eq!(s.kind, Kind::Group("feat".into()));
@@ -1333,13 +1940,16 @@ fn open_unknown_branch_stays_unknown_until_adopted() {
 #[test]
 fn open_and_new_point_at_each_other() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     // open has no branch to attach to
     let o = run_wt(&fx.repo, &["open", "feature/ghost"]);
     assert_fail(&o);
     let stderr = err(&o);
     assert!(stderr.contains("wtree open: refused"), "{stderr}");
-    assert!(stderr.contains("branch 'feature/ghost' does not exist"), "{stderr}");
+    assert!(
+        stderr.contains("branch 'feature/ghost' does not exist"),
+        "{stderr}"
+    );
     assert!(stderr.contains("wtree new feature/ghost"), "{stderr}");
     assert!(!default_dest(&fx, "feature/ghost").exists());
 
@@ -1348,7 +1958,10 @@ fn open_and_new_point_at_each_other() {
     let o = run_wt(&fx.repo, &["new", "feature/a"]);
     assert_fail(&o);
     let stderr = err(&o);
-    assert!(stderr.contains("branch 'feature/a' already exists"), "{stderr}");
+    assert!(
+        stderr.contains("branch 'feature/a' already exists"),
+        "{stderr}"
+    );
     assert!(stderr.contains("wtree open feature/a"), "{stderr}");
 
     // and that open is refused too, because the branch is checked out already
@@ -1356,14 +1969,20 @@ fn open_and_new_point_at_each_other() {
     assert_fail(&o);
     let stderr = err(&o);
     assert!(stderr.contains("already checked out at"), "{stderr}");
-    assert!(stderr.contains("wtree-feature-a"), "the path must be named: {stderr}");
+    assert!(
+        stderr.contains("wtree-feature-a"),
+        "the path must be named: {stderr}"
+    );
     assert!(wt.is_dir());
 }
 
 #[test]
 fn close_keeps_a_protected_fixed_branch() {
     let fx = Fixture::new();
-    write_config(&fx, "[main]\nchildren = dev\n\n[dev]\ndestroyable = false\n");
+    write_rules(
+        &fx,
+        "[main]\nchildren = dev\n\n[dev]\ndestroyable = false\n",
+    );
     assert_ok(&run_wt(&fx.repo, &["new", "dev"]));
     let dev = default_dest(&fx, "dev");
     // destroy is refused unconditionally — close is the verb that exists for it
@@ -1376,16 +1995,22 @@ fn close_keeps_a_protected_fixed_branch() {
     let stdout = out(&o);
     assert!(stdout.contains("closed worktree"), "{stdout}");
     assert!(stdout.contains("branch 'dev' is kept"), "{stdout}");
-    assert!(!stdout.contains("unmanaged now"), "a declared branch stays managed: {stdout}");
+    assert!(
+        !stdout.contains("unmanaged now"),
+        "a declared branch stays managed: {stdout}"
+    );
     assert!(!dev.exists());
     assert_eq!(branches(&fx), vec!["dev".to_string(), "main".into()]);
-    assert!(!fx.git(&fx.repo, &["worktree", "list"]).contains("repo.worktrees"));
+    assert!(
+        !fx.git(&fx.repo, &["worktree", "list"])
+            .contains("repo.worktrees")
+    );
 }
 
 #[test]
 fn close_fixed_parent_still_receives_its_children() {
     let fx = Fixture::new();
-    write_config(&fx, MIDDLE_CFG);
+    write_rules(&fx, MIDDLE_CFG);
     assert_ok(&run_wt(&fx.repo, &["new", "dev"]));
     let dev = default_dest(&fx, "dev");
     assert_ok(&run_wt(&dev, &["new", "feature/a"]));
@@ -1398,14 +2023,18 @@ fn close_fixed_parent_still_receives_its_children() {
     fx.commit(&a, "work");
     let o = run_wt(&a, &["merge", "-m", "feat: a"]);
     assert_ok(&o);
-    assert!(out(&o).contains("merged 'feature/a' onto 'dev'"), "{}", out(&o));
+    assert!(
+        out(&o).contains("merged 'feature/a' onto 'dev'"),
+        "{}",
+        out(&o)
+    );
     assert_eq!(rev(&fx, "dev"), rev(&fx, "feature/a"));
 }
 
 #[test]
 fn close_refuses_a_group_branch_with_live_children() {
     let fx = Fixture::new();
-    write_config(&fx, NESTED_CFG);
+    write_rules(&fx, NESTED_CFG);
     let a = member(&fx, "feature/a", "feat", "main");
     let sub = member(&fx, "sub/x", "sub", "feature/a");
     let o = run_wt(&a, &["close"]);
@@ -1419,7 +2048,7 @@ fn close_refuses_a_group_branch_with_live_children() {
     // an ephemeral child blocks just the same: close never cascades, so it
     // would be left behind with an unmanaged parent
     let fx = Fixture::new();
-    write_config(&fx, EPH_CFG);
+    write_rules(&fx, EPH_CFG);
     let mid = member(&fx, "mid/a", "mid", "main");
     member(&fx, "eph/1", "eph", "mid/a");
     let o = run_wt(&mid, &["close"]);
@@ -1431,7 +2060,7 @@ fn close_refuses_a_group_branch_with_live_children() {
 #[test]
 fn close_group_branch_drops_its_record() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let wt = member(&fx, "feature/a", "feat", "main");
     let o = run_wt(&wt, &["close"]);
     assert_ok(&o);
@@ -1449,7 +2078,7 @@ fn close_group_branch_drops_its_record() {
 #[test]
 fn close_dirty_worktree_needs_the_confirmation_key() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "unmerged work");
     fx.make_dirty(&wt);
@@ -1457,7 +2086,10 @@ fn close_dirty_worktree_needs_the_confirmation_key() {
     let o = run_wt(&wt, &["close"]);
     assert_fail(&o);
     let stderr = err(&o);
-    assert!(stderr.contains("uncommitted changes go with the worktree"), "{stderr}");
+    assert!(
+        stderr.contains("uncommitted changes go with the worktree"),
+        "{stderr}"
+    );
     // the commits are not work loss here: the branch keeps them
     assert!(!stderr.contains("not reflected"), "{stderr}");
     let key = issued_key(&stderr);
@@ -1478,7 +2110,7 @@ fn close_dirty_worktree_needs_the_confirmation_key() {
 #[test]
 fn close_refuses_the_primary_worktree() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     let o = run_wt(&fx.repo, &["close"]);
     assert_fail(&o);
     assert!(err(&o).contains("primary worktree"), "{}", err(&o));
@@ -1489,7 +2121,7 @@ fn close_refuses_the_primary_worktree() {
 #[test]
 fn open_close_round_trip_keeps_a_fixed_branch_working() {
     let fx = Fixture::new();
-    write_config(&fx, MIDDLE_CFG);
+    write_rules(&fx, MIDDLE_CFG);
     assert_ok(&run_wt(&fx.repo, &["new", "dev"]));
     let dev = default_dest(&fx, "dev");
     assert_ok(&run_wt(&dev, &["close"]));
@@ -1511,7 +2143,7 @@ fn open_close_round_trip_keeps_a_fixed_branch_working() {
 #[test]
 fn merge_and_sync_fail_closed_when_the_parent_became_unmanaged() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\n\
          children = group:mid\n\
@@ -1532,7 +2164,11 @@ fn merge_and_sync_fail_closed_when_the_parent_became_unmanaged() {
     // while the parent is managed, its merge-mode rules the merge
     let o = run_wt(&leaf, &["merge", "--no-ff", "-m", "x"]);
     assert_fail(&o);
-    assert!(err(&o).contains("accepts squash merges only"), "{}", err(&o));
+    assert!(
+        err(&o).contains("accepts squash merges only"),
+        "{}",
+        err(&o)
+    );
 
     // raw `git worktree remove` — what there was before `close`, and what
     // `close` now refuses precisely because it strands the children
@@ -1550,22 +2186,35 @@ fn merge_and_sync_fail_closed_when_the_parent_became_unmanaged() {
         let o = run_wt(&leaf, &flags);
         assert_fail(&o);
         let stderr = err(&o);
-        assert!(stderr.contains("parent 'mid/a' is unmanaged"), "{flags:?}: {stderr}");
+        assert!(
+            stderr.contains("parent 'mid/a' is unmanaged"),
+            "{flags:?}: {stderr}"
+        );
         assert!(stderr.contains("fail closed"), "{flags:?}: {stderr}");
         assert!(stderr.contains("wtree open mid/a"), "{flags:?}: {stderr}");
     }
     assert_eq!(rev(&fx, "mid/a"), mid_before, "nothing may have landed");
     // info does not advertise the modes merge will refuse, either
     let info = out(&run_wt(&leaf, &["info"]));
-    assert!(info.contains("merge to 'mid/a': no rules readable"), "{info}");
+    assert!(
+        info.contains("merge to 'mid/a': no rules readable"),
+        "{info}"
+    );
 
     // reopening and re-adopting the parent puts its rules back in force
     assert_ok(&run_wt(&fx.repo, &["open", "mid/a"]));
     let reopened = default_dest(&fx, "mid/a");
-    assert_ok(&run_wt(&reopened, &["adopt", "--group", "mid", "--parent", "main"]));
+    assert_ok(&run_wt(
+        &reopened,
+        &["adopt", "--group", "mid", "--parent", "main"],
+    ));
     let o = run_wt(&leaf, &["merge", "--no-ff", "-m", "x"]);
     assert_fail(&o);
-    assert!(err(&o).contains("accepts squash merges only"), "{}", err(&o));
+    assert!(
+        err(&o).contains("accepts squash merges only"),
+        "{}",
+        err(&o)
+    );
     assert_ok(&run_wt(&leaf, &["merge", "--squash", "-m", "feat: x"]));
     assert_eq!(rev(&fx, "mid/a"), rev(&fx, "leaf/x"));
 }
@@ -1575,7 +2224,7 @@ fn merge_and_sync_fail_closed_when_the_parent_became_unmanaged() {
 #[test]
 fn land_merges_then_destroys() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("squash"));
+    write_rules(&fx, &merge_cfg("squash"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     fx.commit(&wt, "two");
@@ -1583,13 +2232,30 @@ fn land_merges_then_destroys() {
     let o = run_wt(&wt, &["land", "-m", "feat: a"]);
     assert_ok(&o);
     let stdout = out(&o);
-    assert!(stdout.contains("merged 'feature/a' onto 'main'"), "{stdout}");
-    assert!(!stdout.contains("worktree kept"), "land removes it: {stdout}");
+    assert!(
+        stdout.contains("merged 'feature/a' onto 'main'"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("worktree kept"),
+        "land removes it: {stdout}"
+    );
     assert!(stdout.contains("destroyed worktree"), "{stdout}");
-    let count = fx.git(&fx.repo, &["rev-list", "--count", &format!("{before}..main")]);
+    let count = fx.git(
+        &fx.repo,
+        &["rev-list", "--count", &format!("{before}..main")],
+    );
     assert_eq!(count.trim(), "1");
-    assert_eq!(fx.git(&fx.repo, &["log", "-1", "--format=%s", "main"]).trim(), "feat: a");
-    assert!(fs::read_to_string(fx.repo.join("f.txt")).unwrap().contains("two"));
+    assert_eq!(
+        fx.git(&fx.repo, &["log", "-1", "--format=%s", "main"])
+            .trim(),
+        "feat: a"
+    );
+    assert!(
+        fs::read_to_string(fx.repo.join("f.txt"))
+            .unwrap()
+            .contains("two")
+    );
     assert!(!wt.exists());
     assert_eq!(branches(&fx), vec!["main".to_string()]);
 }
@@ -1597,7 +2263,7 @@ fn land_merges_then_destroys() {
 #[test]
 fn land_preflight_refuses_before_merging() {
     let fx = Fixture::new();
-    write_config(&fx, NESTED_CFG);
+    write_rules(&fx, NESTED_CFG);
     let a = member(&fx, "feature/a", "feat", "main");
     let s = member(&fx, "sub/x", "sub", "feature/a");
     fx.commit(&a, "one");
@@ -1620,7 +2286,7 @@ fn land_preflight_refuses_before_merging() {
 #[test]
 fn land_refuses_uncommitted_work_before_merging() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("squash"));
+    write_rules(&fx, &merge_cfg("squash"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     fx.make_dirty(&wt);
@@ -1629,7 +2295,10 @@ fn land_refuses_uncommitted_work_before_merging() {
     assert_fail(&o);
     let stderr = err(&o);
     assert!(stderr.contains("uncommitted changes"), "{stderr}");
-    assert!(stderr.contains("`wtree merge` and then `wtree destroy`"), "{stderr}");
+    assert!(
+        stderr.contains("`wtree merge` and then `wtree destroy`"),
+        "{stderr}"
+    );
     assert_eq!(rev(&fx, "main"), main_before);
     assert!(wt.is_dir());
     assert!(wt.join("scratch.txt").exists());
@@ -1638,7 +2307,7 @@ fn land_refuses_uncommitted_work_before_merging() {
 #[test]
 fn land_with_nothing_to_merge_goes_straight_to_destroy() {
     let fx = Fixture::new();
-    write_config(&fx, &merge_cfg("squash"));
+    write_rules(&fx, &merge_cfg("squash"));
     let wt = member(&fx, "feature/a", "feat", "main");
     fx.commit(&wt, "one");
     // the documented main flow: merge while working, land at the end
@@ -1656,12 +2325,12 @@ fn land_with_nothing_to_merge_goes_straight_to_destroy() {
     assert_eq!(branches(&fx), vec!["main".to_string()]);
 }
 
-// ------------------------------------------------------------ config gating ----
+// ------------------------------------------------------------ rules gating ----
 
 #[test]
-fn verbs_require_init_and_valid_config() {
+fn verbs_require_init_and_valid_rules() {
     let fx = Fixture::new();
-    // no config yet
+    // no rules yet
     for verb in ["list", "info", "new"] {
         let o = if verb == "new" {
             run_wt(&fx.repo, &["new", "feature/a"])
@@ -1669,15 +2338,22 @@ fn verbs_require_init_and_valid_config() {
             run_wt(&fx.repo, &[verb])
         };
         assert_fail(&o);
-        assert!(err(&o).contains("run `wtree init` first"), "{verb}: {}", err(&o));
+        assert!(
+            err(&o).contains("run `wtree init` first"),
+            "{verb}: {}",
+            err(&o)
+        );
     }
-    // a config with errors blocks execution, citing label:line
-    write_config(&fx, "[main]\nchildren = group:ghost\n");
+    // a rules with errors blocks execution, citing label:line
+    write_rules(&fx, "[main]\nchildren = group:ghost\n");
     let o = run_wt(&fx.repo, &["list"]);
     assert_fail(&o);
     let stderr = err(&o);
-    assert!(stderr.contains("undeclared group 'group:ghost'"), "{stderr}");
-    assert!(stderr.contains("(.git/wtree/config:2)"), "{stderr}");
+    assert!(
+        stderr.contains("undeclared group 'group:ghost'"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("(.git/wtree/rules:2)"), "{stderr}");
 }
 
 #[test]
@@ -1687,7 +2363,10 @@ fn a_closed_reader_does_not_panic() {
     // Dropping the pipe before the verb reaches its first print reproduces it:
     // the child spends several git invocations gathering facts first.
     let fx = Fixture::new();
-    write_config(&fx, "[main]\nchildren = group:g\n\n[group:g]\nname-allow = feature/*\n");
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:g\n\n[group:g]\nname-allow = feature/*\n",
+    );
     let mut child = Command::new(env!("CARGO_BIN_EXE_wtree"))
         .current_dir(&fx.repo)
         .args(["info"])
@@ -1699,7 +2378,11 @@ fn a_closed_reader_does_not_panic() {
         .expect("failed to spawn wtree");
     drop(child.stdout.take());
     let status = child.wait().expect("wait failed");
-    assert_ne!(status.code(), Some(101), "printing to a closed pipe panicked");
+    assert_ne!(
+        status.code(),
+        Some(101),
+        "printing to a closed pipe panicked"
+    );
 }
 
 // -------------------------------------------------------------------- help ----
@@ -1753,7 +2436,7 @@ fn assert_hidden_verbs_refuse(dir: &Path, menu: &str) {
 #[test]
 fn the_menu_lists_what_policy_allows_and_hides_what_it_refuses() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat\ndestroyable = false\n\n\
          [group:feat]\nname-allow = feature/*\nmerge-mode = squash\n",
@@ -1765,7 +2448,10 @@ fn the_menu_lists_what_policy_allows_and_hides_what_it_refuses() {
     assert!(menu.starts_with("main (fixed)"), "{menu}");
     assert!(menu.contains("new <name>"), "{menu}");
     for hidden in ["merge", "sync", "land", "close", "destroy"] {
-        assert!(!menu.contains(&format!("  {hidden}")), "'{hidden}' in:\n{menu}");
+        assert!(
+            !menu.contains(&format!("  {hidden}")),
+            "'{hidden}' in:\n{menu}"
+        );
     }
     // list/info are unconditional, and the hint names the way to the rest
     assert!(menu.contains("  list "), "{menu}");
@@ -1779,7 +2465,10 @@ fn the_menu_lists_what_policy_allows_and_hides_what_it_refuses() {
     let menu = out(&run_wt(&wt, &[]));
     assert!(menu.starts_with("feature/a (group:feat)"), "{menu}");
     for shown in ["merge", "sync", "land", "close", "destroy", "adopt"] {
-        assert!(menu.contains(&format!("  {shown}")), "'{shown}' missing:\n{menu}");
+        assert!(
+            menu.contains(&format!("  {shown}")),
+            "'{shown}' missing:\n{menu}"
+        );
     }
     // [group:feat] declares no children, so nothing forks from here
     assert!(!menu.contains("new <name>"), "{menu}");
@@ -1789,7 +2478,7 @@ fn the_menu_lists_what_policy_allows_and_hides_what_it_refuses() {
 #[test]
 fn description_says_what_the_current_branch_is_for() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat\ndestroyable = false\ndescription = release line\n\n\
          [group:feat]\nname-allow = feature/*\ndescription = one feature each, land into main\n",
@@ -1810,18 +2499,25 @@ fn description_says_what_the_current_branch_is_for() {
         "{menu}"
     );
     assert!(!menu.contains("release line"), "{menu}");
-    assert!(
-        out(&run_wt(&wt, &["info"])).contains("description: one feature each, land into main")
-    );
+    assert!(out(&run_wt(&wt, &["info"])).contains("description: one feature each, land into main"));
 }
 
 #[test]
 fn description_absent_prints_no_line() {
     let fx = Fixture::new();
-    write_config(&fx, "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n");
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n",
+    );
     let menu = out(&run_wt(&fx.repo, &[]));
-    assert!(menu.starts_with("main (fixed)\n\n"), "no blank description line:\n{menu}");
-    assert!(!out(&run_wt(&fx.repo, &["info"])).contains("description:"), "{menu}");
+    assert!(
+        menu.starts_with("main (fixed)\n\n"),
+        "no blank description line:\n{menu}"
+    );
+    assert!(
+        !out(&run_wt(&fx.repo, &["info"])).contains("description:"),
+        "{menu}"
+    );
 }
 
 #[test]
@@ -1829,7 +2525,7 @@ fn the_menu_spells_merge_modes_but_never_key_or_force() {
     let fx = Fixture::new();
     // main takes one mode, so merge names it; the group takes two, so the
     // flag becomes a choice the menu has to show.
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat\nmerge-mode = ff\n\n\
          [group:feat]\nchildren = group:sub\nname-allow = feature/*\nmerge-mode = squash, no-ff\n\n\
@@ -1840,7 +2536,10 @@ fn the_menu_spells_merge_modes_but_never_key_or_force() {
     assert_ok(&run_wt(&parent, &["new", "sub/x"]));
     let child = default_dest(&fx, "sub/x");
 
-    assert!(out(&run_wt(&parent, &[])).contains("merge --ff"), "one mode is named");
+    assert!(
+        out(&run_wt(&parent, &[])).contains("merge --ff"),
+        "one mode is named"
+    );
     let menu = out(&run_wt(&child, &[]));
     assert!(menu.contains("merge [--squash|--no-ff]"), "{menu}");
     assert!(menu.contains("land [--squash|--no-ff]"), "{menu}");
@@ -1861,20 +2560,23 @@ fn the_menu_spells_merge_modes_but_never_key_or_force() {
 #[test]
 fn an_unmanaged_worktree_offers_only_the_way_back() {
     let fx = Fixture::new();
-    write_config(&fx, GROUP_CFG);
+    write_rules(&fx, GROUP_CFG);
     fx.git(&fx.repo, &["branch", "stray", "main"]);
     assert_ok(&run_wt(&fx.repo, &["open", "stray"]));
     let wt = default_dest(&fx, "stray");
     let menu = out(&run_wt(&wt, &[]));
     assert!(menu.starts_with("stray (unmanaged)"), "{menu}");
-    assert!(menu.contains("adopt (--group G | --free) --parent P"), "{menu}");
+    assert!(
+        menu.contains("adopt (--group G | --free) --parent P"),
+        "{menu}"
+    );
     assert_hidden_verbs_refuse(&wt, &menu);
 }
 
 #[test]
 fn open_and_new_answer_a_missing_argument_with_what_they_accept() {
     let fx = Fixture::new();
-    write_config(
+    write_rules(
         &fx,
         "[main]\nchildren = group:feat, group:any, dev\n\n\
          [group:feat]\nname-allow = feature/*\nname-deny = feature/tmp-*\n\n[group:any]\n\n[dev]\n",
@@ -1882,7 +2584,11 @@ fn open_and_new_answer_a_missing_argument_with_what_they_accept() {
     fx.git(&fx.repo, &["branch", "loose", "main"]);
 
     let o = run_wt(&fx.repo, &["new"]);
-    assert_eq!(o.status.code(), Some(2), "a missing name is still a usage error");
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "a missing name is still a usage error"
+    );
     assert!(out(&o).is_empty(), "usage errors do not go to stdout");
     let e = err(&o);
     assert!(e.contains("usage: wtree new <name>"), "{e}");
@@ -1897,7 +2603,10 @@ fn open_and_new_answer_a_missing_argument_with_what_they_accept() {
     let e = err(&o);
     assert!(e.contains("usage: wtree open <branch>"), "{e}");
     // 'loose' has no worktree and no declaration; 'main' has one already
-    assert!(e.contains("loose") && e.contains("unmanaged until adopted"), "{e}");
+    assert!(
+        e.contains("loose") && e.contains("unmanaged until adopted"),
+        "{e}"
+    );
     assert!(!e.contains("\n  main"), "main is checked out here: {e}");
 
     // Everything opened: the screen says so rather than showing an empty list.
@@ -1907,22 +2616,27 @@ fn open_and_new_answer_a_missing_argument_with_what_they_accept() {
 }
 
 #[test]
-fn the_manual_needs_neither_a_repo_nor_a_readable_config() {
+fn the_manual_needs_neither_a_repo_nor_a_readable_rules() {
     let fx = Fixture::new();
     // Broken beyond loading: the moment a user most needs to look a verb up.
-    write_config(&fx, "[main]\nchildren = group:ghost\nbogus-key = 1\n");
+    write_rules(&fx, "[main]\nchildren = group:ghost\nbogus-key = 1\n");
     let o = run_wt(&fx.repo, &["help", "--all"]);
     assert_ok(&o);
     let stdout = out(&o);
-    for verb in ["new", "open", "close", "merge", "sync", "land", "destroy", "adopt", "init"] {
-        assert!(stdout.contains(&format!("wtree {verb}")), "'{verb}' missing:\n{stdout}");
+    for verb in [
+        "new", "open", "close", "merge", "sync", "land", "destroy", "adopt", "init",
+    ] {
+        assert!(
+            stdout.contains(&format!("wtree {verb}")),
+            "'{verb}' missing:\n{stdout}"
+        );
     }
     // ... and outside a git repo entirely
     let o = run_wt(&fx.tmp.0, &["help", "--all"]);
     assert_ok(&o);
     assert!(out(&o).contains("wtree merge"));
 
-    // The contextual menu cannot be built from that config, and says so.
+    // The contextual menu cannot be built from that rules, and says so.
     assert_fail(&run_wt(&fx.repo, &[]));
 }
 

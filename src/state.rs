@@ -73,7 +73,9 @@ pub enum StateRead {
     /// No state file — not managed by wtree (fail closed).
     Missing,
     /// File exists but is corrupt: missing field, unknown version, bad syntax.
-    Invalid { reason: String },
+    Invalid {
+        reason: String,
+    },
     Valid(State),
 }
 
@@ -242,8 +244,14 @@ mod tests {
     #[test]
     fn corrupt_variants_are_invalid_with_reason() {
         let cases: &[(&str, &str)] = &[
-            ("version = 1\nbranch = a\nkind = free\n", "missing field 'parent'"),
-            ("branch = a\nkind = free\nparent = main\n", "missing field 'version'"),
+            (
+                "version = 1\nbranch = a\nkind = free\n",
+                "missing field 'parent'",
+            ),
+            (
+                "branch = a\nkind = free\nparent = main\n",
+                "missing field 'version'",
+            ),
             (
                 "version = 2\nbranch = a\nkind = free\nparent = main\n",
                 "unknown version '2'",
@@ -264,7 +272,10 @@ mod tests {
                 "version = 1\nbranch = a\nbranch = b\nkind = free\nparent = main\n",
                 "duplicate key 'branch'",
             ),
-            ("version = 1\nbranch =\nkind = free\nparent = main\n", "empty value"),
+            (
+                "version = 1\nbranch =\nkind = free\nparent = main\n",
+                "empty value",
+            ),
             ("garbage line\n", "expected 'key = value'"),
         ];
         for (text, needle) in cases {

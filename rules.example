@@ -1,4 +1,4 @@
-# Example policy config — the DESIGN.md sketch.
+# Example policy rules — the DESIGN.md sketch.
 
 [main]
 children = dev, group:hotfix        # bare name = declared fixed branch; created here, merges back only here

@@ -43,7 +43,10 @@ impl Fixture {
         let fx = Fixture { tmp, repo };
         fx.git(&fx.repo, &["init", "-q", "-b", "main"]);
         fx.git(&fx.repo, &["config", "user.name", "wtree-test"]);
-        fx.git(&fx.repo, &["config", "user.email", "wtree-test@example.invalid"]);
+        fx.git(
+            &fx.repo,
+            &["config", "user.email", "wtree-test@example.invalid"],
+        );
         fx.git(&fx.repo, &["config", "commit.gpgsign", "false"]);
         fx.commit(&fx.repo, "init");
         fx
@@ -81,10 +84,21 @@ impl Fixture {
 
     /// `git worktree add -b <branch> <path> <from>` — new branch, new worktree.
     pub fn add_worktree(&self, branch: &str, from: &str) -> PathBuf {
-        let path = self.tmp.0.join(format!("wtree-{}", branch.replace('/', "-")));
+        let path = self
+            .tmp
+            .0
+            .join(format!("wtree-{}", branch.replace('/', "-")));
         self.git(
             &self.repo,
-            &["worktree", "add", "-q", "-b", branch, path.to_str().unwrap(), from],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+                from,
+            ],
         );
         path
     }
@@ -94,7 +108,14 @@ impl Fixture {
         let path = self.tmp.0.join(format!("wtree-{name}"));
         self.git(
             &self.repo,
-            &["worktree", "add", "-q", "--detach", path.to_str().unwrap(), from],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                path.to_str().unwrap(),
+                from,
+            ],
         );
         path
     }

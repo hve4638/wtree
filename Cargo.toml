@@ -20,4 +20,6 @@ name = "wtree"
 path = "src/main.rs"
 
 [dependencies]
+dialoguer = { version = "0.12.0", default-features = false }
 libc = "0.2"
+time = { version = "0.3.45", default-features = false, features = ["std"] }

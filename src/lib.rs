@@ -2,9 +2,10 @@
 //!
 //! Library surface used by the `wtree` binary and by integration tests.
 
-pub mod config;
 pub mod judge;
+pub mod prompt;
 pub mod repo;
+pub mod rules;
 pub mod settings;
 pub mod state;
 pub mod verbs;

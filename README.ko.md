@@ -25,10 +25,10 @@ cargo install gitwtree
 ## 시작하기
 
 ```bash
-wtree init
+wtree init --new
 ```
 
-`.git/wtree/config`가 생긴다. 열어서 구조를 선언한다. main 아래에 작업 브랜치를 두는 최소 형태:
+`.git/wtree/rules`가 생긴다. 열어서 구조를 선언한다. main 아래에 작업 브랜치를 두는 최소 형태:
 
 ```ini
 [main]
@@ -70,17 +70,21 @@ main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크
 | `destroy` | 브랜치와 워크트리를 제거 |
 | `adopt` | 기존 브랜치를 정책 아래로 편입 |
 | `list` / `info` | 무엇이 있고 여기서 무엇이 허용되는지 표시 |
-| `init` | 초기 설정 파일을 생성 |
+| `init --new` | 초기 설정 파일을 생성 |
+| `init --load [path]` | 대신 `.wtree/`에서 규칙을 가져옴 |
+| `save [path]` | 규칙을 커밋할 수 있는 `.wtree/`로 복사 |
+
+`wtree init`에 두 플래그를 다 주지 않으면 어느 쪽인지 묻고, 물어볼 터미널이 없으면 거부한다.
 
 ## 설정
 
 | 파일 | |
 |---|---|
-| `config` | branch 정책 |
+| `rules` | branch 정책 |
 | `settings` | 워크트리 생성 위치 등 설정 |
 | `hooks/post-create` | `wtree new` 직후 실행되는 훅 |
 
-`config`에서 `[X]`는 고정 브랜치, `[group:X]`는 같은 정책을 적용받는 작업 브랜치 그룹이다. `children`은 이 섹션을 부모로 삼을 수 있는 브랜치를 선언한다.
+`rules`에서 `[X]`는 고정 브랜치, `[group:X]`는 같은 정책을 적용받는 작업 브랜치 그룹이다. `children`은 이 섹션을 부모로 삼을 수 있는 브랜치를 선언한다.
 
 | 키 | 사용 가능 섹션 | 뜻 |
 |---|---|---|
