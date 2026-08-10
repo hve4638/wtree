@@ -5,35 +5,38 @@
 //! files, executes approved plans (git commands, state records, hooks) and
 //! renders output.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{self, Config, CopyPattern, MergeMode, SectionKind};
 use crate::judge::{self, Affordance, Ctx, DestroyPlan, Identity, MergePlan, NewPlan};
+use crate::prompt;
 use crate::repo::{self, Repo};
-use crate::settings::{self, Settings};
+use crate::rules::{self, CopyPattern, MergeMode, Rules, SectionKind};
+use crate::settings::{self, SETTINGS_LABEL, Settings};
 use crate::state::{self, Kind, State};
 
-/// Label used when citing config rules in refusals and errors. Spelled as the
+/// Label used when citing rules in refusals and errors. Spelled as the
 /// path a user would `cd` to, so a cited rule can be opened without guessing.
-pub const CONFIG_LABEL: &str = ".git/wtree/config";
+pub const RULES_LABEL: &str = ".git/wtree/rules";
 
 /// `Err` is printed to stderr by main, exit 1.
 pub type CmdResult = Result<(), String>;
 
 pub const NEW_USAGE: &str = "usage: wtree new <name> [--group G]";
 pub const OPEN_USAGE: &str = "usage: wtree open <branch>";
+pub const INIT_USAGE: &str = "usage: wtree init [--new | --load [path]] [--force]";
+pub const SAVE_USAGE: &str = "usage: wtree save [path] [--force]";
 
 fn wt_dir(common: &Path) -> PathBuf {
     common.join("wtree")
 }
 
-fn config_path(common: &Path) -> PathBuf {
-    wt_dir(common).join("config")
+fn rules_path(common: &Path) -> PathBuf {
+    wt_dir(common).join("rules")
 }
 
 fn settings_path(common: &Path) -> PathBuf {
@@ -57,21 +60,31 @@ fn primary_root(repo: &Repo) -> Result<PathBuf, String> {
         })
 }
 
-/// Load `.git/wtree/config`: missing file points at `wtree init`; warnings go to
+/// Root of the worktree the command was run from, which is the primary root
+/// only when that is where you are standing. Resolved through git so a
+/// subdirectory works the same as the top.
+fn worktree_root(cwd: &Path) -> Result<PathBuf, String> {
+    let out = repo::run_git(cwd, &["rev-parse", "--show-toplevel"])?;
+    let p = PathBuf::from(out.trim());
+    p.canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", p.display()))
+}
+
+/// Load `.git/wtree/rules`: missing file points at `wtree init`; warnings go to
 /// stderr; any error aborts.
-fn load_policy(repo: &Repo) -> Result<Config, String> {
-    let path = config_path(&repo.common_dir);
+fn load_rules(repo: &Repo) -> Result<Rules, String> {
+    let path = rules_path(&repo.common_dir);
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(format!(
-                "no policy config at {} — run `wtree init` first",
+                "no policy rules at {} — run `wtree init` first",
                 path.display()
             ));
         }
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    let loaded = config::load_str(&text, CONFIG_LABEL);
+    let loaded = rules::load_str(&text, RULES_LABEL);
     for w in &loaded.warnings {
         eprintln!("warning: {w}");
     }
@@ -80,28 +93,100 @@ fn load_policy(repo: &Repo) -> Result<Config, String> {
             eprintln!("error: {e}");
         }
         return Err(format!(
-            "{CONFIG_LABEL}: {} error(s) — fix the policy config first",
+            "{RULES_LABEL}: {} error(s) — fix the policy rules first",
             loaded.errors.len()
         ));
     }
-    Ok(loaded.config)
+    Ok(loaded.rules)
 }
 
 // ------------------------------------------------------------------ init ----
 
-pub fn init(cwd: &Path) -> CmdResult {
+/// Where `wtree init` takes the rules from. `Ask` is the bare invocation: it
+/// resolves to one of the other two by prompting, and refuses outright when
+/// there is no terminal to prompt on.
+pub enum InitMode {
+    New,
+    /// `None` means "work it out from the worktree roots", which succeeds only
+    /// when the answer is unambiguous.
+    Load(Option<PathBuf>),
+    Ask,
+}
+
+/// A `.wtree/` holding something `init` could load, and the worktree it came
+/// from. The label is what the menu and the refusals call it.
+struct Candidate {
+    path: PathBuf,
+    label: &'static str,
+}
+
+const HERE: &str = "this worktree";
+const MAIN: &str = "main worktree";
+
+/// The two files `.wtree/` may carry. Hooks are deliberately not among them:
+/// they are executable scripts, and picking them up from a checkout would make
+/// `init` run someone else's code.
+const SEED: [&str; 2] = ["rules", "settings"];
+
+pub fn init(cwd: &Path, mode: InitMode, force: bool) -> CmdResult {
     if repo::run_git(cwd, &["rev-parse", "--is-bare-repository"])?.trim() == "true" {
         return Err("wtree init: bare repositories are not supported".into());
     }
     let repo = Repo::discover(cwd)?;
-    let cfg_path = config_path(&repo.common_dir);
-    if cfg_path.exists() {
+    let wt = wt_dir(&repo.common_dir);
+    let occupied: Vec<&str> = SEED.into_iter().filter(|n| wt.join(n).exists()).collect();
+
+    let (source, force) = match mode {
+        InitMode::New => (None, force),
+        InitMode::Load(Some(p)) => (Some(cwd.join(p)), force),
+        InitMode::Load(None) => (Some(resolve_load(cwd, &repo)?), force),
+        // Answering the overwrite prompt with yes *is* the force; there is no
+        // second flag to reach for once a person has said so to their face.
+        InitMode::Ask => match ask(cwd, &repo, &occupied)? {
+            Some(choice) => (choice, true),
+            None => return Ok(()),
+        },
+    };
+
+    if !occupied.is_empty() && !force {
         return Err(format!(
-            "wtree init: {} already exists — edit it instead of re-initializing",
-            cfg_path.display()
+            "wtree init: {} already has {} — pass --force to replace it \
+             (the current one is kept in {})",
+            wt.display(),
+            occupied.join(" and "),
+            wt.join(".backup").display()
         ));
     }
-    let root = detect_root(cwd, &repo)?;
+
+    // Read and validate before touching anything. A source with errors must
+    // leave the repo exactly as it was, which also means it must not consume
+    // the --force that would have backed the old rules up.
+    let seed = match &source {
+        Some(dir) => read_seed(dir)?,
+        None => Seed::default(),
+    };
+    // Only needed for the template, and it can fail on a detached HEAD — no
+    // reason to let that block a load.
+    let root = match seed.rules {
+        Some(_) => None,
+        None => Some(detect_root(cwd, &repo)?),
+    };
+
+    // Rules are always written, from the seed or the template. Settings only
+    // when the seed carries one: a `.wtree/` holding rules alone says nothing
+    // about where *this* machine puts its worktrees, and replacing a local
+    // `worktree-dir` with a blank template is not what "load the rules" means.
+    let replacing: Vec<&str> = occupied
+        .iter()
+        .copied()
+        .filter(|n| *n == "rules" || seed.settings.is_some())
+        .collect();
+    let backup = if replacing.is_empty() {
+        None
+    } else {
+        Some(back_up(&wt, &replacing)?)
+    };
+
     let hooks = hooks_dir(&repo.common_dir);
     fs::create_dir_all(&hooks).map_err(|e| format!("cannot create {}: {e}", hooks.display()))?;
     // `.sample`, as git spells its own hook templates: a file named
@@ -109,31 +194,298 @@ pub fn init(cwd: &Path) -> CmdResult {
     // being executable. Executable already, so enabling it is a rename.
     let sample = hooks.join("post-create.sample");
     write_if_absent(&sample, HOOK_SAMPLE, 0o755)?;
+
+    let rules_file = rules_path(&repo.common_dir);
     let sett = settings_path(&repo.common_dir);
-    write_if_absent(&sett, SETTINGS_TEMPLATE, 0o644)?;
-    fs::write(&cfg_path, template(&root))
-        .map_err(|e| format!("cannot write {}: {e}", cfg_path.display()))?;
-    println!("initialized policy config at {}", cfg_path.display());
-    println!("root branch: '{root}' (destroyable = false)");
-    println!("declare children/groups there. also written:");
-    println!("  {}  (machine-local, all commented out)", sett.display());
+    let rules_body = match &seed.rules {
+        Some(t) => t.clone(),
+        None => template(
+            root.as_deref()
+                .expect("root is detected when there is no seed"),
+        ),
+    };
+    write_new(&rules_file, &rules_body, 0o644)?;
+    let kept_settings = match &seed.settings {
+        Some(t) => {
+            write_new(&sett, t, 0o644)?;
+            false
+        }
+        // Fills the gap only. An existing settings is left exactly as it is.
+        None => !write_if_absent(&sett, SETTINGS_TEMPLATE, 0o644)?,
+    };
+
+    match &source {
+        Some(dir) => println!("loaded {} from {}", seed.describe(), dir.display()),
+        None => println!("initialized policy rules at {}", rules_file.display()),
+    }
+    if let Some(r) = &root {
+        println!("root branch: '{r}' (destroyable = false)");
+    }
+    println!("  {}", rules_file.display());
+    println!(
+        "  {}{}",
+        sett.display(),
+        if kept_settings {
+            "  (left as it was)"
+        } else {
+            ""
+        }
+    );
     println!("  {}  (rename to post-create to enable)", sample.display());
+    if let Some(b) = backup {
+        println!(
+            "previous {} kept in {}",
+            replacing.join(" and "),
+            b.display()
+        );
+    }
     Ok(())
 }
 
-/// Only fills a gap. `init` is guarded on the config file alone, so a settings
-/// file or hook written by hand before it ran has to survive it.
-fn write_if_absent(path: &Path, body: &str, mode: u32) -> Result<(), String> {
-    if path.exists() {
-        return Ok(());
+/// Text of the files a `.wtree/` offers. Either may be absent; the one that is
+/// missing falls back to the template rather than blocking the load.
+#[derive(Default)]
+struct Seed {
+    rules: Option<String>,
+    settings: Option<String>,
+}
+
+impl Seed {
+    fn describe(&self) -> String {
+        match (&self.rules, &self.settings) {
+            (Some(_), Some(_)) => "rules and settings".into(),
+            (Some(_), None) => "rules".into(),
+            (None, Some(_)) => "settings".into(),
+            (None, None) => "nothing".into(),
+        }
     }
+}
+
+/// Reads a `.wtree/` and validates every file in it. Nothing is written until
+/// this returns `Ok`, so a source with errors leaves the repo untouched.
+fn read_seed(dir: &Path) -> Result<Seed, String> {
+    let rules_src = dir.join("rules");
+    let settings_src = dir.join("settings");
+    let seed = Seed {
+        rules: read_opt(&rules_src)?,
+        settings: read_opt(&settings_src)?,
+    };
+    if seed.rules.is_none() && seed.settings.is_none() {
+        return Err(format!(
+            "wtree init: {} has no rules or settings to load",
+            dir.display()
+        ));
+    }
+    if let Some(text) = &seed.rules {
+        let label = rules_src.display().to_string();
+        let loaded = rules::load_str(text, &label);
+        for w in &loaded.warnings {
+            eprintln!("warning: {w}");
+        }
+        if !loaded.errors.is_empty() {
+            for e in &loaded.errors {
+                eprintln!("error: {e}");
+            }
+            return Err(format!(
+                "{label}: {} error(s) — nothing was written",
+                loaded.errors.len()
+            ));
+        }
+    }
+    if let Some(text) = &seed.settings {
+        let label = settings_src.display().to_string();
+        warn_if_unportable(&settings::parse(text, &label)?, &label);
+    }
+    Ok(seed)
+}
+
+/// A committed `worktree-dir` only survives the trip to another machine when
+/// it is relative. Worth a word, not a refusal — a solo repo can hold whatever
+/// its author wants.
+fn warn_if_unportable(sett: &Settings, label: &str) {
+    if let Some(p) = &sett.worktree_dir {
+        if p.is_absolute() {
+            eprintln!(
+                "warning: worktree-dir is absolute ({}) and will not resolve on another machine ({label})",
+                p.display()
+            );
+        }
+    }
+}
+
+fn read_opt(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+/// `.wtree/` under each worktree root, keeping only what `init` could actually
+/// load. Pure so the hiding and collapsing rules can be tested without a repo.
+fn candidates(here: &Path, main: &Path, usable: &dyn Fn(&Path) -> bool) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    let mine = here.join(".wtree");
+    if usable(&mine) {
+        out.push(Candidate {
+            path: mine,
+            label: HERE,
+        });
+    }
+    // In the main worktree the two roots are the same directory; offering it
+    // twice would be a choice between identical paths.
+    if main != here {
+        let theirs = main.join(".wtree");
+        if usable(&theirs) {
+            out.push(Candidate {
+                path: theirs,
+                label: MAIN,
+            });
+        }
+    }
+    out
+}
+
+fn wtree_candidates(cwd: &Path, repo: &Repo) -> Result<Vec<Candidate>, String> {
+    let here = worktree_root(cwd)?;
+    let main = primary_root(repo)?;
+    Ok(candidates(&here, &main, &|p| {
+        SEED.iter().any(|n| p.join(n).is_file())
+    }))
+}
+
+/// `--load` with no path. Only the worktree you are standing in counts as the
+/// obvious answer; anything else is a guess, and a guess here silently installs
+/// the wrong policy. Refusals carry the commands that would have worked.
+fn resolve_load(cwd: &Path, repo: &Repo) -> Result<PathBuf, String> {
+    let cands = wtree_candidates(cwd, repo)?;
+    if let [only] = cands.as_slice() {
+        if only.label == HERE {
+            return Ok(only.path.clone());
+        }
+    }
+    let mut msg = match cands.len() {
+        0 => "wtree init --load: no .wtree/ in this worktree or the main worktree".to_string(),
+        1 => "wtree init --load: no .wtree/ in this worktree".to_string(),
+        _ => "wtree init --load: ambiguous — .wtree/ exists in both worktrees".to_string(),
+    };
+    for c in &cands {
+        msg.push_str(&format!(
+            "\n  wtree init --load {}   ({})",
+            c.path.display(),
+            c.label
+        ));
+    }
+    Err(msg)
+}
+
+/// Menu lines for the source prompt, in the order they are offered: the
+/// worktree you are standing in, then the main one, then the template.
+fn menu(cands: &[Candidate]) -> Vec<String> {
+    let mut items: Vec<String> = cands
+        .iter()
+        .map(|c| format!("{:<14} {}", c.label, c.path.display()))
+        .collect();
+    items.push("create new rules".to_string());
+    items
+}
+
+/// Bare `wtree init`. `Ok(None)` means the user backed out; the inner option is
+/// the chosen source, `None` being "write the template". Only reached with a
+/// terminal on both ends — the caller refuses the mode outright without one.
+fn ask(cwd: &Path, repo: &Repo, occupied: &[&str]) -> Result<Option<Option<PathBuf>>, String> {
+    if !occupied.is_empty()
+        && !prompt::confirm(&format!(
+            "{} already has {} — overwrite? (the current one is kept in .backup/)",
+            wt_dir(&repo.common_dir).display(),
+            occupied.join(" and ")
+        ))?
+    {
+        return Ok(None);
+    }
+    let cands = wtree_candidates(cwd, repo)?;
+    // Nothing to choose between: the template is the only possible answer, and
+    // a one-item menu is a question with no question in it.
+    if cands.is_empty() {
+        return Ok(Some(None));
+    }
+    match prompt::select("where should the rules come from?", &menu(&cands))? {
+        None => Ok(None),
+        Some(i) => Ok(Some(cands.get(i).map(|c| c.path.clone()))),
+    }
+}
+
+/// `20260809T031500Z` — no colons, so it is a usable directory name anywhere.
+fn utc_stamp() -> String {
+    let t = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
+}
+
+/// Moves aside what `init` is about to replace. Only the seed files: `hooks/`
+/// is never rewritten, and `.backup/` has to stay out of its own backups or
+/// each one would swallow every earlier one.
+fn back_up(wt: &Path, occupied: &[&str]) -> Result<PathBuf, String> {
+    let root = wt.join(".backup");
+    fs::create_dir_all(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+    let dir = root.join(utc_stamp());
+    // Not create_dir_all: a second --force inside the same second would reuse
+    // the directory and overwrite the backup already sitting in it. Refusing
+    // costs a retry a second later; the alternative loses the earlier backup.
+    fs::create_dir(&dir).map_err(|e| match e.kind() {
+        io::ErrorKind::AlreadyExists => format!(
+            "wtree init: {} was backed up less than a second ago — nothing was written, try again",
+            wt.display()
+        ),
+        _ => format!("cannot create {}: {e}", dir.display()),
+    })?;
+    for name in occupied {
+        fs::rename(wt.join(name), dir.join(name))
+            .map_err(|e| format!("cannot move {} into {}: {e}", name, dir.display()))?;
+    }
+    Ok(dir)
+}
+
+/// Replaces whatever is there. Callers reach this only after the guard has
+/// passed and any previous file has been moved into a backup.
+fn write_new(path: &Path, body: &str, mode: u32) -> Result<(), String> {
     fs::write(path, body).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .map_err(|e| format!("cannot set mode on {}: {e}", path.display()))
 }
 
+/// Only fills a gap; `false` when something was already there. Used for the
+/// hook sample, which survives every `init` because a hook someone wrote is not
+/// this command's to replace, and for the settings template when a load has no
+/// settings of its own to put in its place.
+fn write_if_absent(path: &Path, body: &str, mode: u32) -> Result<bool, String> {
+    let write_error = |e| format!("cannot write {}: {e}", path.display());
+    // `create_new` keeps the check and the write in one step: a second `init`
+    // racing the first must not overwrite what this is meant to preserve.
+    let mut f = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(write_error(e)),
+    };
+    f.write_all(body.as_bytes()).map_err(write_error)?;
+    f.set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("cannot set mode on {}: {e}", path.display()))?;
+    Ok(true)
+}
+
 const SETTINGS_TEMPLATE: &str = "\
-# Machine-local settings. Unlike the policy config next to it, this file is not
+# Machine-local settings. Unlike the policy rules next to it, this file is not
 # meant to be shared — it holds paths that are true only on this machine.
 
 # Where `wtree new` places worktrees. A relative path resolves against the primary
@@ -156,7 +508,7 @@ const HOOK_SAMPLE: &str = "\
 # A non-zero exit is reported as a warning and the worktree is kept either way,
 # so `set -e` is how a failure gets noticed.
 #
-# Files the parent already has belong in the policy config's `copy` key; a hook
+# Files the parent already has belong in the rules' `copy` key; a hook
 # is for what has to be generated here.
 
 set -eu
@@ -170,7 +522,10 @@ set -eu
 /// DESIGN "root seeding": origin/HEAD symref -> main/master existence ->
 /// current branch. Used only to prefill the init template.
 fn detect_root(cwd: &Path, repo: &Repo) -> Result<String, String> {
-    if let Ok(out) = repo::run_git(cwd, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]) {
+    if let Ok(out) = repo::run_git(
+        cwd,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    ) {
         if let Some(b) = out.trim().strip_prefix("refs/remotes/origin/") {
             if !b.is_empty() {
                 return Ok(b.to_string());
@@ -193,13 +548,14 @@ fn detect_root(cwd: &Path, repo: &Repo) -> Result<String, String> {
 
 fn template(root: &str) -> String {
     format!(
-        "# wtree policy config — clone-local (never committed); share it by copying.\n\
+        "# wtree policy rules — clone-local (never committed); share it by copying.\n\
          # [X] declares a fixed branch; [group:X] a set of fungible work\n\
          # branches. `children` = what may be created here, and what merges back here.\n\
          \n\
          [{root}]\n\
          destroyable = false\n\
          # children = group:work\n\
+         # description = release line\n\
          \n\
          # [group:work]\n\
          # ephemeral = true\n\
@@ -208,13 +564,86 @@ fn template(root: &str) -> String {
     )
 }
 
+// ------------------------------------------------------------------ save ----
+
+/// Copies the clone-local rules out to a `.wtree/` that can be committed, so a
+/// teammate's `wtree init --load` starts from the same policy. The reverse of
+/// a load, and the only way the two files leave `.git/`.
+pub fn save(cwd: &Path, dest: Option<&Path>, force: bool) -> CmdResult {
+    let repo = Repo::discover(cwd)?;
+    let rules_body = read_opt(&rules_path(&repo.common_dir))?
+        .ok_or_else(|| format!("wtree save: no {RULES_LABEL} to save — run `wtree init` first"))?;
+    // Rules that do not parse must not be the ones a teammate inherits.
+    let loaded = rules::load_str(&rules_body, RULES_LABEL);
+    for w in &loaded.warnings {
+        eprintln!("warning: {w}");
+    }
+    if !loaded.errors.is_empty() {
+        for e in &loaded.errors {
+            eprintln!("error: {e}");
+        }
+        return Err(format!(
+            "{RULES_LABEL}: {} error(s) — nothing was written",
+            loaded.errors.len()
+        ));
+    }
+    let settings_file = settings_path(&repo.common_dir);
+    let settings_body = read_opt(&settings_file)?;
+    if let Some(text) = &settings_body {
+        warn_if_unportable(&settings::parse(text, SETTINGS_LABEL)?, SETTINGS_LABEL);
+    }
+
+    // Written where you are standing, not at the primary root: the point is to
+    // commit it, and the commit belongs to the branch you are on.
+    let dir = match dest {
+        Some(p) => cwd.join(p),
+        None => worktree_root(cwd)?.join(".wtree"),
+    };
+    let taken: Vec<&str> = SEED.into_iter().filter(|n| dir.join(n).exists()).collect();
+    if !taken.is_empty() && !force {
+        return Err(format!(
+            "wtree save: {} already has {} — pass --force to replace it \
+             (git holds the previous version, so nothing is backed up)",
+            dir.display(),
+            taken.join(" and ")
+        ));
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    write_new(&dir.join("rules"), &rules_body, 0o644)?;
+    match &settings_body {
+        Some(text) => write_new(&dir.join("settings"), text, 0o644)?,
+        // There is no settings to copy, so a settings from an earlier save has
+        // to go: left behind it would keep being loaded alongside rules it no
+        // longer belongs to.
+        None if taken.contains(&"settings") => {
+            let stale = dir.join("settings");
+            fs::remove_file(&stale)
+                .map_err(|e| format!("cannot remove {}: {e}", stale.display()))?;
+        }
+        None => {}
+    }
+    println!("saved to {}", dir.display());
+    println!("  rules");
+    match &settings_body {
+        Some(_) => println!("  settings"),
+        None if taken.contains(&"settings") => println!("  settings removed (this clone has none)"),
+        None => {}
+    }
+    println!("commit it to share the policy; `wtree init --load` reads it back");
+    Ok(())
+}
+
 // ------------------------------------------------------------------- new ----
 
 pub fn new(cwd: &Path, name: &str, group: Option<&str>) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
     let plan = ctx.plan_new(name, group).map_err(|r| r.to_string())?;
     // The section whose `copy` list applies is the one the branch lands in. A
     // free branch has none, so it carries nothing (fail closed).
@@ -250,14 +679,21 @@ pub fn new(cwd: &Path, name: &str, group: Option<&str>) -> CmdResult {
         .ok_or_else(|| "destination path is not valid UTF-8".to_string())?;
 
     // New branch forked at the parent worktree's current HEAD (= cwd's HEAD).
-    repo::run_git(cwd, &["worktree", "add", "-q", "-b", name, dest_str, "HEAD"])?;
+    repo::run_git(
+        cwd,
+        &["worktree", "add", "-q", "-b", name, dest_str, "HEAD"],
+    )?;
 
     let identity = match &kind {
         None => "fixed".to_string(),
         Some(k) => k.to_string(),
     };
     if let Some(kind) = kind {
-        let record = State { branch: name.to_string(), kind, parent: parent.clone() };
+        let record = State {
+            branch: name.to_string(),
+            kind,
+            parent: parent.clone(),
+        };
         let written = repo::private_git_dir(&dest)
             .and_then(|d| state::write(&d, &record).map_err(|e| e.to_string()));
         if let Err(e) = written {
@@ -266,7 +702,9 @@ pub fn new(cwd: &Path, name: &str, group: Option<&str>) -> CmdResult {
                 "wtree new: failed to record state: {e}\nthe worktree and branch were rolled back"
             );
             if let Err(e2) = repo::run_git(cwd, &["worktree", "remove", "--force", dest_str]) {
-                msg.push_str(&format!("\nwarning: rollback (worktree remove) failed: {e2}"));
+                msg.push_str(&format!(
+                    "\nwarning: rollback (worktree remove) failed: {e2}"
+                ));
             }
             if let Err(e2) = repo::run_git(cwd, &["branch", "-D", name]) {
                 msg.push_str(&format!("\nwarning: rollback (branch -D) failed: {e2}"));
@@ -290,7 +728,7 @@ pub fn new(cwd: &Path, name: &str, group: Option<&str>) -> CmdResult {
 // `git worktree add` checks out only what the branch tracks, so a fresh
 // worktree has no `.env` and cannot be run until one is put there. The `copy`
 // list names what crosses from the parent's worktree. Nothing here judges —
-// `Config::copy_list` is the policy and this only carries it out.
+// `Rules::copy_list` is the policy and this only carries it out.
 
 /// Copies the parent's matching entries into `dest`, returning the lines to
 /// print. A worktree is usable without them, so every failure here reports and
@@ -320,13 +758,26 @@ fn copy_from_parent(
     let (mut taken, mut notes) = (Vec::new(), Vec::new());
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_dir = entry.path().is_dir();
+        // A symlink is not a directory here even when it points at one: it is
+        // recreated as a link, so it drags in no tree.
+        let ft = entry.file_type().ok();
+        let is_dir = ft.is_some_and(|t| t.is_dir());
         if !patterns.iter().any(|p| p.matches(&name, is_dir)) {
-            // A directory named by a pattern that lacks the trailing slash is
-            // the one near-miss worth naming: the rule looks like it applies.
-            if is_dir && patterns.iter().any(|p| !p.dir_only && config::glob_match(&p.glob, &name))
-            {
-                notes.push(format!("skipped '{name}': a directory needs a trailing '/'"));
+            // Both near misses: the trailing slash is there and shouldn't be, or
+            // it isn't and should be. Either way the rule looks like it applies.
+            let named = |dir_only: bool| {
+                patterns
+                    .iter()
+                    .any(|p| p.dir_only == dir_only && rules::glob_match(&p.glob, &name))
+            };
+            if is_dir && named(false) {
+                notes.push(format!(
+                    "skipped '{name}': a directory needs a trailing '/'"
+                ));
+            } else if ft.is_some_and(|t| t.is_symlink()) && named(true) {
+                notes.push(format!(
+                    "skipped '{name}': a symlink crosses as a link — drop the '/'"
+                ));
             }
             continue;
         }
@@ -337,7 +788,7 @@ fn copy_from_parent(
             notes.push(format!("skipped '{name}': already in the worktree"));
             continue;
         }
-        match copy_entry(&entry.path(), &to, is_dir) {
+        match copy_entry(&entry.path(), &to) {
             Ok(()) => taken.push(name),
             Err(e) => notes.push(format!("warning: cannot copy '{name}': {e}")),
         }
@@ -352,31 +803,26 @@ fn copy_from_parent(
     out
 }
 
-fn copy_entry(from: &Path, to: &Path, is_dir: bool) -> io::Result<()> {
-    if is_dir {
+/// Symlinks are recreated, not followed — the entry named by a pattern as much
+/// as anything under it. A copied dependency tree is the case this matters for:
+/// pnpm's `node_modules` links packages to each other, and dereferencing those
+/// both explodes the copy and dies on the cycles circular dependencies produce.
+fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
+    let ft = fs::symlink_metadata(from)?.file_type();
+    if ft.is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(from)?, to)
+    } else if ft.is_dir() {
         copy_tree(from, to)
     } else {
         fs::copy(from, to).map(|_| ())
     }
 }
 
-/// Symlinks are recreated, not followed. A copied dependency tree is the case
-/// this matters for: pnpm's `node_modules` links packages to each other, and
-/// dereferencing those both explodes the copy and dies on the cycles that
-/// circular dependencies produce.
 fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
-        let (src, dst) = (entry.path(), to.join(entry.file_name()));
-        let ft = entry.file_type()?;
-        if ft.is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(&src)?, &dst)?;
-        } else if ft.is_dir() {
-            copy_tree(&src, &dst)?;
-        } else {
-            fs::copy(&src, &dst)?;
-        }
+        copy_entry(&entry.path(), &to.join(entry.file_name()))?;
     }
     Ok(())
 }
@@ -385,14 +831,18 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 //
 // Give an existing branch a worktree — the inverse of close, and what `new`
 // cannot do because it always forks a new branch. Nothing is recorded: a fixed
-// branch's identity is its config declaration, and any other branch stays
+// branch's identity is its rules declaration, and any other branch stays
 // unknown until the user adopts it from the worktree this creates.
 
 pub fn open(cwd: &Path, branch: &str) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
     let plan = ctx.plan_open(branch).map_err(|r| r.to_string())?;
 
     // Only a declared branch has a parent to copy from: anything else stays
@@ -400,7 +850,11 @@ pub fn open(cwd: &Path, branch: &str) -> CmdResult {
     // whose `copy` list could be read.
     let carry = plan
         .fixed
-        .then(|| ctx.parent_of(&Identity::Fixed { branch: plan.branch.clone() }))
+        .then(|| {
+            ctx.parent_of(&Identity::Fixed {
+                branch: plan.branch.clone(),
+            })
+        })
         .flatten()
         .map(|(p, _)| (p, cfg.copy_list(SectionKind::Branch, &plan.branch)));
 
@@ -511,102 +965,375 @@ fn run_post_create(common: &Path, wt: &Path, branch: &str, parent: &str, repo_ro
             "warning: post-create hook failed (exit {}); the worktree was still created",
             s.code().unwrap_or(-1)
         ),
-        Err(e) => eprintln!(
-            "warning: cannot run post-create hook: {e}; the worktree was still created"
-        ),
+        Err(e) => {
+            eprintln!("warning: cannot run post-create hook: {e}; the worktree was still created")
+        }
     }
 }
 
 // ------------------------------------------------------------------ list ----
 
-/// Commits the parent has that `branch` does not — the signal that `sync` is
-/// due. Display only: judgment needs the `unreflected` boolean, not a count, so
-/// this stays out of `repo::gather` where every verb would pay for it.
-/// `None` when the count cannot be taken, which is the case for a fixed branch
-/// whose config-derived parent has not been created yet.
-fn behind_count(dir: &Path, branch: &str, parent: &str) -> Option<u32> {
-    let range = format!("{branch}..{parent}");
-    repo::run_git(dir, &["rev-list", "--count", &range])
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+/// Commits each of `branch` and `parent` holds that the other does not — the
+/// signal that `merge` or `sync` is due. One `--left-right` walk answers both
+/// directions, so a row costs one process rather than two.
+///
+/// Display only, and deliberately a different question from the one
+/// `Repo::has_unreflected_commits` answers: this counts commits by ancestry,
+/// that judges whether the content is already in the parent. A branch can be
+/// several commits ahead with nothing left to lose. `destroy` is what needs
+/// the second answer, and it gathers the fact for itself.
+///
+/// `None` when the walk cannot be taken, which is the case for a fixed branch
+/// whose rules-derived parent has not been created yet.
+fn divergence(dir: &Path, branch: &str, parent: &str) -> Option<(u32, u32)> {
+    let range = format!("{parent}...{branch}");
+    let out = repo::run_git(dir, &["rev-list", "--left-right", "--count", &range]).ok()?;
+    let mut counts = out.split_whitespace();
+    // `--left-right` orders the pair by the range: left of `...` first.
+    let behind = counts.next()?.parse().ok()?;
+    let ahead = counts.next()?.parse().ok()?;
+    Some((ahead, behind))
+}
+
+/// `  ↑3 ↓1` for a branch three commits past its parent and one behind it.
+/// Empty when the two are level, so a settled tree carries no noise.
+fn divergence_text(g: &Glyphs, d: Option<(u32, u32)>) -> String {
+    let Some((ahead, behind)) = d else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    if ahead > 0 {
+        parts.push(format!("{}{ahead}", g.ahead));
+    }
+    if behind > 0 {
+        parts.push(format!("{}{behind}", g.behind));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", parts.join(" "))
+    }
+}
+
+/// Tree glyphs: box-drawing on a TTY, ASCII through a pipe so redirected output
+/// stays greppable. `mid`/`last` must share a display width with `bar`/`gap`,
+/// or every level of descent shifts the subtree by the difference.
+struct Glyphs {
+    mid: &'static str,
+    last: &'static str,
+    bar: &'static str,
+    gap: &'static str,
+    /// Marker for a branch that has no worktree.
+    bare: &'static str,
+    /// Commits this branch holds that its parent does not, and the reverse.
+    ahead: &'static str,
+    behind: &'static str,
+}
+
+const TREE_PRETTY: Glyphs = Glyphs {
+    mid: "├─",
+    last: "└─",
+    bar: "│ ",
+    gap: "  ",
+    bare: "·",
+    ahead: "↑",
+    behind: "↓",
+};
+const TREE_PLAIN: Glyphs = Glyphs {
+    mid: "|-",
+    last: "`-",
+    bar: "| ",
+    gap: "  ",
+    bare: ".",
+    ahead: "^",
+    behind: "v",
+};
+
+/// Terminal columns `s` occupies. Branch names and worktree directory names can
+/// hold CJK, which is two columns wide; sizing the branch column by `chars()`
+/// would leave everything right of such a name a column short per wide char.
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+fn char_width(c: char) -> usize {
+    match c as u32 {
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE6F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+/// Columns the terminal on stdout has, `None` when stdout is not one or the
+/// kernel will not say. A row longer than this wraps, and a wrapped row puts
+/// its tail under the next row's gutter — the tree stops being one.
+fn terminal_width() -> Option<usize> {
+    if !io::stdout().is_terminal() {
+        return None;
+    }
+    // SAFETY: `ws` is a fully-owned `winsize` for the kernel to fill in, and
+    // `TIOCGWINSZ` writes nothing else. A non-zero return leaves it untouched,
+    // which is why the result is checked before the field is read.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    (rc == 0 && ws.ws_col > 0).then_some(ws.ws_col as usize)
+}
+
+/// Cut `s` to `width` columns, spending the last one on `…` so the cut is
+/// visible. Returns `s` whole when it already fits.
+fn truncate_to(s: &str, width: usize) -> String {
+    if display_width(s) <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let budget = width - 1;
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = char_width(c);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Floor for the branch column, so a narrow terminal does not shave names down
+/// to nothing in the name of leaving room for what follows them.
+const MIN_NAME_COL: usize = 24;
+
+/// One branch of the tree. Parentage is resolved by name in a second pass, so
+/// the node itself only carries what gets printed.
+struct Node {
+    branch: String,
+    /// Declared fixed branches sort above the group/free churn beneath them.
+    fixed: bool,
+    /// `@` current worktree, `+` some other worktree, `Glyphs::bare` for none.
+    mark: &'static str,
+    /// Everything printed to the right of the branch name.
+    tail: String,
+    kids: Vec<usize>,
+}
+
+/// A worktree or branch with no identity, and so no parent to hang it from.
+struct Stray {
+    head: String,
+    tail: String,
+    reasons: Vec<String>,
+}
+
+/// Recovery line for a branch that no worktree claims and no `[branch]`
+/// declares. The judge's own adopt hint cannot stand in here: it is written for
+/// a worktree being judged, where `adopt` acts on the checkout one is standing
+/// in. This branch has none, so a worktree has to be opened before there is
+/// anything to adopt — the same shape `unmanaged_parent` uses when the branch
+/// it names is somewhere other than here.
+fn unadopted_branch(branch: &str, reasons: &[String]) -> Vec<String> {
+    let mut rs = reasons.to_vec();
+    rs.push(format!(
+        "manage it with: wtree open {branch}, then wtree adopt there"
+    ));
+    rs
 }
 
 pub fn list(cwd: &Path) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
-    let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let cfg = load_rules(&repo)?;
+    // Light: nothing here judges work loss, and the reflected-in-parent probe
+    // is the most expensive fact gather takes. `↑`/`↓` answer the neighbouring
+    // question — how far apart — from a single ancestry walk per row.
+    let world = repo::gather_light(cwd, &cfg)?;
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
+    let g = if io::stdout().is_terminal() { &TREE_PRETTY } else { &TREE_PLAIN };
 
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    println!("worktrees:");
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut parent_of: Vec<Option<String>> = Vec::new();
+    let mut by_branch: BTreeMap<String, usize> = BTreeMap::new();
+    let mut strays: Vec<Stray> = Vec::new();
+    // Every branch a worktree has checked out, judged or not. A worktree that
+    // came out unmanaged still owns its branch, so the branch pass must not
+    // list it a second time.
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+
+    // Worktrees first: a worktree's record outranks a declaration (the
+    // grandfather rule `branch_identity` encodes), so the branches they claim
+    // are the ones the branch pass below skips.
     for (i, wt) in world.facts.iter().enumerate() {
-        let marker = if i == world.current { '*' } else { ' ' };
-        let name = wt
+        if let Some(h) = &wt.head {
+            claimed.insert(h.clone());
+        }
+        let dir = wt
             .path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| wt.path.display().to_string());
-        let head = wt.head.clone().unwrap_or_else(|| "(detached)".into());
-        if let Some(h) = &wt.head {
-            seen.insert(h.clone());
-        }
         let mut flags = String::new();
         if wt.dirty {
             flags.push_str(" [dirty]");
         }
-        if wt.unreflected {
-            flags.push_str(" [unreflected]");
-        }
         let id = ctx.identity_of(wt);
-        match &id {
-            Identity::Unknown { reasons } => {
-                println!("{marker} {name}  {head}  UNKNOWN{flags}");
-                for r in reasons {
-                    println!("      ! {r}");
-                }
+        if let Identity::Unknown { reasons } = &id {
+            let head = wt.head.clone().unwrap_or_else(|| "(detached)".into());
+            strays.push(Stray {
+                head: format!("{dir}  {head}"),
+                tail: format!("UNKNOWN{flags}"),
+                reasons: reasons.clone(),
+            });
+            continue;
+        }
+        let branch = id.branch().expect("a judged identity names its branch").to_string();
+        let (parent, div) = match ctx.parent_of(&id) {
+            Some((p, _)) => {
+                let d = divergence_text(g, divergence(&repo.common_dir, &branch, &p));
+                (Some(p), d)
             }
-            _ => {
-                let ident = describe_identity(&ctx, &id);
-                let (parent, behind) = match ctx.parent_of(&id) {
-                    Some((p, _)) => {
-                        let n = wt
-                            .head
-                            .as_deref()
-                            .and_then(|h| behind_count(&repo.common_dir, h, &p))
-                            .filter(|n| *n > 0)
-                            .map(|n| format!(" [behind {n}]"))
-                            .unwrap_or_default();
-                        (format!("parent: {p}"), n)
-                    }
-                    None => ("root".to_string(), String::new()),
-                };
-                println!("{marker} {name}  {head}  {ident}  {parent}{flags}{behind}");
-            }
+            None => (None, String::new()),
+        };
+        by_branch.insert(branch.clone(), nodes.len());
+        parent_of.push(parent);
+        nodes.push(Node {
+            branch,
+            fixed: matches!(id, Identity::Fixed { .. }),
+            mark: if i == world.current { "@" } else { "+" },
+            tail: format!("{}  {dir}{div}{flags}", describe_identity(&ctx, &id)),
+            kids: Vec::new(),
+        });
+    }
+
+    for b in &world.branches {
+        if claimed.contains(b) {
+            continue;
+        }
+        let id = ctx.branch_identity(b);
+        if let Identity::Unknown { reasons } = &id {
+            strays.push(Stray {
+                head: b.clone(),
+                tail: "UNKNOWN".to_string(),
+                reasons: unadopted_branch(b, reasons),
+            });
+            continue;
+        }
+        let parent = ctx.parent_of(&id).map(|(p, _)| p);
+        // A branch with no worktree still has a parent to be measured against,
+        // and being the one nobody has opened is exactly when how far it has
+        // drifted is worth knowing.
+        let div = parent
+            .as_deref()
+            .map(|p| divergence_text(g, divergence(&repo.common_dir, b, p)))
+            .unwrap_or_default();
+        by_branch.insert(b.clone(), nodes.len());
+        parent_of.push(parent);
+        nodes.push(Node {
+            branch: b.clone(),
+            fixed: matches!(id, Identity::Fixed { .. }),
+            mark: g.bare,
+            tail: format!("{}{div}", describe_identity(&ctx, &id)),
+            kids: Vec::new(),
+        });
+    }
+
+    // A node whose recorded parent is absent — or is itself — becomes a root
+    // rather than vanishing: the tree shows every branch it was given.
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, parent) in parent_of.iter().enumerate() {
+        match parent.as_ref().and_then(|p| by_branch.get(p)) {
+            Some(&p) if p != i => nodes[p].kids.push(i),
+            _ => roots.push(i),
+        }
+    }
+    let key = |n: &Node| (!n.fixed, n.branch.clone());
+    roots.sort_by_key(|&i| key(&nodes[i]));
+    for i in 0..nodes.len() {
+        let mut kids = std::mem::take(&mut nodes[i].kids);
+        kids.sort_by_key(|&j| key(&nodes[j]));
+        nodes[i].kids = kids;
+    }
+
+    // Flatten depth-first into (gutter, node) so the branch column can be
+    // measured in one pass and padded in the next — the gutter's width varies
+    // by depth, so the two cannot be done together.
+    let mut rows: Vec<(String, usize)> = Vec::new();
+    let mut seen = vec![false; nodes.len()];
+    let mut stack: Vec<(usize, String, String)> = roots
+        .iter()
+        .rev()
+        .map(|&r| (r, String::new(), String::new()))
+        .collect();
+    while let Some((i, gutter, prefix)) = stack.pop() {
+        if seen[i] {
+            continue;
+        }
+        seen[i] = true;
+        rows.push((gutter, i));
+        for (n, &k) in nodes[i].kids.iter().enumerate().rev() {
+            let last = n == nodes[i].kids.len() - 1;
+            stack.push((
+                k,
+                format!("{prefix}{}", if last { g.last } else { g.mid }),
+                format!("{prefix}{}", if last { g.gap } else { g.bar }),
+            ));
+        }
+    }
+    // Recorded parents that form a cycle leave their nodes unreachable from any
+    // root. Print them flat rather than drop them.
+    for (i, visited) in seen.iter().enumerate() {
+        if !visited {
+            rows.push((String::new(), i));
         }
     }
 
-    let rest: Vec<&String> = world.branches.iter().filter(|b| !seen.contains(*b)).collect();
-    if !rest.is_empty() {
-        println!("branches without worktrees:");
-        for b in rest {
-            let id = ctx.branch_identity(b);
-            match &id {
-                Identity::Unknown { .. } => {
-                    println!("  {b}  UNKNOWN");
-                    println!(
-                        "      ! no worktree and no [branch] declaration — to manage it, create a worktree for it, then run: wtree adopt"
-                    );
-                }
-                _ => {
-                    let ident = describe_identity(&ctx, &id);
-                    let parent = match ctx.parent_of(&id) {
-                        Some((p, _)) => format!("parent: {p}"),
-                        None => "root".to_string(),
-                    };
-                    println!("  {b}  {ident}  {parent}");
-                }
+    let head_of = |(gutter, i): &(String, usize)| {
+        let n: &Node = &nodes[*i];
+        format!("{gutter}{} {}", n.mark, n.branch)
+    };
+    let natural = rows.iter().map(|r| display_width(&head_of(r))).max().unwrap_or(0);
+    // Piped output is never cut: a reader that is not a terminal is grepping or
+    // diffing, and half a branch name serves neither. On a terminal, one long
+    // name would otherwise push every row's tail past the right edge, so the
+    // names give way first and only past half the screen.
+    let term = terminal_width();
+    let name_w = match term {
+        Some(t) => natural.min((t / 2).max(MIN_NAME_COL)),
+        None => natural,
+    };
+    for r in &rows {
+        let head = truncate_to(&head_of(r), name_w);
+        let pad = " ".repeat(name_w.saturating_sub(display_width(&head)));
+        let line = format!("{head}{pad}  {}", nodes[r.1].tail);
+        let line = line.trim_end();
+        match term {
+            Some(t) => println!("{}", truncate_to(line, t)),
+            None => println!("{line}"),
+        }
+    }
+
+    if !strays.is_empty() {
+        println!("\nunmanaged:");
+        for s in &strays {
+            println!("  {}  {}", s.head, s.tail);
+            for r in &s.reasons {
+                println!("      ! {r}");
             }
         }
     }
@@ -632,9 +1359,13 @@ fn describe_identity(ctx: &Ctx, id: &Identity) -> String {
 
 pub fn info(cwd: &Path) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
     let cur = world.current();
 
     println!("worktree: {}", cur.path.display());
@@ -651,7 +1382,7 @@ pub fn info(cwd: &Path) -> CmdResult {
         }
         let allowed: Vec<&str> = [
             "new", "open", "merge", "sync", "land", "destroy", "close", "list", "info", "init",
-            "adopt",
+            "save", "adopt",
         ]
         .into_iter()
         .filter(|v| judge::verb_allowed_when_unknown(v))
@@ -666,15 +1397,18 @@ pub fn info(cwd: &Path) -> CmdResult {
                 .section(SectionKind::Branch, branch)
                 .map(|s| s.line)
                 .unwrap_or(0);
-            println!("identity: fixed — declared [{branch}] ({CONFIG_LABEL}:{line})");
+            println!("identity: fixed — declared [{branch}] ({RULES_LABEL}:{line})");
         }
-        Identity::GroupMember { group, .. } => println!(
-            "identity: group:{group} — state record in this worktree's private git dir"
-        ),
+        Identity::GroupMember { group, .. } => {
+            println!("identity: group:{group} — state record in this worktree's private git dir")
+        }
         Identity::Free { .. } => {
             println!("identity: free — state record in this worktree's private git dir")
         }
         Identity::Unknown { .. } => unreachable!("handled above"),
+    }
+    if let Some(d) = description_of(&ctx, &id) {
+        println!("description: {d}");
     }
     match ctx.parent_of(&id) {
         Some((p, how)) => println!("parent: {p} ({how})"),
@@ -719,7 +1453,12 @@ pub fn info(cwd: &Path) -> CmdResult {
 
     println!("preview:");
     match ctx.plan_merge(None) {
-        Ok(p) => println!("  merge: '{}' -> '{}' (--{})", p.source, p.target, p.mode.as_str()),
+        Ok(p) => println!(
+            "  merge: '{}' -> '{}' (--{})",
+            p.source,
+            p.target,
+            p.mode.as_str()
+        ),
         Err(r) => print_refusal_indented(&r),
     }
     match ctx.plan_sync() {
@@ -750,17 +1489,33 @@ pub fn info(cwd: &Path) -> CmdResult {
 /// with the situation that called for them.
 pub fn help(cwd: &Path) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    if !config_path(&repo.common_dir).exists() {
+    if !rules_path(&repo.common_dir).exists() {
         println!("this repo has no wtree policy yet\n");
-        println!("  init                      write a starter {CONFIG_LABEL}");
+        println!("  init                      ask where {RULES_LABEL} should come from");
+        println!("  init --new                write a starter one");
+        println!("  init --load [path]        take one from a .wtree/");
         return Ok(());
     }
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
 
-    let head = world.current().head.clone().unwrap_or_else(|| "(detached)".into());
-    println!("{head} ({})", identity_word(&ctx.current_identity()));
+    let head = world
+        .current()
+        .head
+        .clone()
+        .unwrap_or_else(|| "(detached)".into());
+    let id = ctx.current_identity();
+    println!("{head} ({})", identity_word(&id));
+    // Only the current branch's: one per screen, or the line that applies
+    // gets buried under the groups `new` could create here.
+    if let Some(d) = description_of(&ctx, &id) {
+        println!("  {d}");
+    }
     println!();
 
     let mut rows: Vec<(String, String)> = Vec::new();
@@ -808,7 +1563,14 @@ pub fn help(cwd: &Path) -> CmdResult {
         });
     }
     rows.push(("list".to_string(), "worktrees in this repo".to_string()));
-    rows.push(("info".to_string(), "rules and previews for this worktree".to_string()));
+    rows.push((
+        "info".to_string(),
+        "rules and previews for this worktree".to_string(),
+    ));
+    rows.push((
+        "save".to_string(),
+        "copy the rules out to a .wtree/".to_string(),
+    ));
 
     let width = rows.iter().map(|(u, _)| u.len()).max().unwrap_or(0);
     for (usage, note) in &rows {
@@ -826,6 +1588,17 @@ fn mode_flags(modes: &[MergeMode]) -> String {
         1 => flags[0].clone(),
         _ => format!("[{}]", flags.join("|")),
     }
+}
+
+/// The `description` of the section declaring `id`. Free and unknown branches
+/// are declared nowhere, so they never have one.
+fn description_of<'a>(ctx: &Ctx<'a>, id: &Identity) -> Option<&'a str> {
+    let (kind, name) = match id {
+        Identity::Fixed { branch } => (SectionKind::Branch, branch),
+        Identity::GroupMember { group, .. } => (SectionKind::Group, group),
+        Identity::Free { .. } | Identity::Unknown { .. } => return None,
+    };
+    ctx.cfg.get(kind, name, "description")
 }
 
 fn identity_word(id: &Identity) -> String {
@@ -878,19 +1651,27 @@ pub fn usage_open(cwd: &Path) {
     }
     eprintln!();
     for c in &candidates {
-        let note = if c.fixed { "" } else { "   (unmanaged until adopted)" };
+        let note = if c.fixed {
+            ""
+        } else {
+            "   (unmanaged until adopted)"
+        };
         eprintln!("  {}{note}", c.branch);
     }
 }
 
 /// Gather the world and hand a `Ctx` to `f`. Used by the no-argument usage
-/// screens, which have nothing to report if the repo or config is unusable —
+/// screens, which have nothing to report if the repo or rules are unusable —
 /// the usage line alone is still the answer.
 fn with_ctx<T>(cwd: &Path, f: impl FnOnce(&Ctx) -> judge::Decision<T>) -> Result<T, String> {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
     f(&ctx).map_err(|r| r.to_string())
 }
 
@@ -922,10 +1703,16 @@ fn print_refusal_indented(r: &judge::Refusal) {
 
 pub fn adopt(cwd: &Path, group: Option<&str>, free: bool, parent: &str) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
-    let plan = ctx.plan_adopt(group, free, parent).map_err(|r| r.to_string())?;
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
+    let plan = ctx
+        .plan_adopt(group, free, parent)
+        .map_err(|r| r.to_string())?;
 
     // A record about to be replaced (mismatch recovery, re-adopt) is shown
     // before it is gone — never a silent overwrite.
@@ -970,9 +1757,13 @@ pub fn adopt(cwd: &Path, group: Option<&str>, free: bool, parent: &str) -> CmdRe
 
 pub fn merge(cwd: &Path, mode_flag: Option<MergeMode>, msg: Option<&str>) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
     let plan = ctx.plan_merge(mode_flag).map_err(|r| r.to_string())?;
     let commit_msg = check_message("merge", plan.mode, msg)?;
 
@@ -1022,7 +1813,12 @@ fn has_changes_to_merge(world: &repo::World, plan: &MergePlan) -> Result<bool, S
     let wt = &world.current().path;
     let (code, _, derr) = repo::run_git_code(
         wt,
-        &["diff", "--quiet", &format!("{}...{}", plan.target, plan.source), "--"],
+        &[
+            "diff",
+            "--quiet",
+            &format!("{}...{}", plan.target, plan.source),
+            "--",
+        ],
     )?;
     match code {
         0 => Ok(false),
@@ -1063,7 +1859,10 @@ fn run_merge(
         }
         ff_target(&wt, target_wt.as_deref(), &target, &branch)
             .map_err(|e| format!("wtree {verb}: {e}; nothing was changed"))?;
-        println!("fast-forwarded '{target}' to '{branch}' ({})", short_head(&wt));
+        println!(
+            "fast-forwarded '{target}' to '{branch}' ({})",
+            short_head(&wt)
+        );
         print_kept(&wt, in_land);
         return Ok(());
     }
@@ -1124,7 +1923,9 @@ fn run_merge(
             repo::run_git(&wt, &["reset", "-q", "--soft", &base])
                 .map_err(|_| fail(format!("could not squash '{branch}'; nothing merged")))?;
             repo::run_git(&wt, &["commit", "-q", "-m", m]).map_err(|e| {
-                fail(format!("commit failed (hook or signing?): {e}; nothing merged"))
+                fail(format!(
+                    "commit failed (hook or signing?): {e}; nothing merged"
+                ))
             })?;
             rebase_onto(&wt, &target).map_err(&fail)?;
         }
@@ -1139,9 +1940,22 @@ fn run_merge(
             let m = commit_msg.expect("required above");
             let commit = repo::run_git(
                 &wt,
-                &["commit-tree", &merged_tree, "-p", &target_oid, "-p", &branch, "-m", m],
+                &[
+                    "commit-tree",
+                    &merged_tree,
+                    "-p",
+                    &target_oid,
+                    "-p",
+                    &branch,
+                    "-m",
+                    m,
+                ],
             )
-            .map_err(|e| fail(format!("could not create the merge commit: {e}; nothing merged")))?
+            .map_err(|e| {
+                fail(format!(
+                    "could not create the merge commit: {e}; nothing merged"
+                ))
+            })?
             .trim()
             .to_string();
             repo::run_git(&wt, &["merge", "--ff-only", &commit]).map_err(|e| {
@@ -1155,10 +1969,13 @@ fn run_merge(
 
     // Counted before the target moves: exactly what is about to land (1 after
     // a squash; a rebase may have dropped commits already applied).
-    let ncommits = repo::run_git(&wt, &["rev-list", "--count", &format!("{target}..{branch}")])
-        .map_err(|e| fail(format!("{e}; nothing merged")))?
-        .trim()
-        .to_string();
+    let ncommits = repo::run_git(
+        &wt,
+        &["rev-list", "--count", &format!("{target}..{branch}")],
+    )
+    .map_err(|e| fail(format!("{e}; nothing merged")))?
+    .trim()
+    .to_string();
 
     // Step 4 — fast-forward the target.
     ff_target(&wt, target_wt.as_deref(), &target, &branch)
@@ -1191,7 +2008,10 @@ fn run_merge(
 /// the destroy hint that follows it would be true.
 fn print_kept(wt: &Path, in_land: bool) {
     if !in_land {
-        println!("worktree kept @ {}; clean up with: wtree destroy", wt.display());
+        println!(
+            "worktree kept @ {}; clean up with: wtree destroy",
+            wt.display()
+        );
     }
 }
 
@@ -1203,9 +2023,13 @@ fn print_kept(wt: &Path, in_land: bool) {
 
 pub fn sync(cwd: &Path) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
     let plan = ctx.plan_sync().map_err(|r| r.to_string())?;
     let (branch, parent) = (plan.branch, plan.parent);
     let wt = world.current().path.clone();
@@ -1222,7 +2046,9 @@ pub fn sync(cwd: &Path) -> CmdResult {
         &branch,
         &parent,
         &format!("merging '{parent}' into '{branch}'"),
-        &format!("resolve by hand:  git merge {parent}   (resolve, commit) — that completes the sync"),
+        &format!(
+            "resolve by hand:  git merge {parent}   (resolve, commit) — that completes the sync"
+        ),
     )?;
 
     let stashed = stash_push(&wt, "sync", &branch)?;
@@ -1234,7 +2060,10 @@ pub fn sync(cwd: &Path) -> CmdResult {
         ));
     }
     stash_pop(&wt, stashed);
-    println!("synced '{branch}' with '{parent}' (now {})", short_head(&wt));
+    println!(
+        "synced '{branch}' with '{parent}' (now {})",
+        short_head(&wt)
+    );
     Ok(())
 }
 
@@ -1247,9 +2076,13 @@ pub fn sync(cwd: &Path) -> CmdResult {
 
 pub fn destroy(cwd: &Path, force: bool, key: Option<&str>) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
     let plan = ctx.plan_destroy(force, key).map_err(|r| r.to_string())?;
     let targets = resolve_targets(&world, &plan)?;
     execute_destroy(&primary_root(&repo)?, &targets, "destroy", "")
@@ -1352,9 +2185,13 @@ fn remove_one(root: &Path, t: &Target) -> Result<(), String> {
 
 pub fn close(cwd: &Path, key: Option<&str>) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
     let plan = ctx.plan_close(key).map_err(|r| r.to_string())?;
 
     let path = world.current().path.clone();
@@ -1404,9 +2241,13 @@ const LAND_NOTE: &str = "\n  the merge before it already succeeded";
 
 pub fn land(cwd: &Path, mode_flag: Option<MergeMode>, msg: Option<&str>) -> CmdResult {
     let repo = Repo::discover(cwd)?;
-    let cfg = load_policy(&repo)?;
+    let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
 
     // ---- preflight: both halves judged while nothing has happened yet ----
     let plan = ctx.plan_merge(mode_flag).map_err(as_land)?;
@@ -1432,16 +2273,23 @@ pub fn land(cwd: &Path, mode_flag: Option<MergeMode>, msg: Option<&str>) -> CmdR
         // Not a failure: there is nothing to publish, so the cleanup is the
         // whole remaining job — and it is the state a successful `merge`
         // leaves behind, which is the documented way to reach `land`.
-        println!("nothing to merge onto '{}'; going straight to destroy", plan.target);
+        println!(
+            "nothing to merge onto '{}'; going straight to destroy",
+            plan.target
+        );
     }
 
     // The merge moved this branch, so the destroy is carried out on freshly
     // gathered facts rather than the preflight's.
     let note = if merged { LAND_NOTE } else { "" };
     let world = repo::gather(cwd, &cfg)?;
-    let ctx = Ctx { world: &world, cfg: &cfg, label: CONFIG_LABEL };
-    let plan = plan_destroy_for_land(&ctx)
-        .map_err(|r| format!("{}{note}", as_land(r).trim_end()))?;
+    let ctx = Ctx {
+        world: &world,
+        cfg: &cfg,
+        label: RULES_LABEL,
+    };
+    let plan =
+        plan_destroy_for_land(&ctx).map_err(|r| format!("{}{note}", as_land(r).trim_end()))?;
     let targets = resolve_targets(&world, &plan)?;
     execute_destroy(&primary_root(&repo)?, &targets, "land", note)
 }
@@ -1487,7 +2335,11 @@ fn merge_tree_precheck(
         0 => Ok(stdout.lines().next().unwrap_or_default().to_string()),
         1 => {
             let files = conflicted_files(&stdout);
-            let list = if files.is_empty() { "?".to_string() } else { files.join(", ") };
+            let list = if files.is_empty() {
+                "?".to_string()
+            } else {
+                files.join(", ")
+            };
             Err(format!(
                 "wtree {verb}: {doing} would conflict in: {list}\n  {hint}\n  nothing was changed"
             ))
@@ -1520,10 +2372,20 @@ fn stash_push(wt: &Path, verb: &str, branch: &str) -> Result<bool, String> {
     if !repo::is_dirty(wt)? {
         return Ok(false);
     }
-    repo::run_git(wt, &["stash", "push", "-u", "-q", "-m", &format!("wtree {verb}: {branch}")])
-        .map_err(|e| {
-            format!("wtree {verb}: could not stash uncommitted changes: {e}\n  nothing was changed")
-        })?;
+    repo::run_git(
+        wt,
+        &[
+            "stash",
+            "push",
+            "-u",
+            "-q",
+            "-m",
+            &format!("wtree {verb}: {branch}"),
+        ],
+    )
+    .map_err(|e| {
+        format!("wtree {verb}: could not stash uncommitted changes: {e}\n  nothing was changed")
+    })?;
     Ok(true)
 }
 
@@ -1538,8 +2400,14 @@ fn stash_pop(wt: &Path, stashed: bool) {
         return;
     }
     eprintln!("warning: could not restore your uncommitted changes automatically.");
-    eprintln!("  they are kept in the stash:  git -C {} stash list", wt.display());
-    eprintln!("  recover with:                git -C {} stash pop --index", wt.display());
+    eprintln!(
+        "  they are kept in the stash:  git -C {} stash list",
+        wt.display()
+    );
+    eprintln!(
+        "  recover with:                git -C {} stash pop --index",
+        wt.display()
+    );
 }
 
 /// Failure path shared by every post-stash merge step: abort any in-flight
@@ -1559,15 +2427,24 @@ fn bail(wt: &Path, orig_head: &str, stashed: bool, msg: String) -> String {
 /// mid-rebase has a detached HEAD, which locks out every verb until a human
 /// finishes it by hand.
 fn rebase_onto(wt: &Path, target: &str) -> Result<(), String> {
-    repo::run_git(wt, &["rebase", "-q", target]).map(drop).map_err(|_| {
-        format!("rebase onto '{target}' conflicted ('{target}' moved since the precheck); re-run")
-    })
+    repo::run_git(wt, &["rebase", "-q", target])
+        .map(drop)
+        .map_err(|_| {
+            format!(
+                "rebase onto '{target}' conflicted ('{target}' moved since the precheck); re-run"
+            )
+        })
 }
 
 /// Fast-forward the target, never merging into it. Checked out somewhere: the
 /// ff runs in that worktree so its files move with the ref. Not checked out:
 /// there are no files to move, so moving the ref IS the fast-forward.
-fn ff_target(wt: &Path, target_wt: Option<&Path>, target: &str, branch: &str) -> Result<(), String> {
+fn ff_target(
+    wt: &Path,
+    target_wt: Option<&Path>,
+    target: &str,
+    branch: &str,
+) -> Result<(), String> {
     match target_wt {
         Some(tw) => repo::run_git(tw, &["merge", "--ff-only", branch]).map(drop).map_err(|_| {
             format!(
@@ -1605,6 +2482,42 @@ fn short_head(wt: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// The cut has to land on a character boundary and inside the budget, and
+    /// a wide character that would straddle the last column has to be dropped
+    /// rather than pushed over it — one column past the edge wraps the row,
+    /// which is the whole failure being avoided.
+    #[test]
+    fn truncate_to_never_exceeds_the_width() {
+        for s in [
+            "feat/short",
+            "feat/an-extremely-long-branch-name-that-keeps-going",
+            "feat/아주-긴-한글-브랜치-이름",
+            "├─+ feat/혼합-mixed-이름",
+        ] {
+            for w in 0..40 {
+                let cut = truncate_to(s, w);
+                assert!(
+                    display_width(&cut) <= w,
+                    "{s:?} cut to {w}: {cut:?} is {} wide",
+                    display_width(&cut)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_to_leaves_what_already_fits() {
+        assert_eq!(truncate_to("feat/a", 6), "feat/a");
+        assert_eq!(truncate_to("feat/a", 99), "feat/a");
+        assert_eq!(truncate_to("한글", 4), "한글");
+        // One column short: the marker replaces the last character it can.
+        assert_eq!(truncate_to("feat/a", 5), "feat…");
+        // Two columns for the wide character, one for the marker, exactly 3.
+        assert_eq!(truncate_to("한글", 3), "한…");
+        // Only the marker fits beside a character that needs two columns.
+        assert_eq!(truncate_to("한글", 2), "…");
+    }
+
     #[test]
     fn conflicted_files_parsed_from_merge_tree_output() {
         let out = "badf00dtree\n\
@@ -1627,10 +2540,15 @@ mod tests {
     fn relative_worktree_dir_yields_a_clean_absolute_path() {
         let root = Path::new("/repos/proj-main");
         let dest = |dir: &str| {
-            let sett = Settings { worktree_dir: Some(PathBuf::from(dir)) };
+            let sett = Settings {
+                worktree_dir: Some(PathBuf::from(dir)),
+            };
             worktree_dest(root, &sett, "feat/x").unwrap()
         };
-        assert_eq!(dest("../proj.worktrees"), Path::new("/repos/proj.worktrees/feat-x"));
+        assert_eq!(
+            dest("../proj.worktrees"),
+            Path::new("/repos/proj.worktrees/feat-x")
+        );
         assert_eq!(dest("./wtree"), Path::new("/repos/proj-main/wtree/feat-x"));
         assert_eq!(dest("/abs/wtree"), Path::new("/abs/wtree/feat-x"));
 
@@ -1647,5 +2565,56 @@ mod tests {
         // Escaping the root, and `..` following `..`, must survive untouched.
         assert_eq!(normalize(Path::new("/../a")), Path::new("/../a"));
         assert_eq!(normalize(Path::new("a/../../b")), Path::new("../b"));
+    }
+
+    /// What the menu offers, and what it refuses to offer. A directory that
+    /// cannot be loaded is not a choice, and in the main worktree the two roots
+    /// are one place — offering it twice would be a choice between identicals.
+    #[test]
+    fn candidates_hide_the_useless_and_collapse_the_identical() {
+        let here = Path::new("/repo.worktrees/feat-x");
+        let main = Path::new("/repo");
+        let labels = |c: &[Candidate]| -> Vec<&'static str> { c.iter().map(|c| c.label).collect() };
+
+        let both = candidates(here, main, &|_| true);
+        assert_eq!(labels(&both), vec![HERE, MAIN]);
+        assert_eq!(both[0].path, Path::new("/repo.worktrees/feat-x/.wtree"));
+        assert_eq!(both[1].path, Path::new("/repo/.wtree"));
+
+        let only_main = candidates(here, main, &|p| p.starts_with("/repo/"));
+        assert_eq!(labels(&only_main), vec![MAIN]);
+
+        assert!(candidates(here, main, &|_| false).is_empty());
+
+        // standing in the main worktree
+        assert_eq!(labels(&candidates(main, main, &|_| true)), vec![HERE]);
+    }
+
+    #[test]
+    fn the_menu_puts_the_template_last() {
+        let cands = candidates(Path::new("/a"), Path::new("/b"), &|_| true);
+        let items = menu(&cands);
+        assert_eq!(items.len(), 3);
+        assert!(items[0].starts_with(HERE), "{items:?}");
+        assert!(items[0].ends_with("/a/.wtree"), "{items:?}");
+        assert!(items[1].starts_with(MAIN), "{items:?}");
+        assert_eq!(items[2], "create new rules");
+
+        // with nothing to load the caller skips the prompt, but the template
+        // still has to be the entry a bare list falls back to.
+        assert_eq!(menu(&[]), vec!["create new rules".to_string()]);
+    }
+
+    /// A directory name, so no colons, and sortable as plain text.
+    #[test]
+    fn the_backup_stamp_is_a_usable_directory_name() {
+        let s = utc_stamp();
+        assert_eq!(s.len(), 16, "{s}");
+        assert!(s.ends_with('Z') && s[8..9].eq("T"), "{s}");
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_digit() || c == 'T' || c == 'Z'),
+            "{s}"
+        );
     }
 }

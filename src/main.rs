@@ -1,27 +1,34 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use wtree::verbs::{NEW_USAGE, OPEN_USAGE};
-use wtree::{config, verbs};
+use wtree::verbs::{INIT_USAGE, NEW_USAGE, OPEN_USAGE, SAVE_USAGE};
+use wtree::{prompt, rules, verbs};
 
 /// Rust's runtime sets SIGPIPE to SIG_IGN before main, so a closed reader turns
 /// every later `println!` into a panic (`head`, `less`, `grep -q` all do this).
 /// Restoring the default makes the process die quietly like any other unix tool.
-/// Declared here rather than pulled from `libc` to keep the dependency set empty.
 fn restore_sigpipe() {
-    const SIGPIPE: i32 = 13;
-    const SIG_DFL: usize = 0;
-    unsafe extern "C" {
-        fn signal(sig: i32, handler: usize) -> usize;
-    }
-    unsafe { signal(SIGPIPE, SIG_DFL) };
+    // SAFETY: `SIG_DFL` is a valid handler for `SIGPIPE`, and this runs once at
+    // startup, before anything else can be looking at the disposition.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
 }
 
 fn main() -> ExitCode {
     restore_sigpipe();
-    let args: Vec<String> = env::args().skip(1).collect();
+    // `env::args` panics on a non-UTF-8 argument, and a git refname is only a
+    // byte string — `wtree open $'\xff'` is reachable. Every name here is a
+    // `String` down to the state file, so refuse it rather than act on a
+    // lossily converted branch the user did not name.
+    let args: Vec<String> = match env::args_os().skip(1).map(OsString::into_string).collect() {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("wtree: arguments must be valid UTF-8");
+            return ExitCode::from(2);
+        }
+    };
     let cwd: PathBuf = match env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -33,7 +40,25 @@ fn main() -> ExitCode {
     // `rest` rather than `args[1..]`, which panics on the bare invocation.
     let verb = args.first().map(String::as_str).unwrap_or("help");
     let rest: &[String] = args.get(1..).unwrap_or(&[]);
+    // `--help` outranks everything else on the line, wherever it sits. Asking a
+    // verb what it does and having it do the thing instead is the one answer
+    // that cannot be taken back, and no verb here wants `--help` as a value.
+    if args.iter().any(|a| a == "--help") {
+        help_for(verb);
+        return ExitCode::SUCCESS;
+    }
     let result = match verb {
+        // Only in the verb slot: no verb takes a `-v`, so unlike `--help` there
+        // is nothing further down the line for this to outrank.
+        "-v" | "--version" => {
+            println!(
+                "{} {} ({})",
+                env!("CARGO_BIN_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_NAME")
+            );
+            return ExitCode::SUCCESS;
+        }
         "help" => {
             if rest.iter().any(|a| a == "--all") {
                 manual();
@@ -42,7 +67,20 @@ fn main() -> ExitCode {
             verbs::help(&cwd)
         }
         "check" => return cmd_check(args.get(1).map(String::as_str)),
-        "init" => verbs::init(&cwd),
+        "init" => match parse_init_args(rest) {
+            Ok((mode, force)) => verbs::init(&cwd, mode, force),
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::from(2);
+            }
+        },
+        "save" => match parse_save_args(rest) {
+            Ok((dest, force)) => verbs::save(&cwd, dest.as_deref(), force),
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::from(2);
+            }
+        },
         "new" => match parse_new_args(rest) {
             Ok((name, group)) => verbs::new(&cwd, &name, group.as_deref()),
             Err(ArgErr::Missing) => {
@@ -204,7 +242,11 @@ fn parse_close_args(rest: &[String]) -> Result<Option<String>, String> {
                 Some(k) => key = Some(k.clone()),
                 None => return Err("wtree close: --key requires a value".into()),
             },
-            s => return Err(format!("wtree close: unknown argument '{s}'\n{CLOSE_USAGE}")),
+            s => {
+                return Err(format!(
+                    "wtree close: unknown argument '{s}'\n{CLOSE_USAGE}"
+                ));
+            }
         }
     }
     Ok(key)
@@ -214,7 +256,7 @@ const ADOPT_USAGE: &str = "usage: wtree adopt (--group G | --free) --parent P";
 
 /// Exactly one of --group/--free, plus a mandatory --parent. The exclusivity
 /// is decided here rather than in the judge so a misspelled invocation fails
-/// as a usage error (exit 2), before any repo or config is touched.
+/// as a usage error (exit 2), before any repo or rules are touched.
 fn parse_adopt_args(rest: &[String]) -> Result<(Option<String>, bool, String), String> {
     let mut group: Option<String> = None;
     let mut free = false;
@@ -235,7 +277,11 @@ fn parse_adopt_args(rest: &[String]) -> Result<(Option<String>, bool, String), S
                 Some(p) => parent = Some(p.clone()),
                 None => return Err("wtree adopt: --parent requires a value".into()),
             },
-            s => return Err(format!("wtree adopt: unknown argument '{s}'\n{ADOPT_USAGE}")),
+            s => {
+                return Err(format!(
+                    "wtree adopt: unknown argument '{s}'\n{ADOPT_USAGE}"
+                ));
+            }
         }
     }
     match (&group, free) {
@@ -263,14 +309,14 @@ fn parse_adopt_args(rest: &[String]) -> Result<(Option<String>, bool, String), S
 fn parse_merge_args(
     verb: &str,
     rest: &[String],
-) -> Result<(Option<config::MergeMode>, Option<String>), String> {
+) -> Result<(Option<rules::MergeMode>, Option<String>), String> {
     let mut mode = None;
     let mut msg: Option<String> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--squash" | "--rebase" | "--no-ff" | "--ff" => {
-                let m = config::MergeMode::parse(&a[2..]).expect("flag names mirror mode names");
+                let m = rules::MergeMode::parse(&a[2..]).expect("flag names mirror mode names");
                 if mode.is_some() {
                     return Err(format!(
                         "wtree {verb}: pass exactly one of --squash | --rebase | --no-ff | --ff"
@@ -325,51 +371,159 @@ fn parse_destroy_args(rest: &[String]) -> Result<(bool, Option<String>), String>
                 Some(k) => key = Some(k.clone()),
                 None => return Err("wtree destroy: --key requires a value".into()),
             },
-            s => return Err(format!("wtree destroy: unknown argument '{s}'\n{DESTROY_USAGE}")),
+            s => {
+                return Err(format!(
+                    "wtree destroy: unknown argument '{s}'\n{DESTROY_USAGE}"
+                ));
+            }
         }
     }
     Ok((force, key))
 }
 
+/// `--new` and `--load` name the two things `init` can do, and one of them has
+/// to be picked: guessing from whether a `.wtree/` happens to exist is how a
+/// team policy gets silently replaced by a template. Neither flag means "ask",
+/// which only works on a terminal.
+fn parse_init_args(rest: &[String]) -> Result<(verbs::InitMode, bool), String> {
+    let mut mode: Option<verbs::InitMode> = None;
+    let mut force = false;
+    let mut it = rest.iter().peekable();
+    while let Some(a) = it.next() {
+        let picked = match a.as_str() {
+            "--new" => verbs::InitMode::New,
+            "--load" => {
+                // The path is optional, so a following `--force` is the next
+                // flag rather than a directory called "--force".
+                let p = it.next_if(|v| !v.starts_with("--"));
+                verbs::InitMode::Load(p.map(PathBuf::from))
+            }
+            "--force" => {
+                force = true;
+                continue;
+            }
+            s => return Err(format!("wtree init: unknown argument '{s}'\n{INIT_USAGE}")),
+        };
+        if mode.is_some() {
+            return Err(format!(
+                "wtree init: --new and --load are mutually exclusive\n{INIT_USAGE}"
+            ));
+        }
+        mode = Some(picked);
+    }
+    match mode {
+        Some(m) => Ok((m, force)),
+        // Nothing to force: the interactive path asks about overwriting to your
+        // face, and there is no template-versus-load decision to pre-answer.
+        None if force => Err(format!(
+            "wtree init: --force only applies to --new or --load\n{INIT_USAGE}"
+        )),
+        // Refused here rather than deeper in: there is nothing to ask on, and a
+        // missing flag is a usage error (exit 2) whether or not this is a repo.
+        None if !prompt::available() => Err(format!(
+            "wtree init: no terminal to ask on — say which source to use\n  \
+             wtree init --new\n  wtree init --load [path]\n{INIT_USAGE}"
+        )),
+        None => Ok((verbs::InitMode::Ask, false)),
+    }
+}
+
+fn parse_save_args(rest: &[String]) -> Result<(Option<PathBuf>, bool), String> {
+    let mut dest: Option<PathBuf> = None;
+    let mut force = false;
+    for a in rest {
+        match a.as_str() {
+            "--force" => force = true,
+            s if s.starts_with("--") => {
+                return Err(format!("wtree save: unknown flag '{s}'\n{SAVE_USAGE}"));
+            }
+            s if dest.is_some() => {
+                return Err(format!("wtree save: '{s}' is a second path\n{SAVE_USAGE}"));
+            }
+            s => dest = Some(PathBuf::from(s)),
+        }
+    }
+    Ok((dest, force))
+}
+
+/// Every verb, in the order the manual prints them. `--help` for a single verb
+/// reads one row out of the same table, so the two can never disagree.
+const ROWS: &[(&str, &str, &str)] = &[
+    ("new", NEW_USAGE, "create a branch and its worktree"),
+    ("open", OPEN_USAGE, "give an existing branch a worktree"),
+    ("close", CLOSE_USAGE, "remove a worktree, keep the branch"),
+    (
+        "merge",
+        "usage: wtree merge [--squash|--rebase|--no-ff|--ff] [-m <msg>]",
+        "merge into the parent",
+    ),
+    (
+        "sync",
+        "usage: wtree sync",
+        "merge the parent into this branch",
+    ),
+    (
+        "land",
+        "usage: wtree land [--squash|--rebase|--no-ff|--ff] [-m <msg>]",
+        "merge, then destroy",
+    ),
+    ("destroy", DESTROY_USAGE, "delete a branch and its worktree"),
+    (
+        "adopt",
+        ADOPT_USAGE,
+        "record what a branch is, and whose child",
+    ),
+    ("list", "usage: wtree list", "worktrees in this repo"),
+    (
+        "info",
+        "usage: wtree info",
+        "rules and previews for one worktree",
+    ),
+    (
+        "init",
+        INIT_USAGE,
+        "write starter rules, or load them from a .wtree/ (asks when given neither)",
+    ),
+    (
+        "save",
+        SAVE_USAGE,
+        "copy the rules out to a .wtree/ you can commit",
+    ),
+    (
+        "check",
+        "usage: wtree check <rules-path>",
+        "parse and validate a rules file (dev-only)",
+    ),
+];
+
+/// `wtree <verb> --help`. Whatever has no row of its own — `help`, a misspelled
+/// verb, or `wtree --help` with no verb at all — gets the whole manual, which
+/// is never a worse answer than the one line it was reaching for.
+fn help_for(verb: &str) {
+    match ROWS.iter().find(|(v, ..)| *v == verb) {
+        Some((_, usage, note)) => println!("{usage}\n    {note}"),
+        None => manual(),
+    }
+}
+
 /// `wtree help --all` — every verb, judged against nothing. It reads no repo
-/// and no config on purpose: a broken config is when a user most needs to look
+/// and no rules on purpose: broken rules are when a user most needs to look
 /// something up, and that is exactly when the contextual menu cannot be built.
 fn manual() {
     println!("usage: wtree <verb> [args]\n");
-    let rows: &[(&str, &str)] = &[
-        (NEW_USAGE, "create a branch and its worktree"),
-        (OPEN_USAGE, "give an existing branch a worktree"),
-        (CLOSE_USAGE, "remove a worktree, keep the branch"),
-        (
-            "usage: wtree merge [--squash|--rebase|--no-ff|--ff] [-m <msg>]",
-            "merge into the parent",
-        ),
-        ("usage: wtree sync", "merge the parent into this branch"),
-        (
-            "usage: wtree land [--squash|--rebase|--no-ff|--ff] [-m <msg>]",
-            "merge, then destroy",
-        ),
-        (DESTROY_USAGE, "delete a branch and its worktree"),
-        (ADOPT_USAGE, "record what a branch is, and whose child"),
-        ("usage: wtree list", "worktrees in this repo"),
-        ("usage: wtree info", "rules and previews for one worktree"),
-        ("usage: wtree init", "write a starter policy config"),
-        (
-            "usage: wtree check <config-path>",
-            "parse and validate a config (dev-only)",
-        ),
-    ];
-    for (usage, note) in rows {
+    for (_, usage, note) in ROWS {
         println!("  {}\n      {note}", usage.trim_start_matches("usage: "));
     }
     println!("\n-m is required for --squash and --no-ff, and rejected for --rebase and --ff.");
     println!("--key and --force appear only when a verb asks for them.");
     println!("\nwtree (no verb) lists just the verbs available where you are.");
+    println!("wtree <verb> --help prints that verb's line on its own.");
+    println!("wtree --version (or -v) prints the version.");
 }
 
 fn cmd_check(path: Option<&str>) -> ExitCode {
     let Some(path) = path else {
-        eprintln!("usage: wtree check <config-path>");
+        eprintln!("usage: wtree check <rules-path>");
         return ExitCode::from(2);
     };
     let text = match fs::read_to_string(path) {
@@ -379,7 +533,7 @@ fn cmd_check(path: Option<&str>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let loaded = config::load_str(&text, path);
+    let loaded = rules::load_str(&text, path);
     for w in &loaded.warnings {
         println!("warning: {w}");
     }
@@ -389,7 +543,7 @@ fn cmd_check(path: Option<&str>) -> ExitCode {
     if loaded.errors.is_empty() {
         println!(
             "ok: {} section(s), {} warning(s)",
-            loaded.config.sections.len(),
+            loaded.rules.sections.len(),
             loaded.warnings.len()
         );
         ExitCode::SUCCESS
@@ -406,10 +560,56 @@ fn cmd_check(path: Option<&str>) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wtree::config::MergeMode;
+    use wtree::rules::MergeMode;
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--load` takes an optional path, so the parser has to tell a directory
+    /// from the next flag. Everything else it accepts is exclusive or refused.
+    #[test]
+    fn init_args_read_the_optional_load_path() {
+        let mode = |a: &[&str]| match parse_init_args(&args(a)) {
+            Ok((verbs::InitMode::New, f)) => format!("new force={f}"),
+            Ok((verbs::InitMode::Load(p), f)) => format!("load {p:?} force={f}"),
+            Ok((verbs::InitMode::Ask, f)) => format!("ask force={f}"),
+            Err(e) => format!("err: {}", e.lines().next().unwrap()),
+        };
+        assert_eq!(mode(&["--new"]), "new force=false");
+        assert_eq!(mode(&["--new", "--force"]), "new force=true");
+        assert_eq!(mode(&["--load"]), "load None force=false");
+        assert_eq!(
+            mode(&["--load", ".wtree.strategy-1"]),
+            "load Some(\".wtree.strategy-1\") force=false"
+        );
+        // the flag after a bare --load is a flag, not a directory called --force
+        assert_eq!(mode(&["--load", "--force"]), "load None force=true");
+        assert_eq!(
+            mode(&["--force", "--load", "x"]),
+            "load Some(\"x\") force=true"
+        );
+
+        assert!(mode(&["--new", "--load"]).contains("mutually exclusive"));
+        assert!(mode(&["--load", "a", "--load", "b"]).contains("mutually exclusive"));
+        assert!(mode(&["--force"]).contains("--force only applies"));
+        assert!(mode(&["--nope"]).contains("unknown argument"));
+    }
+
+    #[test]
+    fn save_args_take_one_path_at_most() {
+        assert_eq!(parse_save_args(&args(&[])).unwrap(), (None, false));
+        assert_eq!(
+            parse_save_args(&args(&[".wtree.b", "--force"])).unwrap(),
+            (Some(PathBuf::from(".wtree.b")), true)
+        );
+        for (a, needle) in [
+            (vec!["a", "b"], "second path"),
+            (vec!["--nope"], "unknown flag"),
+        ] {
+            let e = parse_save_args(&args(&a)).unwrap_err();
+            assert!(e.contains(needle), "{a:?}: {e}");
+        }
     }
 
     #[test]
@@ -423,12 +623,21 @@ mod tests {
             (None, true, "main".into())
         );
         for (a, needle) in [
-            (vec!["--group", "g", "--free", "--parent", "main"], "mutually exclusive"),
+            (
+                vec!["--group", "g", "--free", "--parent", "main"],
+                "mutually exclusive",
+            ),
             (vec!["--parent", "main"], "one of --group <X> or --free"),
             (vec!["--free"], "--parent <branch> is required"),
             (vec!["--free", "--parent"], "--parent requires a value"),
-            (vec!["--group", "a", "--group", "b", "--parent", "m"], "--group given twice"),
-            (vec!["--free", "--parent", "m", "extra"], "unknown argument 'extra'"),
+            (
+                vec!["--group", "a", "--group", "b", "--parent", "m"],
+                "--group given twice",
+            ),
+            (
+                vec!["--free", "--parent", "m", "extra"],
+                "unknown argument 'extra'",
+            ),
         ] {
             let e = parse_adopt_args(&args(&a)).unwrap_err();
             assert!(e.contains(needle), "for {a:?}: {e}");
@@ -448,7 +657,9 @@ mod tests {
         assert_eq!(parse_merge_args("merge", &args(&[])).unwrap(), (None, None));
         // a dash-leading phrase is plainly a value, not a flag
         assert_eq!(
-            parse_merge_args("merge", &args(&["-m", "- fix the thing"])).unwrap().1,
+            parse_merge_args("merge", &args(&["-m", "- fix the thing"]))
+                .unwrap()
+                .1,
             Some("- fix the thing".into())
         );
         // land takes the same flags, and says so when it refuses them
@@ -478,10 +689,7 @@ mod tests {
     fn open_takes_one_branch_and_close_takes_only_a_key() {
         assert_eq!(parse_open_args(&args(&["feature/a"])).unwrap(), "feature/a");
         // No branch at all is Missing, so the caller can list the candidates.
-        assert!(matches!(
-            parse_open_args(&args(&[])),
-            Err(ArgErr::Missing)
-        ));
+        assert!(matches!(parse_open_args(&args(&[])), Err(ArgErr::Missing)));
         for (a, needle) in [
             (vec!["a", "b"], "unexpected extra argument 'b'"),
             (vec!["--force"], "unknown flag '--force'"),

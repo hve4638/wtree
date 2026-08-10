@@ -1,13 +1,13 @@
-//! Judgment core: pure decisions over a `World` snapshot plus policy config.
+//! Judgment core: pure decisions over a `World` snapshot plus policy rules.
 //!
 //! No side effects — each `plan_*` returns either a plan describing what the
 //! verb would do, or a `Refusal` listing every reason, citing rule values and
-//! config lines in the DESIGN.md error format.
+//! rules lines in the DESIGN.md error format.
 
 use std::fmt;
 
-use crate::config::{Child, Config, MergeMode, SectionKind};
 use crate::repo::{World, WtFact};
+use crate::rules::{Child, MergeMode, Rules, SectionKind};
 use crate::state::{Kind, State, StateRead};
 
 pub const ALL_MODES: [MergeMode; 4] = [
@@ -24,10 +24,21 @@ const ADOPT_HINT: &str = "recover with: wtree adopt";
 /// (2) `[X]` declaration -> fixed, (3) unknown, fail closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
-    Fixed { branch: String },
-    GroupMember { branch: String, group: String, parent: String },
-    Free { branch: String, parent: String },
-    Unknown { reasons: Vec<String> },
+    Fixed {
+        branch: String,
+    },
+    GroupMember {
+        branch: String,
+        group: String,
+        parent: String,
+    },
+    Free {
+        branch: String,
+        parent: String,
+    },
+    Unknown {
+        reasons: Vec<String>,
+    },
 }
 
 impl Identity {
@@ -80,9 +91,19 @@ fn refuse<T>(verb: &'static str, subject: impl Into<String>, reasons: Vec<String
 pub enum NewPlan {
     /// Declared fixed branch, listed bare in the parent's children — created
     /// without a state record.
-    Fixed { name: String, parent: String },
-    GroupMember { name: String, group: String, parent: String },
-    Free { name: String, parent: String },
+    Fixed {
+        name: String,
+        parent: String,
+    },
+    GroupMember {
+        name: String,
+        group: String,
+        parent: String,
+    },
+    Free {
+        name: String,
+        parent: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -108,7 +129,7 @@ pub struct DestroyPlan {
 #[derive(Debug, PartialEq, Eq)]
 pub struct OpenPlan {
     pub branch: String,
-    /// A declared `[branch]`: its identity comes from the config, so the new
+    /// A declared `[branch]`: its identity comes from the rules, so the new
     /// worktree needs no state record and the branch is managed at once.
     /// Anything else stays unknown until it is adopted from there.
     pub fixed: bool,
@@ -122,7 +143,7 @@ pub struct ClosePlan {
     /// needs `--force` to carry that out.
     pub dirty: bool,
     /// Whether the state record goes with the worktree, leaving the branch
-    /// unmanaged (group/free) or not (fixed, declared in the config).
+    /// unmanaged (group/free) or not (fixed, declared in the rules).
     pub drops_record: bool,
 }
 
@@ -216,7 +237,10 @@ pub enum Affordance {
 /// it is given, not the worktree it is typed in, so this worktree's identity
 /// never enters into it.
 pub fn verb_allowed_when_unknown(verb: &str) -> bool {
-    matches!(verb, "adopt" | "list" | "info" | "init" | "open" | "close")
+    matches!(
+        verb,
+        "adopt" | "list" | "info" | "init" | "save" | "open" | "close"
+    )
 }
 
 /// Refusal reasons for a parent that is no longer managed. Its rules cannot be
@@ -245,9 +269,7 @@ fn unmanaged_parent(parent: &str, reasons: &[String]) -> Vec<String> {
 fn primary_worktree(verb: &'static str) -> Vec<String> {
     vec![
         "this is the primary worktree — git cannot remove it".to_string(),
-        format!(
-            "{verb} removes a linked worktree; the primary one is the repo checkout itself"
-        ),
+        format!("{verb} removes a linked worktree; the primary one is the repo checkout itself"),
     ]
 }
 
@@ -261,8 +283,8 @@ fn mode_list(modes: &[MergeMode]) -> String {
 
 pub struct Ctx<'a> {
     pub world: &'a World,
-    pub cfg: &'a Config,
-    /// Label used when citing config rules, e.g. ".git/wtree/config".
+    pub cfg: &'a Rules,
+    /// Label used when citing rules, e.g. ".git/wtree/rules".
     pub label: &'a str,
 }
 
@@ -282,7 +304,7 @@ impl<'a> Ctx<'a> {
             .unwrap_or_else(|| "(detached)".to_string())
     }
 
-    /// `rule: key = value    (.git/wtree/config:N)` citation for refusal reasons.
+    /// `rule: key = value    (.git/wtree/rules:N)` citation for refusal reasons.
     fn rule(&self, kind: SectionKind, name: &str, key: &str) -> String {
         match (
             self.cfg.get(kind, name, key),
@@ -331,7 +353,7 @@ impl<'a> Ctx<'a> {
                             Identity::Unknown {
                                 reasons: vec![
                                     format!(
-                                        "recorded group '{g}' is no longer declared in config"
+                                        "recorded group '{g}' is no longer declared in the rules"
                                     ),
                                     ADOPT_HINT.to_string(),
                                 ],
@@ -403,7 +425,7 @@ impl<'a> Ctx<'a> {
                 .cfg
                 .bare_parent_sections(branch)
                 .first()
-                .map(|s| (s.name.clone(), "config-derived")),
+                .map(|s| (s.name.clone(), "rules-derived")),
             Identity::Unknown { .. } => None,
         }
     }
@@ -412,14 +434,14 @@ impl<'a> Ctx<'a> {
     /// violated key (`name-allow` or `name-deny`).
     fn naming_ok(&self, group: &str, name: &str) -> Result<(), (String, &'static str)> {
         let allow = self.cfg.name_allow(group);
-        if !allow.is_empty() && !allow.iter().any(|p| crate::config::glob_match(p, name)) {
+        if !allow.is_empty() && !allow.iter().any(|p| crate::rules::glob_match(p, name)) {
             return Err((
                 format!("'{name}' does not match name-allow of group '{group}'"),
                 "name-allow",
             ));
         }
         for p in self.cfg.name_deny(group) {
-            if crate::config::glob_match(&p, name) {
+            if crate::rules::glob_match(&p, name) {
                 return Err((
                     format!("'{name}' matches name-deny pattern '{p}' of group '{group}'"),
                     "name-deny",
@@ -602,7 +624,10 @@ impl<'a> Ctx<'a> {
                 let mut rs: Vec<String> = rejected
                     .iter()
                     .map(|(g, (why, key))| {
-                        format!("group:{g} — {why}\n{}", self.rule(SectionKind::Group, g, key))
+                        format!(
+                            "group:{g} — {why}\n{}",
+                            self.rule(SectionKind::Group, g, key)
+                        )
                     })
                     .collect();
                 if rs.is_empty() {
@@ -665,7 +690,7 @@ impl<'a> Ctx<'a> {
     /// `close` removes this worktree and keeps the branch, so nothing is
     /// destroyed and `destroyable` does not apply. The one question it asks is
     /// whether the node leaves the tree along with the worktree: a fixed
-    /// branch's identity is its config declaration and outlives any checkout,
+    /// branch's identity is its rules declaration and outlives any checkout,
     /// while a group/free branch's identity is the record inside this
     /// worktree — losing it would leave that branch's children with an
     /// unmanaged parent, which is where policy silently stops applying.
@@ -786,13 +811,12 @@ impl<'a> Ctx<'a> {
         if cur.dirty {
             let expected = cur.confirmation_key.as_deref();
             if expected.is_none() || key != expected {
-                let mut rs =
-                    vec!["uncommitted changes go with the worktree (the branch keeps its commits)"
-                        .to_string()];
+                let mut rs = vec![
+                    "uncommitted changes go with the worktree (the branch keeps its commits)"
+                        .to_string(),
+                ];
                 match expected {
-                    Some(k) => {
-                        rs.push(format!("confirmation key required: wtree close --key {k}"))
-                    }
+                    Some(k) => rs.push(format!("confirmation key required: wtree close --key {k}")),
                     None => rs.push("confirmation key could not be computed".to_string()),
                 }
                 return refuse("close", subject, rs);
@@ -809,11 +833,17 @@ impl<'a> Ctx<'a> {
             Identity::Unknown { reasons } => {
                 return refuse(
                     "merge",
-                    format!("'{}' is unmanaged (fail closed)", self.current_head_or_detached()),
+                    format!(
+                        "'{}' is unmanaged (fail closed)",
+                        self.current_head_or_detached()
+                    ),
                     reasons.clone(),
                 );
             }
-            other => other.branch().expect("known identity has a branch").to_string(),
+            other => other
+                .branch()
+                .expect("known identity has a branch")
+                .to_string(),
         };
         let Some((target, how)) = self.parent_of(&id) else {
             return refuse(
@@ -840,12 +870,22 @@ impl<'a> Ctx<'a> {
             return refuse("merge", subject, unmanaged_parent(&target, &reasons));
         }
         let (modes, cite) = self.target_merge_modes(&target);
-        Ok(MergeGate { source: branch, target, modes, cite })
+        Ok(MergeGate {
+            source: branch,
+            target,
+            modes,
+            cite,
+        })
     }
 
     pub fn plan_merge(&self, mode_flag: Option<MergeMode>) -> Decision<MergePlan> {
         let g = self.gate_merge()?;
-        let MergeGate { source, target, modes: allowed, cite } = g;
+        let MergeGate {
+            source,
+            target,
+            modes: allowed,
+            cite,
+        } = g;
         let subject = format!("'{source}' -> '{target}'");
         let mode = match mode_flag {
             Some(m) if allowed.contains(&m) => m,
@@ -898,11 +938,17 @@ impl<'a> Ctx<'a> {
             Identity::Unknown { reasons } => {
                 return refuse(
                     "sync",
-                    format!("'{}' is unmanaged (fail closed)", self.current_head_or_detached()),
+                    format!(
+                        "'{}' is unmanaged (fail closed)",
+                        self.current_head_or_detached()
+                    ),
                     reasons.clone(),
                 );
             }
-            other => other.branch().expect("known identity has a branch").to_string(),
+            other => other
+                .branch()
+                .expect("known identity has a branch")
+                .to_string(),
         };
         let Some((parent, _how)) = self.parent_of(&id) else {
             return refuse(
@@ -948,11 +994,17 @@ impl<'a> Ctx<'a> {
             Identity::Unknown { reasons } => {
                 return refuse(
                     "destroy",
-                    format!("'{}' is unmanaged (fail closed)", self.current_head_or_detached()),
+                    format!(
+                        "'{}' is unmanaged (fail closed)",
+                        self.current_head_or_detached()
+                    ),
                     reasons.clone(),
                 );
             }
-            other => other.branch().expect("known identity has a branch").to_string(),
+            other => other
+                .branch()
+                .expect("known identity has a branch")
+                .to_string(),
         };
         let subject = format!("'{branch}'");
 
@@ -1043,7 +1095,10 @@ impl<'a> Ctx<'a> {
             }
         }
 
-        Ok(DestroyPlan { branch, cascade: g.cascade })
+        Ok(DestroyPlan {
+            branch,
+            cascade: g.cascade,
+        })
     }
 
     /// Worktrees whose state record names `branch` as its parent — the
@@ -1063,12 +1118,16 @@ impl<'a> Ctx<'a> {
 
     /// Recursive child scan for destroy/land: returns (blockers, leaf-first
     /// cascade order). Managed children are worktree records whose parent is
-    /// `branch`, plus declared fixed branches whose config parent is `branch`
+    /// `branch`, plus declared fixed branches whose rules parent is `branch`
     /// and which exist in git.
-    fn subtree_closable(&self, branch: &str, visited: &mut Vec<String>) -> (Vec<String>, Vec<String>) {
+    fn subtree_closable(
+        &self,
+        branch: &str,
+        visited: &mut Vec<String>,
+    ) -> (Vec<String>, Vec<String>) {
         let mut blockers = Vec::new();
         let mut order = Vec::new();
-        // Fixed children: config x branch existence.
+        // Fixed children: rules x branch existence.
         for b in self.cfg.branch_names() {
             if b == branch || !self.world.branches.contains(b) {
                 continue;
@@ -1137,7 +1196,10 @@ impl<'a> Ctx<'a> {
             return refuse(
                 "adopt",
                 "(detached HEAD)".to_string(),
-                vec!["cannot adopt a detached HEAD — check out the branch to adopt first".to_string()],
+                vec![
+                    "cannot adopt a detached HEAD — check out the branch to adopt first"
+                        .to_string(),
+                ],
             );
         };
         // Name reservation applies to --group and --free alike: a declared
@@ -1297,18 +1359,18 @@ impl<'a> Ctx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
     use crate::repo;
+    use crate::rules;
     use crate::testutil::Fixture;
     use std::path::Path;
 
-    fn cfg(text: &str) -> Config {
-        let l = config::load_str(text, ".git/wtree/config");
-        assert!(l.errors.is_empty(), "config errors: {:?}", l.errors);
-        l.config
+    fn cfg(text: &str) -> Rules {
+        let l = rules::load_str(text, ".git/wtree/rules");
+        assert!(l.errors.is_empty(), "rules errors: {:?}", l.errors);
+        l.rules
     }
 
-    fn world(cwd: &Path, cfg: &Config) -> World {
+    fn world(cwd: &Path, cfg: &Rules) -> World {
         repo::gather(cwd, cfg).unwrap()
     }
 
@@ -1341,15 +1403,29 @@ mod tests {
 
         // sanity: managed before the raw intervention
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
-        assert!(matches!(ctx.current_identity(), Identity::GroupMember { .. }));
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        assert!(matches!(
+            ctx.current_identity(),
+            Identity::GroupMember { .. }
+        ));
 
         // raw switch: HEAD moves, record stays
         fx.git(&wt, &["switch", "-q", "-c", "oops"]);
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         assert!(matches!(ctx.current_identity(), Identity::Unknown { .. }));
-        refused(ctx.plan_merge(None), &["unmanaged", "raw switch/rename", "adopt"]);
+        refused(
+            ctx.plan_merge(None),
+            &["unmanaged", "raw switch/rename", "adopt"],
+        );
         refused(ctx.plan_new("feature/b", None), &["cannot be a parent"]);
         fx.git(&wt, &["switch", "-q", "feature/a"]);
 
@@ -1357,8 +1433,15 @@ mod tests {
         let wt2 = member(&fx, "feature/b", "feat", "main");
         fx.git(&wt2, &["branch", "-m", "feature/b2"]);
         let w = world(&wt2, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
-        refused(ctx.plan_sync(), &["recorded branch 'feature/b'", "HEAD 'feature/b2'"]);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        refused(
+            ctx.plan_sync(),
+            &["recorded branch 'feature/b'", "HEAD 'feature/b2'"],
+        );
     }
 
     #[test]
@@ -1369,18 +1452,29 @@ mod tests {
         std::fs::write(private.join(crate::state::STATE_FILE), "version = 9\n").unwrap();
         let c = cfg("[main]\nchildren = group:feat\n\n[group:feat]\n");
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_sync(), &["corrupt", "unknown version '9'"]);
 
-        // recorded group no longer declared in config
+        // recorded group no longer declared in the rules
         fx.write_state(&wt, "feature/a", "group:gone", "main");
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
-        refused(ctx.plan_sync(), &["recorded group 'gone' is no longer declared"]);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        refused(
+            ctx.plan_sync(),
+            &["recorded group 'gone' is no longer declared"],
+        );
     }
 
     #[test]
-    fn parent_derivation_recorded_config_and_root() {
+    fn parent_derivation_recorded_rules_and_root() {
         let fx = Fixture::new();
         let c = cfg(
             "[main]\nchildren = dev, group:feat\nmerge-mode = squash\n\n[dev]\n\n[group:feat]\nname-allow = feature/*\n",
@@ -1388,26 +1482,48 @@ mod tests {
         // recorded parent (group member)
         let m = member(&fx, "feature/a", "feat", "main");
         let w = world(&m, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         assert_eq!(
             ctx.plan_sync().unwrap(),
-            SyncPlan { branch: "feature/a".into(), parent: "main".into() }
+            SyncPlan {
+                branch: "feature/a".into(),
+                parent: "main".into()
+            }
         );
-        // config-derived parent (fixed branch, no state record)
+        // rules-derived parent (fixed branch, no state record)
         let d = fx.add_worktree("dev", "main");
         let w = world(&d, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         assert_eq!(
             ctx.plan_sync().unwrap(),
-            SyncPlan { branch: "dev".into(), parent: "main".into() }
+            SyncPlan {
+                branch: "dev".into(),
+                parent: "main".into()
+            }
         );
         assert_eq!(
             ctx.plan_merge(None).unwrap(),
-            MergePlan { source: "dev".into(), target: "main".into(), mode: MergeMode::Squash }
+            MergePlan {
+                source: "dev".into(),
+                target: "main".into(),
+                mode: MergeMode::Squash
+            }
         );
         // root: fixed branch listed bare nowhere
         let w = world(&fx.repo, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_sync(), &["no parent to sync from (root branch?)"]);
         refused(ctx.plan_merge(None), &["no merge target"]);
     }
@@ -1421,7 +1537,11 @@ mod tests {
         let wt = fx.add_worktree("dev", "main");
         fx.write_state(&wt, "dev", "group:feat", "main");
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         assert!(matches!(
             ctx.current_identity(),
             Identity::GroupMember { ref group, .. } if group == "feat"
@@ -1434,39 +1554,62 @@ mod tests {
     #[test]
     fn new_group_resolution_three_rules() {
         let fx = Fixture::new();
-        let base = "[group:a]\nname-allow = feature/*\n\n[group:b]\nname-allow = feature/*, bug/*\n";
+        let base =
+            "[group:a]\nname-allow = feature/*\n\n[group:b]\nname-allow = feature/*, bug/*\n";
         let star_cfg = cfg(&format!("[main]\nchildren = group:a, group:b, *\n\n{base}"));
         let w = world(&fx.repo, &star_cfg);
-        let ctx = Ctx { world: &w, cfg: &star_cfg, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &star_cfg,
+            label: ".git/wtree/rules",
+        };
         // exactly one candidate -> that group ('*' ignored)
         assert_eq!(
             ctx.plan_new("bug/x", None).unwrap(),
-            NewPlan::GroupMember { name: "bug/x".into(), group: "b".into(), parent: "main".into() }
+            NewPlan::GroupMember {
+                name: "bug/x".into(),
+                group: "b".into(),
+                parent: "main".into()
+            }
         );
         // two candidates -> ambiguous, refuse ('*' must not swallow it)
         refused(ctx.plan_new("feature/x", None), &["ambiguous", "a, b"]);
         // --group narrows the ambiguity
         assert_eq!(
             ctx.plan_new("feature/x", Some("a")).unwrap(),
-            NewPlan::GroupMember { name: "feature/x".into(), group: "a".into(), parent: "main".into() }
+            NewPlan::GroupMember {
+                name: "feature/x".into(),
+                group: "a".into(),
+                parent: "main".into()
+            }
         );
         // zero candidates + '*' -> free branch
         assert_eq!(
             ctx.plan_new("other/x", None).unwrap(),
-            NewPlan::Free { name: "other/x".into(), parent: "main".into() }
+            NewPlan::Free {
+                name: "other/x".into(),
+                parent: "main".into()
+            }
         );
         // --group does not override naming rules, and suppresses the '*' fallback
         refused(
             ctx.plan_new("other/x", Some("a")),
-            &["does not override naming rules", "(.git/wtree/config:"],
+            &["does not override naming rules", "(.git/wtree/rules:"],
         );
         // --group of a group not listed in children
-        refused(ctx.plan_new("feature/x", Some("ghost")), &["--group ghost: not in children"]);
+        refused(
+            ctx.plan_new("feature/x", Some("ghost")),
+            &["--group ghost: not in children"],
+        );
 
         // zero candidates, no '*' -> refuse with per-group reasons
         let nostar_cfg = cfg(&format!("[main]\nchildren = group:a, group:b\n\n{base}"));
         let w = world(&fx.repo, &nostar_cfg);
-        let ctx = Ctx { world: &w, cfg: &nostar_cfg, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &nostar_cfg,
+            label: ".git/wtree/rules",
+        };
         refused(
             ctx.plan_new("other/x", None),
             &["group:a", "does not match name-allow", "rule: name-allow"],
@@ -1479,19 +1622,33 @@ mod tests {
         // declared but not listed bare: reserved, neither group nor '*'
         let c = cfg("[main]\nchildren = group:g, *\n\n[dev]\n\n[group:g]\n");
         let w = world(&fx.repo, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(
             ctx.plan_new("dev", None),
-            &["name reservation", "'*' excludes declared fixed branch names"],
+            &[
+                "name reservation",
+                "'*' excludes declared fixed branch names",
+            ],
         );
         refused(ctx.plan_new("dev", Some("g")), &["name reservation"]);
         // listed bare: created as fixed, without a state record
         let c2 = cfg("[main]\nchildren = dev, group:g, *\n\n[dev]\n\n[group:g]\n");
         let w = world(&fx.repo, &c2);
-        let ctx = Ctx { world: &w, cfg: &c2, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c2,
+            label: ".git/wtree/rules",
+        };
         assert_eq!(
             ctx.plan_new("dev", None).unwrap(),
-            NewPlan::Fixed { name: "dev".into(), parent: "main".into() }
+            NewPlan::Fixed {
+                name: "dev".into(),
+                parent: "main".into()
+            }
         );
         // an existing branch name is always refused
         refused(ctx.plan_new("main", None), &["already exists"]);
@@ -1504,14 +1661,28 @@ mod tests {
         // fail closed: no children declared
         let c0 = cfg("[main]\n");
         let w = world(&fx.repo, &c0);
-        let ctx = Ctx { world: &w, cfg: &c0, label: ".git/wtree/config" };
-        refused(ctx.plan_new("x", None), &["declares no children", "fail closed"]);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c0,
+            label: ".git/wtree/rules",
+        };
+        refused(
+            ctx.plan_new("x", None),
+            &["declares no children", "fail closed"],
+        );
         // free branches have no children
         let f = fx.add_worktree("loose", "main");
         fx.write_state(&f, "loose", "free", "main");
         let w = world(&f, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
-        refused(ctx.plan_new("x", None), &["free branches cannot have children"]);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        refused(
+            ctx.plan_new("x", None),
+            &["free branches cannot have children"],
+        );
     }
 
     // -------------------------------------------------------- plan_merge ----
@@ -1523,26 +1694,57 @@ mod tests {
         // two allowed modes: flag is mandatory
         let c = cfg("[main]\nchildren = dev\nmerge-mode = squash, no-ff\n\n[dev]\n");
         let w = world(&d, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
-        refused(ctx.plan_merge(None), &["multiple merge modes", "squash, no-ff", "(.git/wtree/config:3)"]);
-        assert_eq!(ctx.plan_merge(Some(MergeMode::NoFf)).unwrap().mode, MergeMode::NoFf);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        refused(
+            ctx.plan_merge(None),
+            &[
+                "multiple merge modes",
+                "squash, no-ff",
+                "(.git/wtree/rules:3)",
+            ],
+        );
+        assert_eq!(
+            ctx.plan_merge(Some(MergeMode::NoFf)).unwrap().mode,
+            MergeMode::NoFf
+        );
         // flag outside the set
         refused(
             ctx.plan_merge(Some(MergeMode::Rebase)),
-            &["accepts squash, no-ff merges only (requested: --rebase)", "rule: merge-mode"],
+            &[
+                "accepts squash, no-ff merges only (requested: --rebase)",
+                "rule: merge-mode",
+            ],
         );
         // single allowed mode: flag optional
         let c1 = cfg("[main]\nchildren = dev\nmerge-mode = squash\n\n[dev]\n");
         let w = world(&d, &c1);
-        let ctx = Ctx { world: &w, cfg: &c1, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c1,
+            label: ".git/wtree/rules",
+        };
         assert_eq!(ctx.plan_merge(None).unwrap().mode, MergeMode::Squash);
-        refused(ctx.plan_merge(Some(MergeMode::Ff)), &["accepts squash merges only"]);
+        refused(
+            ctx.plan_merge(Some(MergeMode::Ff)),
+            &["accepts squash merges only"],
+        );
         // unset: every mode allowed, so the flag is mandatory
         let c2 = cfg("[main]\nchildren = dev\n\n[dev]\n");
         let w = world(&d, &c2);
-        let ctx = Ctx { world: &w, cfg: &c2, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c2,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_merge(None), &["squash, rebase, no-ff, ff"]);
-        assert_eq!(ctx.plan_merge(Some(MergeMode::Ff)).unwrap().mode, MergeMode::Ff);
+        assert_eq!(
+            ctx.plan_merge(Some(MergeMode::Ff)).unwrap().mode,
+            MergeMode::Ff
+        );
     }
 
     #[test]
@@ -1555,14 +1757,25 @@ mod tests {
         let l = member(&fx, "l1", "leaf", "m1");
         let _ = m;
         let w = world(&l, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         assert_eq!(
             ctx.plan_merge(None).unwrap(),
-            MergePlan { source: "l1".into(), target: "m1".into(), mode: MergeMode::Rebase }
+            MergePlan {
+                source: "l1".into(),
+                target: "m1".into(),
+                mode: MergeMode::Rebase
+            }
         );
         refused(
             ctx.plan_merge(Some(MergeMode::Squash)),
-            &["'m1': accepts rebase merges only", "rule: merge-mode = rebase"],
+            &[
+                "'m1': accepts rebase merges only",
+                "rule: merge-mode = rebase",
+            ],
         );
     }
 
@@ -1573,7 +1786,11 @@ mod tests {
         let wt = fx.add_worktree("feature/a", "main");
         fx.write_state(&wt, "feature/a", "group:feat", "ghost");
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_merge(None), &["'ghost' no longer exists", "adopt"]);
         refused(ctx.plan_sync(), &["'ghost' no longer exists"]);
     }
@@ -1585,16 +1802,24 @@ mod tests {
             "[main]\nchildren = group:feat\nmerge-mode = squash\n\n[group:feat]\nname-allow = feature/*\n",
         );
         let m = member(&fx, "feature/a", "feat", "main");
-        // config change: group removed from children (still declared)
+        // rules change: group removed from children (still declared)
         let after = cfg("[main]\nmerge-mode = squash\n\n[group:feat]\nname-allow = feature/*\n");
         let _ = before;
         // existing member still merges via its recorded parent
         let w = world(&m, &after);
-        let ctx = Ctx { world: &w, cfg: &after, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &after,
+            label: ".git/wtree/rules",
+        };
         assert_eq!(ctx.plan_merge(None).unwrap().target, "main");
         // but nothing new can be created there
         let w = world(&fx.repo, &after);
-        let ctx = Ctx { world: &w, cfg: &after, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &after,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_new("feature/b", None), &["declares no children"]);
     }
 
@@ -1608,10 +1833,18 @@ mod tests {
         let c = cfg("[main]\nchildren = mid\n\n[mid]\ndestroyable = false\n");
         let wt = fx.add_worktree("mid", "main");
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(
             ctx.plan_destroy(true, None),
-            &["destroyable = false", "--force cannot override", "(.git/wtree/config:5)"],
+            &[
+                "destroyable = false",
+                "--force cannot override",
+                "(.git/wtree/rules:5)",
+            ],
         );
     }
 
@@ -1620,10 +1853,17 @@ mod tests {
         let fx = Fixture::new();
         let c = cfg("[main]\nchildren = group:feat\n\n[group:feat]\n");
         let w = world(&fx.repo, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         // Nothing about 'main' forbids it — it is the checkout git will not
         // remove, exactly as for close.
-        refused(ctx.plan_destroy(true, None), &["primary worktree", "git cannot remove it"]);
+        refused(
+            ctx.plan_destroy(true, None),
+            &["primary worktree", "git cannot remove it"],
+        );
         refused(ctx.plan_close(None), &["primary worktree"]);
     }
 
@@ -1637,49 +1877,73 @@ mod tests {
         let c = cfg("[main]\nchildren = mid\n\n[mid]\nchildren = group:feat\n\n[group:feat]\n");
         member(&fx, "wip", "feat", "mid");
         let w = world(&mid, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_destroy(true, None), &["'wip'", "not ephemeral"]);
-        // fixed child (config x branch existence, no worktree needed)
+        // fixed child (rules x branch existence, no worktree needed)
         let c2 = cfg("[main]\nchildren = mid\n\n[mid]\nchildren = dev\n\n[dev]\n");
         fx.git(&fx.repo, &["branch", "dev", "main"]);
         let w = world(&mid, &c2);
-        let ctx = Ctx { world: &w, cfg: &c2, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c2,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_destroy(true, None), &["'dev'", "fixed child"]);
         // free child
         let c3 = cfg("[main]\nchildren = mid\n\n[mid]\nchildren = *\n");
         let f = fx.add_worktree("loose", "main");
         fx.write_state(&f, "loose", "free", "mid");
         let w = world(&mid, &c3);
-        let ctx = Ctx { world: &w, cfg: &c3, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c3,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_destroy(true, None), &["'loose'", "free child"]);
     }
 
     #[test]
     fn destroy_ephemeral_cascade_leaf_first() {
         let fx = Fixture::new();
-        let c = cfg(
-            "[main]\nchildren = mid\n\n[mid]\nchildren = group:eph\n\n\
-             [group:eph]\nchildren = group:eph\nephemeral = true\n",
-        );
+        let c = cfg("[main]\nchildren = mid\n\n[mid]\nchildren = group:eph\n\n\
+             [group:eph]\nchildren = group:eph\nephemeral = true\n");
         let mid = fx.add_worktree("mid", "main");
         member(&fx, "wa", "eph", "mid");
         member(&fx, "wb", "eph", "wa");
         let wc = member(&fx, "wc", "eph", "wb");
         // all clean: collected leaf-first together with 'mid'
         let w = world(&mid, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         let plan = ctx.plan_destroy(true, None).unwrap();
         assert_eq!(plan.branch, "mid");
-        assert_eq!(plan.cascade, vec!["wc".to_string(), "wb".into(), "wa".into()]);
+        assert_eq!(
+            plan.cascade,
+            vec!["wc".to_string(), "wb".into(), "wa".into()]
+        );
         // one dirty leaf + one unreflected middle: whole refusal, per-branch reasons
         fx.make_dirty(&wc);
         let wb_path = fx.tmp.0.join("wtree-wb");
         fx.commit(&wb_path, "unreflected work");
         let w = world(&mid, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(
             ctx.plan_destroy(true, None),
-            &["'wc' — uncommitted changes (dirty)", "'wb' — commits not reflected in its parent"],
+            &[
+                "'wc' — uncommitted changes (dirty)",
+                "'wb' — commits not reflected in its parent",
+            ],
         );
     }
 
@@ -1690,25 +1954,46 @@ mod tests {
         let m = member(&fx, "feature/a", "feat", "main");
         fx.commit(&m, "work"); // commits not reflected in main
         let w = world(&m, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         let key = w.current().confirmation_key.clone().unwrap();
         refused(
             ctx.plan_destroy(false, None),
-            &["work-loss risk", "commits not reflected in parent", &format!("--key {key}")],
+            &[
+                "work-loss risk",
+                "commits not reflected in parent",
+                &format!("--key {key}"),
+            ],
         );
-        refused(ctx.plan_destroy(false, Some("zzzzz")), &["confirmation key required"]);
+        refused(
+            ctx.plan_destroy(false, Some("zzzzz")),
+            &["confirmation key required"],
+        );
         // --force never substitutes for the key
         refused(ctx.plan_destroy(true, None), &["--force cannot override"]);
         // the right key passes
         assert_eq!(
             ctx.plan_destroy(false, Some(&key)).unwrap(),
-            DestroyPlan { branch: "feature/a".into(), cascade: vec![] }
+            DestroyPlan {
+                branch: "feature/a".into(),
+                cascade: vec![]
+            }
         );
         // the key is stale once the worktree changes
         fx.make_dirty(&m);
         let w = world(&m, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
-        refused(ctx.plan_destroy(false, Some(&key)), &["uncommitted changes"]);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        refused(
+            ctx.plan_destroy(false, Some(&key)),
+            &["uncommitted changes"],
+        );
     }
 
     #[test]
@@ -1719,15 +2004,29 @@ mod tests {
         let wt = fx.add_worktree("orphaned", "main");
         fx.write_state(&wt, "orphaned", "group:feat", "ghost");
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
-        refused(ctx.plan_destroy(false, None), &["'ghost' no longer exists", "--force"]);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        refused(
+            ctx.plan_destroy(false, None),
+            &["'ghost' no longer exists", "--force"],
+        );
         assert_eq!(ctx.plan_destroy(true, None).unwrap().branch, "orphaned");
         // declared but listed in nobody's children: no derivable parent
         let c2 = cfg("[main]\nchildren = group:feat\n\n[group:feat]\n\n[solo]\n");
         let solo = fx.add_worktree("solo", "main");
         let w = world(&solo, &c2);
-        let ctx = Ctx { world: &w, cfg: &c2, label: ".git/wtree/config" };
-        refused(ctx.plan_destroy(false, None), &["no recorded/derivable parent"]);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c2,
+            label: ".git/wtree/rules",
+        };
+        refused(
+            ctx.plan_destroy(false, None),
+            &["no recorded/derivable parent"],
+        );
         assert_eq!(ctx.plan_destroy(true, None).unwrap().branch, "solo");
     }
 
@@ -1738,7 +2037,11 @@ mod tests {
         let fx = Fixture::new();
         let c = cfg("[main]\nchildren = dev\n\n[dev]\n");
         let w = world(&fx.repo, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_open("dev"), &["does not exist", "wtree new dev"]);
         refused(ctx.plan_open("main"), &["already checked out at"]);
         // a declared name is fixed on sight; anything else stays unknown until
@@ -1746,14 +2049,24 @@ mod tests {
         fx.git(&fx.repo, &["branch", "dev", "main"]);
         fx.git(&fx.repo, &["branch", "junk", "main"]);
         let w = world(&fx.repo, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         assert_eq!(
             ctx.plan_open("dev").unwrap(),
-            OpenPlan { branch: "dev".into(), fixed: true }
+            OpenPlan {
+                branch: "dev".into(),
+                fixed: true
+            }
         );
         assert_eq!(
             ctx.plan_open("junk").unwrap(),
-            OpenPlan { branch: "junk".into(), fixed: false }
+            OpenPlan {
+                branch: "junk".into(),
+                fixed: false
+            }
         );
     }
 
@@ -1765,7 +2078,11 @@ mod tests {
         );
         // the primary worktree is git's, not wtree's, to remove
         let w = world(&fx.repo, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_close(None), &["primary worktree"]);
 
         // a protected fixed branch closes, live child and all: [dev] keeps it
@@ -1773,32 +2090,59 @@ mod tests {
         let dev = fx.add_worktree("dev", "main");
         let a = member(&fx, "feature/a", "feat", "dev");
         let w = world(&dev, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         assert_eq!(
             ctx.plan_close(None).unwrap(),
-            ClosePlan { branch: Some("dev".into()), dirty: false, drops_record: false }
+            ClosePlan {
+                branch: Some("dev".into()),
+                dirty: false,
+                drops_record: false
+            }
         );
 
         // a group member with a live child does not: the record inside this
         // worktree is the only thing holding it in the tree
         member(&fx, "feature/b", "feat", "feature/a");
         let w = world(&a, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
-        refused(ctx.plan_close(None), &["orphans its children", "'feature/b'"]);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        refused(
+            ctx.plan_close(None),
+            &["orphans its children", "'feature/b'"],
+        );
 
         // an unmanaged worktree has no record to lose — close is its way out
         let junk = fx.add_worktree("junk", "main");
         let w = world(&junk, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         assert_eq!(
             ctx.plan_close(None).unwrap(),
-            ClosePlan { branch: Some("junk".into()), dirty: false, drops_record: false }
+            ClosePlan {
+                branch: Some("junk".into()),
+                dirty: false,
+                drops_record: false
+            }
         );
 
         // detached HEAD likewise, with no branch left behind to speak of
         let det = fx.add_worktree_detached("det", "main");
         let w = world(&det, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         assert_eq!(ctx.plan_close(None).unwrap().branch, None);
     }
 
@@ -1812,7 +2156,11 @@ mod tests {
         );
         let m = member(&fx, "feature/a", "feat", "main");
         let w = world(&m, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         let plan = ctx.plan_adopt(Some("feat2"), false, "main").unwrap();
         assert_eq!(plan.kind, Kind::Group("feat2".into()));
         assert_eq!(plan.parent, "main");
@@ -1830,8 +2178,15 @@ mod tests {
         );
         let m = member(&fx, "feature/a", "feat", "main");
         let w = world(&m, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
-        refused(ctx.plan_adopt(Some("feat"), false, "feature/a"), &["cannot be its own parent"]);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        refused(
+            ctx.plan_adopt(Some("feat"), false, "feature/a"),
+            &["cannot be its own parent"],
+        );
     }
 
     #[test]
@@ -1841,7 +2196,11 @@ mod tests {
         let m = member(&fx, "feature/a", "feat", "main");
         fx.git(&m, &["switch", "-q", "-c", "oops"]);
         let w = world(&m, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         let plan = ctx.plan_adopt(None, true, "main").unwrap();
         assert_eq!(plan.branch, "oops");
         assert_eq!(plan.kind, Kind::Free);
@@ -1854,9 +2213,16 @@ mod tests {
         let c = cfg("[main]\nchildren = group:feat, *\n\n[dev]\n\n[group:feat]\n");
         let wt = fx.add_worktree("dev", "main"); // raw-created declared name
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(ctx.plan_adopt(None, true, "main"), &["name reservation"]);
-        refused(ctx.plan_adopt(Some("feat"), false, "main"), &["name reservation"]);
+        refused(
+            ctx.plan_adopt(Some("feat"), false, "main"),
+            &["name reservation"],
+        );
     }
 
     #[test]
@@ -1865,7 +2231,11 @@ mod tests {
         let c = cfg("[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*\n");
         let wt = fx.add_worktree("junk/x", "main");
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         // naming constraints are not bypassed
         refused(
             ctx.plan_adopt(Some("feat"), false, "main"),
@@ -1874,16 +2244,32 @@ mod tests {
         // no '*' in children: --free refused
         refused(ctx.plan_adopt(None, true, "main"), &["contains no '*'"]);
         // group not in children
-        refused(ctx.plan_adopt(Some("ghost"), false, "main"), &["--group ghost: not in children"]);
+        refused(
+            ctx.plan_adopt(Some("ghost"), false, "main"),
+            &["--group ghost: not in children"],
+        );
         // exactly one of --group/--free
-        refused(ctx.plan_adopt(None, false, "main"), &["--group <X> or --free is required"]);
-        refused(ctx.plan_adopt(Some("feat"), true, "main"), &["mutually exclusive"]);
+        refused(
+            ctx.plan_adopt(None, false, "main"),
+            &["--group <X> or --free is required"],
+        );
+        refused(
+            ctx.plan_adopt(Some("feat"), true, "main"),
+            &["mutually exclusive"],
+        );
         // nonexistent parent
-        refused(ctx.plan_adopt(Some("feat"), false, "nope"), &["does not exist"]);
+        refused(
+            ctx.plan_adopt(Some("feat"), false, "nope"),
+            &["does not exist"],
+        );
         // happy path
         let wt2 = fx.add_worktree("feature/ok", "main");
         let w = world(&wt2, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         let plan = ctx.plan_adopt(Some("feat"), false, "main").unwrap();
         assert_eq!(plan.kind, Kind::Group("feat".into()));
         assert_eq!(plan.previous, None);
@@ -1897,7 +2283,11 @@ mod tests {
         fx.git(&wt, &["checkout", "-q", "--orphan", "orphan-branch"]);
         fx.commit(&wt, "disconnected root");
         let w = world(&wt, &c);
-        let ctx = Ctx { world: &w, cfg: &c, label: ".git/wtree/config" };
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
         refused(
             ctx.plan_adopt(None, true, "main"),
             &["no common ancestor (merge-base) with parent 'main'"],
@@ -1909,10 +2299,16 @@ mod tests {
     #[test]
     fn unknown_identity_verb_table() {
         for verb in ["merge", "sync", "land", "destroy", "new"] {
-            assert!(!verb_allowed_when_unknown(verb), "{verb} must be refused when unknown");
+            assert!(
+                !verb_allowed_when_unknown(verb),
+                "{verb} must be refused when unknown"
+            );
         }
-        for verb in ["adopt", "list", "info", "init", "open", "close"] {
-            assert!(verb_allowed_when_unknown(verb), "{verb} must be allowed when unknown");
+        for verb in ["adopt", "list", "info", "init", "save", "open", "close"] {
+            assert!(
+                verb_allowed_when_unknown(verb),
+                "{verb} must be allowed when unknown"
+            );
         }
     }
 }

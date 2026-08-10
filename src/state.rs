@@ -8,8 +8,10 @@
 //!
 //! Reading is fail-closed: a missing file is `Missing` (unmanaged), and
 //! anything that does not parse to exactly the known fields is `Invalid` with
-//! a reason. Writing goes through a temp file + rename so a crash never
-//! leaves a half-written state file behind.
+//! a reason. Writing goes through a temp file in the same directory + rename,
+//! so a reader sees either the whole previous record or the whole new one,
+//! never a half-written file. Nothing is fsynced: a record lost to a system
+//! crash reads as unmanaged, which fails closed and `wtree adopt` rebuilds.
 
 use std::fmt;
 use std::fs;
@@ -71,7 +73,9 @@ pub enum StateRead {
     /// No state file — not managed by wtree (fail closed).
     Missing,
     /// File exists but is corrupt: missing field, unknown version, bad syntax.
-    Invalid { reason: String },
+    Invalid {
+        reason: String,
+    },
     Valid(State),
 }
 
@@ -166,8 +170,9 @@ pub fn serialize(state: &State) -> String {
 }
 
 /// Atomic write: temp file in the same directory, then rename over the target.
+/// The pid in the temp name keeps concurrent `wtree` processes off each other.
 pub fn write(private_git_dir: &Path, state: &State) -> io::Result<()> {
-    let tmp = private_git_dir.join(format!("{STATE_FILE}.tmp"));
+    let tmp = private_git_dir.join(format!("{STATE_FILE}.{}.tmp", std::process::id()));
     fs::write(&tmp, serialize(state))?;
     fs::rename(&tmp, state_path(private_git_dir))
 }
@@ -226,15 +231,27 @@ mod tests {
         };
         write(&dir.0, &s2).unwrap();
         assert_eq!(read(&dir.0), StateRead::Valid(s2));
-        // no temp residue left behind
-        assert!(!dir.0.join(format!("{STATE_FILE}.tmp")).exists());
+        // no temp residue left behind, whatever the temp file was named
+        let residue: Vec<String> = fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != STATE_FILE)
+            .collect();
+        assert!(residue.is_empty(), "left behind: {residue:?}");
     }
 
     #[test]
     fn corrupt_variants_are_invalid_with_reason() {
         let cases: &[(&str, &str)] = &[
-            ("version = 1\nbranch = a\nkind = free\n", "missing field 'parent'"),
-            ("branch = a\nkind = free\nparent = main\n", "missing field 'version'"),
+            (
+                "version = 1\nbranch = a\nkind = free\n",
+                "missing field 'parent'",
+            ),
+            (
+                "branch = a\nkind = free\nparent = main\n",
+                "missing field 'version'",
+            ),
             (
                 "version = 2\nbranch = a\nkind = free\nparent = main\n",
                 "unknown version '2'",
@@ -255,7 +272,10 @@ mod tests {
                 "version = 1\nbranch = a\nbranch = b\nkind = free\nparent = main\n",
                 "duplicate key 'branch'",
             ),
-            ("version = 1\nbranch =\nkind = free\nparent = main\n", "empty value"),
+            (
+                "version = 1\nbranch =\nkind = free\nparent = main\n",
+                "empty value",
+            ),
             ("garbage line\n", "expected 'key = value'"),
         ];
         for (text, needle) in cases {

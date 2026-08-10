@@ -25,10 +25,10 @@ The command is `wtree`. Unix-like systems only.
 ## Getting started
 
 ```bash
-wtree init
+wtree init --new
 ```
 
-This writes `.git/wtree/config`. Open it and declare the structure. The smallest form that puts work branches under main:
+This writes `.git/wtree/rules`. Open it and declare the structure. The smallest form that puts work branches under main:
 
 ```ini
 [main]
@@ -70,17 +70,21 @@ That squash-merges into main and cleans up the worktree and the branch. To merge
 | `destroy` | remove the branch and its worktree |
 | `adopt` | bring an existing branch under the policy |
 | `list` / `info` | what exists, and what is allowed here |
-| `init` | write the starter files |
+| `init --new` | write the starter files |
+| `init --load [path]` | take the rules from a `.wtree/` instead |
+| `save [path]` | copy the rules out to a `.wtree/` you can commit |
+
+`wtree init` with neither flag asks which of the two you meant, and refuses when there is no terminal to ask on.
 
 ## Config
 
 | file | |
 |---|---|
-| `config` | branch policy |
+| `rules` | branch policy |
 | `settings` | where worktrees are created, and other settings |
 | `hooks/post-create` | runs right after `wtree new` |
 
-In `config`, `[X]` is a fixed branch and `[group:X]` is a group of work branches sharing one policy. `children` declares what may take this section as its parent.
+In `rules`, `[X]` is a fixed branch and `[group:X]` is a group of work branches sharing one policy. `children` declares what may take this section as its parent.
 
 | key | sections | meaning |
 |---|---|---|
@@ -90,6 +94,18 @@ In `config`, `[X]` is a fixed branch and `[group:X]` is a group of work branches
 | `ephemeral` | `[group:X]` | collected along with the parent on destroy, if the safety checks pass. Default `false` |
 | `merge-mode` | `[X]` `[group:X]` | merge methods this branch accepts. `squash`, `rebase`, `no-ff`, `ff`, comma-separated |
 | `copy` | `[X]` `[group:X]` | untracked files a new worktree takes from its parent's |
+| `description` | `[X]` `[group:X]` | one line on what the branch is for, printed by `wtree` and `info` |
+
+What each `merge-mode` leaves in the parent:
+
+| mode | the parent gets | the branch's commits |
+|---|---|---|
+| `ff` | the branch's commits as they are | kept |
+| `rebase` | the same commits, replayed on its tip | kept, rewritten if the parent moved |
+| `squash` | one commit | folded into it |
+| `no-ff` | one merge commit | kept, on its second parent |
+
+`no-ff` reads as a squash without discarding anything. `git log --first-parent` shows one line per branch, and plain `git log` still has every commit.
 
 ## License
 

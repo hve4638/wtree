@@ -1,9 +1,9 @@
 //! Machine-local settings: `<git common dir>/wtree/settings`.
 //!
-//! Kept separate from the policy config so the policy file can be copied to
+//! Kept separate from the policy rules so the policy file can be copied to
 //! teammates without dragging machine paths along. `key = value` lines, `#`
 //! comments. Unknown keys are load errors (same strictness as the policy
-//! config — a typo must not silently fall back to defaults).
+//! rules — a typo must not silently fall back to defaults).
 
 use std::fs;
 use std::io;
