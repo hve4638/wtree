@@ -48,6 +48,17 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let result = match verb {
+        // Only in the verb slot: no verb takes a `-v`, so unlike `--help` there
+        // is nothing further down the line for this to outrank.
+        "-v" | "--version" => {
+            println!(
+                "{} {} ({})",
+                env!("CARGO_BIN_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_NAME")
+            );
+            return ExitCode::SUCCESS;
+        }
         "help" => {
             if rest.iter().any(|a| a == "--all") {
                 manual();
@@ -507,6 +518,7 @@ fn manual() {
     println!("--key and --force appear only when a verb asks for them.");
     println!("\nwtree (no verb) lists just the verbs available where you are.");
     println!("wtree <verb> --help prints that verb's line on its own.");
+    println!("wtree --version (or -v) prints the version.");
 }
 
 fn cmd_check(path: Option<&str>) -> ExitCode {

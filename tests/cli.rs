@@ -2806,6 +2806,23 @@ fn help_anywhere_on_the_line_beats_the_verb() {
     assert!(out(&o).contains("merge into the parent"), "{}", out(&o));
 }
 
+/// The command is `wtree` and the crate is `gitwtree`, so the version line names
+/// both: what you typed, and what you would reinstall.
+#[test]
+fn version_prints_the_command_and_the_crate() {
+    let fx = Fixture::new();
+    let expected = format!("wtree {} (gitwtree)", env!("CARGO_PKG_VERSION"));
+    for a in [vec!["-v"], vec!["--version"]] {
+        let o = run_wt(&fx.repo, &a);
+        assert_ok(&o);
+        assert_eq!(out(&o).trim(), expected, "{a:?}");
+    }
+    // It reads no repo: outside one is exactly where you check what you installed.
+    let o = run_wt(fx.repo.parent().unwrap(), &["--version"]);
+    assert_ok(&o);
+    assert_eq!(out(&o).trim(), expected);
+}
+
 #[test]
 fn a_non_utf8_argument_is_refused_instead_of_panicking() {
     use std::ffi::OsStr;
