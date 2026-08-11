@@ -685,6 +685,40 @@ fn new_refuses_two_names_that_want_one_directory() {
     assert!(!default_dest(&fx, "feature/x").exists(), "one was created");
 }
 
+/// `feature/a` and `feature/a/b` land in different directories, so only the ref
+/// names collide — a collision git reports halfway through the batch, once the
+/// first branch is already written.
+#[test]
+fn new_refuses_two_names_that_nest_as_refs() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+
+    for pair in [
+        ["feature/a", "feature/a/b"],
+        ["feature/a/b", "feature/a"], // the second one first: same answer
+    ] {
+        let o = run_wt(&fx.repo, &["new", pair[0], pair[1]]);
+        assert_fail(&o);
+        assert!(err(&o).contains("cannot both be branches"), "{}", err(&o));
+        assert_eq!(branches(&fx), vec!["main".to_string()], "{}", err(&o));
+        assert!(
+            !default_dest(&fx, pair[0]).exists(),
+            "{} was created",
+            pair[0]
+        );
+    }
+
+    // Sharing a prefix is not the same as nesting under one.
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a", "feature/ab"]));
+
+    // A branch already on disk nests by the same rule, and is answered by the
+    // same layer — `fatal: cannot lock ref` never reaches the reader.
+    let o = run_wt(&fx.repo, &["new", "feature/a/b"]);
+    assert_fail(&o);
+    assert!(err(&o).starts_with("refusal:"), "{}", err(&o));
+    assert!(!err(&o).contains("fatal:"), "{}", err(&o));
+}
+
 /// The occupant is named, because "already exists" fits three situations that
 /// want three different things done about them.
 #[test]
@@ -2321,6 +2355,38 @@ fn close_fixed_parent_still_receives_its_children() {
     assert_eq!(rev(&fx, "dev"), rev(&fx, "feature/a"));
 }
 
+/// A parent with no worktree is moved by `update-ref`, not by `git merge`, so
+/// the reflog line is whatever wtree hands over — and it is the only record of
+/// who moved a branch the user was not standing on.
+#[test]
+fn moving_a_parent_nobody_stands_on_names_the_verb_in_its_reflog() {
+    let fx = Fixture::new();
+    write_rules(&fx, MIDDLE_CFG);
+    assert_ok(&run_wt(&fx.repo, &["new", "dev"]));
+    let dev = default_dest(&fx, "dev");
+    assert_ok(&run_wt(&dev, &["new", "feature/a"]));
+    let a = default_dest(&fx, "feature/a");
+    assert_ok(&run_wt(&dev, &["close"]));
+
+    let subject = |fx: &Fixture| {
+        fx.git(&fx.repo, &["reflog", "show", "--format=%gs", "dev"])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    fx.commit(&a, "work");
+    assert_ok(&run_wt(&a, &["merge", "-m", "feat: a"]));
+    assert_eq!(subject(&fx), "wtree merge: feature/a");
+
+    // land goes through the same step and says land, matching the name the
+    // stash it parked would have carried.
+    fx.commit(&a, "more");
+    assert_ok(&run_wt(&a, &["land", "-m", "feat: a again"]));
+    assert_eq!(subject(&fx), "wtree land: feature/a");
+}
+
 #[test]
 fn close_refuses_a_group_branch_with_live_children() {
     let fx = Fixture::new();
@@ -3043,6 +3109,59 @@ fn a_non_utf8_argument_is_refused_instead_of_panicking() {
     // Invalid encoding is a usage error, not an internal failure.
     assert_eq!(o.status.code(), Some(2), "stderr:\n{}", err(&o));
     assert!(err(&o).contains("must be valid UTF-8"), "{}", err(&o));
+    assert!(err(&o).starts_with("error:"), "{}", err(&o));
+}
+
+/// Two words carry the diagnostics — `refusal:` for what the policy declines
+/// and `error:` for everything else that went wrong — and the exit code says
+/// separately whether the line or the run was at fault. A third word for the
+/// failures main answers by itself would be a second system to learn.
+#[test]
+fn every_diagnostic_wears_one_of_the_two_words() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+
+    let o = run_wt(&fx.repo, &["frobnicate"]);
+    assert_eq!(o.status.code(), Some(2), "stderr:\n{}", err(&o));
+    assert!(err(&o).starts_with("error: unknown verb"), "{}", err(&o));
+    // The two lines under it are the menu, not diagnostics, and stay bare.
+    assert!(err(&o).contains("\nwtree      verbs"), "{}", err(&o));
+
+    // An unknown flag is the same mistake one word further in, and always said
+    // so; the verb slot now matches it.
+    let o = run_wt(&fx.repo, &["new", "--frobnicate"]);
+    assert!(err(&o).starts_with("error: unknown flag"), "{}", err(&o));
+
+    // A layer under the verbs raises a bare sentence; main is the last hand on
+    // it, so the word is added there rather than at each of those layers.
+    let o = run_wt(&fx.tmp.0, &["list"]);
+    assert!(err(&o).starts_with("error:"), "{}", err(&o));
+
+    // A refusal already carries its word and must not collect a second.
+    let o = run_wt(&fx.repo, &["new", "junk/x"]);
+    assert!(err(&o).starts_with("refusal: new"), "{}", err(&o));
+}
+
+/// The two failures every reader meets — no repository, no rules — are wtree's
+/// to answer. Which plumbing command asked, and where the file would have
+/// sat, are answers to a question nobody standing there has yet.
+#[test]
+fn the_expected_failures_are_answered_without_git_or_paths() {
+    let fx = Fixture::new();
+
+    let o = run_wt(&fx.tmp.0, &["list"]);
+    assert_fail(&o);
+    assert_eq!(err(&o).trim(), "error: not inside a git repository");
+
+    // In a repository, with no rules written yet.
+    let o = run_wt(&fx.repo, &["list"]);
+    assert_fail(&o);
+    assert_eq!(
+        err(&o).trim(),
+        "error: no policy rules in this repository — run `wtree init` first"
+    );
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
+    assert_ok(&run_wt(&fx.repo, &["list"]));
 }
 
 #[test]

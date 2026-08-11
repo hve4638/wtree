@@ -25,14 +25,14 @@ fn main() -> ExitCode {
     let args: Vec<String> = match env::args_os().skip(1).map(OsString::into_string).collect() {
         Ok(a) => a,
         Err(_) => {
-            eprintln!("wtree: arguments must be valid UTF-8");
+            eprintln!("error: arguments must be valid UTF-8");
             return ExitCode::from(2);
         }
     };
     let cwd: PathBuf = match env::current_dir() {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("wtree: cannot determine the current directory: {e}");
+            eprintln!("error: cannot determine the current directory: {e}");
             return ExitCode::from(1);
         }
     };
@@ -161,7 +161,7 @@ fn main() -> ExitCode {
         },
         "info" => verbs::info(&cwd),
         v => {
-            eprintln!("wtree: unknown verb '{v}'");
+            eprintln!("error: unknown verb '{v}'");
             eprintln!("wtree      verbs available where you are");
             eprintln!("wtree -h   every verb");
             return ExitCode::from(2);
@@ -170,7 +170,15 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("{}", msg.trim_end());
+            // The two words are the contract, so the last hand on the message
+            // guarantees one. Layers under the verbs raise a plain sentence —
+            // they answer a git call or a missing file, not a request, and
+            // cannot tell which word that request deserved.
+            let msg = msg.trim_end();
+            match msg.starts_with("error:") || msg.starts_with("refusal:") {
+                true => eprintln!("{msg}"),
+                false => eprintln!("error: {msg}"),
+            }
             ExitCode::from(1)
         }
     }

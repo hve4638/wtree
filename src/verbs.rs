@@ -78,11 +78,11 @@ fn load_rules(repo: &Repo) -> Result<Rules, String> {
     let path = rules_path(&repo.common_dir);
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
+        // Where the file goes is `init`'s business to say and the rule
+        // citations' to cite; a reader who has none yet is told what is
+        // missing, the way git names a repository rather than a path.
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(format!(
-                "no policy rules at {} — run `wtree init` first",
-                path.display()
-            ));
+            return Err("no policy rules in this repository — run `wtree init` first".to_string());
         }
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
@@ -660,6 +660,15 @@ pub fn new(cwd: &Path, names: &[String], group: Option<&str>, dir: Option<&str>)
     let mut planned: Vec<(&String, NewPlan, PathBuf)> = Vec::new();
     for name in names {
         let plan = ctx.plan_new(name, group).map_err(|r| r.to_string())?;
+        // plan_new weighs the name against the branches that existed when the
+        // world was gathered, which is every name but the ones this line is
+        // about to add. Those are the batch's own to check.
+        if let Some(first) = judge::nested_ref(planned.iter().map(|(n, _, _)| n.as_str()), name) {
+            return Err(format!(
+                "error: '{first}' and '{name}' cannot both be branches: {}",
+                judge::nesting_reason(first, name)
+            ));
+        }
         let dest = match dir {
             Some(d) => worktree_dest_in(&root, &sett, d)?,
             None => worktree_dest(&root, &sett, name)?,
@@ -2049,7 +2058,7 @@ fn run_merge(
                 "error: cannot fast-forward: '{target}' has commits that '{branch}' lacks\n  run `wtree sync`, then retry\n  nothing was changed"
             ));
         }
-        ff_target(&wt, target_wt.as_deref(), &target, &branch)
+        ff_target(&wt, target_wt.as_deref(), &target, &branch, verb)
             .map_err(|e| format!("error: {e}; nothing was changed"))?;
         println!(
             "fast-forwarded '{target}' to '{branch}' ({})",
@@ -2169,7 +2178,7 @@ fn run_merge(
     .to_string();
 
     // Step 4 — fast-forward the target.
-    ff_target(&wt, target_wt.as_deref(), &target, &branch)
+    ff_target(&wt, target_wt.as_deref(), &target, &branch, verb)
         .map_err(|e| fail(format!("{e}; nothing merged")))?;
     let tip = short_head(&wt);
 
@@ -2306,7 +2315,7 @@ fn resolve_targets(world: &repo::World, plan: &DestroyPlan) -> Result<Vec<Target
                     dirty: f.dirty,
                 })
                 .ok_or_else(|| {
-                    format!("wtree: '{b}' has no worktree to remove; nothing was changed")
+                    format!("error: '{b}' has no worktree to remove; nothing was changed")
                 })
         })
         .collect()
@@ -2635,6 +2644,7 @@ fn ff_target(
     target_wt: Option<&Path>,
     target: &str,
     branch: &str,
+    verb: &str,
 ) -> Result<(), String> {
     match target_wt {
         Some(tw) => repo::run_git(tw, &["merge", "--ff-only", branch]).map(drop).map_err(|_| {
@@ -2652,7 +2662,10 @@ fn ff_target(
                 &[
                     "update-ref",
                     "-m",
-                    &format!("error: {branch}"),
+                    // The reflog's own label, not a diagnostic: this is the
+                    // only mover of a branch nobody is standing on, so the
+                    // line it leaves is the whole record of what happened.
+                    &format!("wtree {verb}: {branch}"),
                     &format!("refs/heads/{target}"),
                     branch,
                 ],

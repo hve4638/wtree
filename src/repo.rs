@@ -72,7 +72,17 @@ pub struct Repo {
 
 impl Repo {
     pub fn discover(dir: &Path) -> Result<Repo, String> {
-        let out = run_git(dir, &["rev-parse", "--git-common-dir"])?;
+        // Standing outside a repository is the one failure of this call anyone
+        // meets, and it is wtree's to answer: which plumbing command asked is
+        // nobody's business until the cause is something else. Anything that
+        // is, keeps git's own words — a cause nobody predicted is a cause
+        // nobody should have to guess at.
+        let out = run_git(dir, &["rev-parse", "--git-common-dir"]).map_err(|e| {
+            match e.contains("not a git repository") {
+                true => "not inside a git repository".to_string(),
+                false => e,
+            }
+        })?;
         let raw = PathBuf::from(out.trim());
         // --git-common-dir may print a path relative to cwd.
         let abs = if raw.is_absolute() {

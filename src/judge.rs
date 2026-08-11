@@ -89,6 +89,32 @@ impl fmt::Display for Refusal {
 
 pub type Decision<T> = Result<T, Refusal>;
 
+/// The branch name among `existing` that cannot coexist with `name`, if any.
+///
+/// git stores a ref as a file at its own path, so one name being another's
+/// prefix at a `/` boundary makes the shorter one a file and a directory at
+/// once. Equality is a different answer — the name is taken, and `open` picks
+/// it up — so it stays out of here.
+pub(crate) fn nested_ref<'a>(
+    existing: impl IntoIterator<Item = &'a str>,
+    name: &str,
+) -> Option<&'a str> {
+    fn under(parent: &str, child: &str) -> bool {
+        child.len() > parent.len()
+            && child.starts_with(parent)
+            && child.as_bytes()[parent.len()] == b'/'
+    }
+    existing
+        .into_iter()
+        .find(|e| under(e, name) || under(name, e))
+}
+
+/// Why two nesting names cannot both be branches, in the order git sees it.
+pub(crate) fn nesting_reason(a: &str, b: &str) -> String {
+    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    format!("git cannot hold '{short}' as a branch and as the path to '{long}'")
+}
+
 fn refuse<T>(verb: &'static str, subject: impl Into<String>, reasons: Vec<String>) -> Decision<T> {
     Err(Refusal {
         verb,
@@ -545,6 +571,18 @@ impl<'a> Ctx<'a> {
                     format!("branch '{name}' already exists"),
                     format!("to give it a worktree instead: wtree open {name}"),
                 ],
+            );
+        }
+        // Nesting has no escape hatch the way an exact match has `open`: the
+        // only way out is a name that does not nest, so the reason stands alone.
+        if let Some(clash) = nested_ref(self.world.branches.iter().map(String::as_str), name) {
+            return refuse(
+                "new",
+                subject,
+                vec![format!(
+                    "branch '{clash}' conflicts: {}",
+                    nesting_reason(clash, name)
+                )],
             );
         }
         let bares: Vec<&str> = g.bares.iter().map(String::as_str).collect();
@@ -1668,6 +1706,44 @@ mod tests {
         );
         // an existing branch name is always refused
         refused(ctx.plan_new("main", None), &["already exists"]);
+    }
+
+    #[test]
+    fn nesting_is_judged_before_git_sees_the_name() {
+        // A ref is a file at its own path, so `feature/a` and `feature/a/b`
+        // want that path to be a file and a directory at once. git says so
+        // only once the branch is being written; the judge says it first.
+        assert_eq!(nested_ref(["feature/a"], "feature/a/b"), Some("feature/a"));
+        assert_eq!(
+            nested_ref(["feature/a/b"], "feature/a"),
+            Some("feature/a/b")
+        );
+        // the same name is a different answer, and `open` answers it
+        assert_eq!(nested_ref(["feature/a"], "feature/a"), None);
+        // a prefix that is not a path boundary shares nothing
+        assert_eq!(nested_ref(["feature/a"], "feature/ab"), None);
+        assert_eq!(nested_ref(["feature/ab"], "feature/a"), None);
+        assert_eq!(nested_ref([] as [&str; 0], "feature/a"), None);
+
+        let fx = Fixture::new();
+        let c = cfg("[main]\nchildren = group:g\n\n[group:g]\nname-allow = feature/*\n");
+        fx.git(&fx.repo, &["branch", "feature/a"]);
+        let w = world(&fx.repo, &c);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        // named either way round, the reason names the file and the path
+        let r = refused(
+            ctx.plan_new("feature/a/b", None),
+            &[
+                "branch 'feature/a' conflicts",
+                "as the path to 'feature/a/b'",
+            ],
+        );
+        assert_eq!(r.reasons.len(), 1, "{r}");
+        assert!(!r.to_string().contains("wtree open"), "{r}");
     }
 
     #[test]
