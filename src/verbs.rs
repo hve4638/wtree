@@ -1514,9 +1514,16 @@ pub fn list(cwd: &Path, view: UnmanagedView) -> CmdResult {
             // Asked for by name, this screen is nobody's appendix: what recedes
             // here is the hint, read once, and not the rows that were the point
             // of typing it.
+            //
+            // The heading takes magenta rather than weight. Bold made it
+            // brighter than the rows it introduces, and against a plain branch
+            // name — the whole of a branch row — weight alone barely reads.
+            // Magenta is the one colour no row uses: green, cyan and yellow all
+            // mean something about a branch, and scaffolding should not borrow
+            // a word from the data.
             println!(
                 "{}  {}",
-                style(format!("[unmanaged {label}]")).bold(),
+                style(format!("[unmanaged {label}]")).magenta(),
                 style(format!("({how})")).dim()
             );
             for s in group {
