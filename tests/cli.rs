@@ -636,7 +636,7 @@ fn new_refusal_prints_judge_reasons_and_creates_nothing() {
     let o = run_wt(&fx.repo, &["new", "junk/x"]);
     assert_fail(&o);
     let stderr = err(&o);
-    assert!(stderr.contains("wtree new: refused"), "{stderr}");
+    assert!(stderr.contains("refusal: new "), "{stderr}");
     assert!(stderr.contains("does not match name-allow"), "{stderr}");
     assert!(stderr.contains("rule: name-allow"), "{stderr}");
     // neither a worktree nor a branch was created
@@ -646,6 +646,153 @@ fn new_refusal_prints_judge_reasons_and_creates_nothing() {
         &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
     );
     assert_eq!(refs.trim(), "main");
+}
+
+/// Several names on one line, and nothing made unless every one of them passes.
+#[test]
+fn new_takes_many_names_and_creates_all_or_none() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+
+    let o = run_wt(&fx.repo, &["new", "feature/a", "feature/b", "feature/c"]);
+    assert_ok(&o);
+    for b in ["feature/a", "feature/b", "feature/c"] {
+        assert!(default_dest(&fx, b).exists(), "{b}: {}", out(&o));
+    }
+    // One `cd` is a place to go and three are a question, so a batch prints none.
+    assert!(!out(&o).contains("cd "), "{}", out(&o));
+    assert!(out(&run_wt(&fx.repo, &["new", "feature/solo"])).contains("cd "));
+
+    // A bad name anywhere on the line leaves the good ones unmade.
+    let o = run_wt(&fx.repo, &["new", "feature/d", "junk/x"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("does not match name-allow"), "{}", err(&o));
+    assert!(!default_dest(&fx, "feature/d").exists(), "d was created");
+}
+
+/// `feature/x` and `feature-x` both fold onto `feature-x`, so a line asking for
+/// both is answered before either is made rather than halfway through.
+#[test]
+fn new_refuses_two_names_that_want_one_directory() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*, feature-*\n",
+    );
+    let o = run_wt(&fx.repo, &["new", "feature/x", "feature-x"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("both want"), "{}", err(&o));
+    assert!(!default_dest(&fx, "feature/x").exists(), "one was created");
+}
+
+/// `feature/a` and `feature/a/b` land in different directories, so only the ref
+/// names collide — a collision git reports halfway through the batch, once the
+/// first branch is already written.
+#[test]
+fn new_refuses_two_names_that_nest_as_refs() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+
+    for pair in [
+        ["feature/a", "feature/a/b"],
+        ["feature/a/b", "feature/a"], // the second one first: same answer
+    ] {
+        let o = run_wt(&fx.repo, &["new", pair[0], pair[1]]);
+        assert_fail(&o);
+        assert!(err(&o).contains("cannot both be branches"), "{}", err(&o));
+        assert_eq!(branches(&fx), vec!["main".to_string()], "{}", err(&o));
+        assert!(
+            !default_dest(&fx, pair[0]).exists(),
+            "{} was created",
+            pair[0]
+        );
+    }
+
+    // Sharing a prefix is not the same as nesting under one.
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a", "feature/ab"]));
+
+    // A branch already on disk nests by the same rule, and is answered by the
+    // same layer — `fatal: cannot lock ref` never reaches the reader.
+    let o = run_wt(&fx.repo, &["new", "feature/a/b"]);
+    assert_fail(&o);
+    assert!(err(&o).starts_with("refusal:"), "{}", err(&o));
+    assert!(!err(&o).contains("fatal:"), "{}", err(&o));
+}
+
+/// The occupant is named, because "already exists" fits three situations that
+/// want three different things done about them.
+#[test]
+fn new_names_what_occupies_the_destination() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*, feature-*\n",
+    );
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/x"]));
+
+    // Managed: the branch that folded onto the same directory.
+    let o = run_wt(&fx.repo, &["new", "feature-x"]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("conflict: branch 'feature/x' occupies it"),
+        "{}",
+        err(&o)
+    );
+    assert!(err(&o).contains("--dir <name>"), "{}", err(&o));
+
+    // Unmanaged: still a branch, and still named — being outside the policy is
+    // a note on it, not a reason to withhold it.
+    let raw = default_dest(&fx, "feature-raw");
+    fx.git(
+        &fx.repo,
+        &["worktree", "add", "-q", raw.to_str().unwrap(), "-b", "odd"],
+    );
+    let o = run_wt(&fx.repo, &["new", "feature-raw"]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("conflict: branch 'odd' (unmanaged) occupies it"),
+        "{}",
+        err(&o)
+    );
+
+    // A plain directory is only in the way; there is nothing to name.
+    fs::create_dir_all(default_dest(&fx, "feature-plain")).unwrap();
+    let o = run_wt(&fx.repo, &["new", "feature-plain"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("already exists"), "{}", err(&o));
+    assert!(!err(&o).contains("conflict:"), "{}", err(&o));
+}
+
+/// `--dir` relabels one worktree. It takes a name and not a path: the policy
+/// keeps deciding where worktrees live.
+#[test]
+fn new_dir_renames_the_directory_but_not_the_place() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
+
+    let o = run_wt(&fx.repo, &["new", "feature/b", "--dir", "elsewhere"]);
+    assert_ok(&o);
+    assert!(default_dest(&fx, "elsewhere").exists(), "{}", out(&o));
+    assert!(!default_dest(&fx, "feature/b").exists(), "{}", out(&o));
+
+    for (args, want) in [
+        (
+            vec!["new", "feature/c", "feature/d", "--dir", "x"],
+            "--dir names one directory",
+        ),
+        (
+            vec!["new", "feature/c", "--dir", "../escape"],
+            "not a path",
+        ),
+        (vec!["new", "feature/c", "--dir", ".."], "not a path"),
+        (vec!["new", "feature/c", "--dir", ""], "not a path"),
+    ] {
+        let o = run_wt(&fx.repo, &args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", err(&o));
+        assert!(err(&o).contains(want), "{args:?}: {}", err(&o));
+    }
+    assert!(!default_dest(&fx, "feature/c").exists(), "c was created");
 }
 
 #[test]
@@ -940,37 +1087,95 @@ fn list_shows_identities_unknowns_and_bare_branches() {
     let stdout = out(&o);
     // Parentage is position in the tree now, not a `parent: X` column. Piped
     // output uses the ASCII glyphs.
-    assert!(stdout.contains("@ main         fixed  repo"), "{stdout}");
+    assert!(stdout.contains("* main         fixed       repo"), "{stdout}");
     assert!(stdout.contains("`-+ feature/a  group:feat"), "{stdout}");
     assert!(stdout.contains("|-. dev        fixed"), "declared, no worktree:\n{stdout}");
     // An unmanaged worktree has no identity, so no parent, so no place in the
-    // tree — it is listed apart with the reason it cannot be judged.
-    assert!(stdout.contains("unmanaged:"), "{stdout}");
-    assert!(stdout.contains("wtree-junk  junk  UNKNOWN"), "{stdout}");
-
-    // Each stray carries its own recovery line, and they differ: `adopt` acts
-    // on the worktree one stands in, so the branch that has none must be told
-    // to open one first. Scoped per row — a whole-stdout `contains` would let
-    // either row answer for both.
-    let reasons_under = |head: &str| -> Vec<&str> {
-        stdout
-            .lines()
-            .skip_while(|l| !l.contains(head))
-            .skip(1)
-            .take_while(|l| l.trim_start().starts_with('!'))
-            .collect()
-    };
-    let junk = reasons_under("wtree-junk  junk  UNKNOWN");
+    // tree. Plain `list` only says how many there are; the entries and their
+    // entries wait behind `--unmanaged` rather than crowding the tree.
+    // `junk` is a checkout on disk and `loose` is only a branch, so the summary
+    // counts them apart rather than calling both the same thing.
     assert!(
-        junk.iter().any(|l| l.contains("recover with: wtree adopt")),
-        "the worktree stray adopts in place: {junk:?}\n{stdout}"
+        stdout.contains("found 2 unmanaged: 1 worktree, 1 branch. See 'wtree list --unmanaged'."),
+        "{stdout}"
     );
-    let loose = reasons_under("  loose  UNKNOWN");
     assert!(
-        loose
-            .iter()
-            .any(|l| l.contains("wtree open loose, then wtree adopt there")),
-        "the branch stray has no worktree to adopt yet: {loose:?}\n{stdout}"
+        !stdout.contains("wtree-junk"),
+        "no entries by default:\n{stdout}"
+    );
+
+    // `--unmanaged` is its own screen: the strays under a heading per kind, no
+    // tree above them, and the step to take on the heading.
+    let oe = run_wt(&fx.repo, &["list", "--unmanaged"]);
+    assert_ok(&oe);
+    let entries = out(&oe);
+    // The recovery rides on the heading rather than on every row beneath it.
+    assert!(
+        entries.contains("[unmanaged worktree]  (recover with: wtree adopt)"),
+        "{entries}"
+    );
+    assert!(
+        entries.contains(
+            "[unmanaged branch]  (recover with: 'wtree open <branch>', then 'wtree adopt' there)"
+        ),
+        "{entries}"
+    );
+    // No tree above them: this view answers one question.
+    assert!(!entries.contains("@ main"), "no tree here:\n{entries}");
+    // The worktree row leads with the path in full — an unmanaged checkout
+    // sits wherever it was made. The branch row is just the branch.
+    assert!(
+        entries.lines().any(|l| l.starts_with('/') && l.ends_with("  junk")),
+        "absolute path then branch:\n{entries}"
+    );
+    assert!(entries.contains("\nloose\n"), "{entries}");
+    // The headings carry the count, so the summary sentence stands down.
+    assert!(!entries.contains("found 2 unmanaged"), "{entries}");
+    // No reason beneath a row: the heading says the step, and `wtree info`
+    // standing in the worktree says why that particular one could not be
+    // judged. A branch stray has only ever one reason, so nothing is lost.
+    assert!(
+        !entries.lines().any(|l| l.trim_start().starts_with('!')),
+        "rows carry no reason lines:\n{entries}"
+    );
+
+    // The level that printed them is gone with them.
+    let od = run_wt(&fx.repo, &["list", "--detail"]);
+    assert_eq!(od.status.code(), Some(2), "{}", err(&od));
+    assert!(
+        err(&od).contains("unknown argument '--detail'"),
+        "{}",
+        err(&od)
+    );
+}
+
+/// A branch no worktree has checked out has nothing for the directory column.
+/// Run together, its divergence would slide left under the directories above it
+/// and read as one, so the columns are sized across every row instead.
+#[test]
+fn list_keeps_the_divergence_column_when_a_row_has_no_directory() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = stage, group:feat\n\n[stage]\n\n[group:feat]\nname-allow = feature/*\n",
+    );
+    // no `v` in either name: the plain glyph for "behind" is `v` too.
+    fx.git(&fx.repo, &["branch", "stage", "main"]); // declared, never opened
+    member(&fx, "feature/a", "feat", "main"); // opened, so it has a directory
+    fx.commit(&fx.repo, "main moves"); // both fall a commit behind
+
+    let stdout = out(&run_wt(&fx.repo, &["list"]));
+    let col = |branch: &str| -> usize {
+        let l = stdout
+            .lines()
+            .find(|l| l.contains(branch))
+            .unwrap_or_else(|| panic!("no row for {branch}:\n{stdout}"));
+        l.find('v').unwrap_or_else(|| panic!("no divergence on {l:?}:\n{stdout}"))
+    };
+    assert_eq!(
+        col("stage"),
+        col("feature/a"),
+        "the counts share a column whether or not the row has a directory:\n{stdout}"
     );
 }
 
@@ -990,7 +1195,7 @@ fn list_indents_a_grandchild_under_its_own_parent() {
     let stdout = out(&run_wt(&fx.repo, &["list"]));
     let l: Vec<&str> = stdout.lines().collect();
     assert_eq!(l.len(), 4, "one row per branch, no section headers:\n{stdout}");
-    assert!(l[0].starts_with("@ main"), "{stdout}");
+    assert!(l[0].starts_with("* main"), "{stdout}");
     assert!(l[1].starts_with("|-+ dev"), "{stdout}");
     // the leading `|` is main's line continuing past dev down to feature/b
     assert!(l[2].starts_with("| `-+ feature/a"), "{stdout}");
@@ -1012,7 +1217,7 @@ fn list_keeps_a_branch_whose_recorded_parent_is_gone() {
         stdout.lines().any(|l| l.starts_with("+ feature/a")),
         "shown at the root, not swallowed:\n{stdout}"
     );
-    assert!(stdout.contains("@ main"), "{stdout}");
+    assert!(stdout.contains("* main"), "{stdout}");
 }
 
 /// The counts are what say `sync` or `merge` is due; nothing else on screen
@@ -1051,7 +1256,7 @@ fn list_counts_divergence_from_the_parent_in_both_directions() {
     );
     assert!(
         both.lines()
-            .any(|l| l.contains("@ main") && !l.contains("^") && !l.contains("v2")),
+            .any(|l| l.contains("* main") && !l.contains("^") && !l.contains("v2")),
         "main is the root — it has no parent to diverge from:\n{both}"
     );
 }
@@ -1636,7 +1841,7 @@ fn adopt_refusals_write_nothing() {
     let o = run_wt(&a, &["adopt", "--group", "other", "--parent", "main"]);
     assert_fail(&o);
     let stderr = err(&o);
-    assert!(stderr.contains("wtree adopt: refused"), "{stderr}");
+    assert!(stderr.contains("refusal: adopt "), "{stderr}");
     assert!(
         stderr.contains("--group other: not in children of [main]"),
         "{stderr}"
@@ -1735,7 +1940,7 @@ fn merge_refused_while_unmanaged_then_allowed_after_adopt() {
     let o = run_wt(&wt, &["merge", "-m", "feat: a"]);
     assert_fail(&o);
     let stderr = err(&o);
-    assert!(stderr.contains("wtree merge: refused"), "{stderr}");
+    assert!(stderr.contains("refusal: merge "), "{stderr}");
     assert!(stderr.contains("unmanaged (fail closed)"), "{stderr}");
     assert!(stderr.contains("wtree adopt"), "{stderr}");
     let main_before = rev(&fx, "main");
@@ -2064,7 +2269,7 @@ fn open_and_new_point_at_each_other() {
     let o = run_wt(&fx.repo, &["open", "feature/ghost"]);
     assert_fail(&o);
     let stderr = err(&o);
-    assert!(stderr.contains("wtree open: refused"), "{stderr}");
+    assert!(stderr.contains("refusal: open "), "{stderr}");
     assert!(
         stderr.contains("branch 'feature/ghost' does not exist"),
         "{stderr}"
@@ -2150,6 +2355,38 @@ fn close_fixed_parent_still_receives_its_children() {
     assert_eq!(rev(&fx, "dev"), rev(&fx, "feature/a"));
 }
 
+/// A parent with no worktree is moved by `update-ref`, not by `git merge`, so
+/// the reflog line is whatever wtree hands over — and it is the only record of
+/// who moved a branch the user was not standing on.
+#[test]
+fn moving_a_parent_nobody_stands_on_names_the_verb_in_its_reflog() {
+    let fx = Fixture::new();
+    write_rules(&fx, MIDDLE_CFG);
+    assert_ok(&run_wt(&fx.repo, &["new", "dev"]));
+    let dev = default_dest(&fx, "dev");
+    assert_ok(&run_wt(&dev, &["new", "feature/a"]));
+    let a = default_dest(&fx, "feature/a");
+    assert_ok(&run_wt(&dev, &["close"]));
+
+    let subject = |fx: &Fixture| {
+        fx.git(&fx.repo, &["reflog", "show", "--format=%gs", "dev"])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    fx.commit(&a, "work");
+    assert_ok(&run_wt(&a, &["merge", "-m", "feat: a"]));
+    assert_eq!(subject(&fx), "wtree merge: feature/a");
+
+    // land goes through the same step and says land, matching the name the
+    // stash it parked would have carried.
+    fx.commit(&a, "more");
+    assert_ok(&run_wt(&a, &["land", "-m", "feat: a again"]));
+    assert_eq!(subject(&fx), "wtree land: feature/a");
+}
+
 #[test]
 fn close_refuses_a_group_branch_with_live_children() {
     let fx = Fixture::new();
@@ -2159,7 +2396,7 @@ fn close_refuses_a_group_branch_with_live_children() {
     let o = run_wt(&a, &["close"]);
     assert_fail(&o);
     let stderr = err(&o);
-    assert!(stderr.contains("wtree close: refused"), "{stderr}");
+    assert!(stderr.contains("refusal: close "), "{stderr}");
     assert!(stderr.contains("orphans its children"), "{stderr}");
     assert!(stderr.contains("'sub/x'"), "{stderr}");
     assert!(a.is_dir() && sub.is_dir());
@@ -2189,9 +2426,10 @@ fn close_group_branch_drops_its_record() {
     assert!(!wt.exists());
     assert_eq!(branches(&fx), vec!["feature/a".to_string(), "main".into()]);
     // the record lived in the worktree, so the branch reads as unknown now
-    let l = run_wt(&fx.repo, &["list"]);
+    let l = run_wt(&fx.repo, &["list", "--unmanaged"]);
     assert_ok(&l);
-    assert!(out(&l).contains("feature/a  UNKNOWN"), "{}", out(&l));
+    assert!(out(&l).contains("[unmanaged branch]"), "{}", out(&l));
+    assert!(out(&l).contains("\nfeature/a\n"), "{}", out(&l));
 }
 
 #[test]
@@ -2392,7 +2630,7 @@ fn land_preflight_refuses_before_merging() {
     assert_fail(&o);
     let stderr = err(&o);
     // attributed to the verb that was typed, not to the half that judged it
-    assert!(stderr.contains("wtree land: refused"), "{stderr}");
+    assert!(stderr.contains("refusal: land "), "{stderr}");
     assert!(stderr.contains("'sub/x'"), "{stderr}");
     assert!(stderr.contains("not ephemeral"), "{stderr}");
     // the merge half never started
@@ -2575,7 +2813,7 @@ fn the_menu_lists_what_policy_allows_and_hides_what_it_refuses() {
     // list/info are unconditional, and the hint names the way to the rest
     assert!(menu.contains("  list "), "{menu}");
     assert!(menu.contains("  info "), "{menu}");
-    assert!(menu.contains("wtree help --all"), "{menu}");
+    assert!(menu.contains("wtree -h"), "{menu}");
     assert_hidden_verbs_refuse(&fx.repo, &menu);
 
     // A group member: the leaf where the work happens, so nearly everything is.
@@ -2798,12 +3036,45 @@ fn help_anywhere_on_the_line_beats_the_verb() {
         );
     }
 
+    // `-h` is the same rule, not a second one: same reach, same answer.
+    for (short, long) in [
+        (vec!["-h"], vec!["--help"]),
+        (vec!["list", "-h"], vec!["list", "--help"]),
+        (vec!["init", "--new", "-h"], vec!["init", "--new", "--help"]),
+    ] {
+        let s = run_wt(&fx.repo, &short);
+        assert_ok(&s);
+        assert_eq!(out(&s), out(&run_wt(&fx.repo, &long)), "{short:?}");
+    }
+    assert!(!fx.repo.join(".git/wtree").exists(), "-h must not init");
+
     // Broken rules are when a verb's usage is most needed, so it reads none.
     write_rules(&fx, "[main]\nbogus-key = 1\n");
     assert_fail(&run_wt(&fx.repo, &[]));
     let o = run_wt(&fx.repo, &["merge", "--help"]);
     assert_ok(&o);
     assert!(out(&o).contains("merge into the parent"), "{}", out(&o));
+}
+
+/// `help` answers but is never offered: it is the word a lost user reaches for
+/// first, and refusing it to teach a shorter spelling costs them a try. Nothing
+/// on screen names it, so each of the two screens has one advertised way in.
+#[test]
+fn the_help_verb_answers_without_being_advertised() {
+    let fx = Fixture::new();
+    write_rules(&fx, "[main]\nchildren = group:feat\n\n[group:feat]\n");
+
+    assert_eq!(out(&run_wt(&fx.repo, &["help"])), out(&run_wt(&fx.repo, &[])));
+    assert_eq!(
+        out(&run_wt(&fx.repo, &["help", "--all"])),
+        out(&run_wt(&fx.repo, &["-h"]))
+    );
+
+    for a in [vec![], vec!["-h"], vec!["bogus"]] {
+        let o = run_wt(&fx.repo, &a);
+        let all = format!("{}{}", out(&o), String::from_utf8_lossy(&o.stderr));
+        assert!(!all.contains("wtree help"), "{a:?} points at it:\n{all}");
+    }
 }
 
 /// The command is `wtree` and the crate is `gitwtree`, so the version line names
@@ -2838,6 +3109,59 @@ fn a_non_utf8_argument_is_refused_instead_of_panicking() {
     // Invalid encoding is a usage error, not an internal failure.
     assert_eq!(o.status.code(), Some(2), "stderr:\n{}", err(&o));
     assert!(err(&o).contains("must be valid UTF-8"), "{}", err(&o));
+    assert!(err(&o).starts_with("error:"), "{}", err(&o));
+}
+
+/// Two words carry the diagnostics — `refusal:` for what the policy declines
+/// and `error:` for everything else that went wrong — and the exit code says
+/// separately whether the line or the run was at fault. A third word for the
+/// failures main answers by itself would be a second system to learn.
+#[test]
+fn every_diagnostic_wears_one_of_the_two_words() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+
+    let o = run_wt(&fx.repo, &["frobnicate"]);
+    assert_eq!(o.status.code(), Some(2), "stderr:\n{}", err(&o));
+    assert!(err(&o).starts_with("error: unknown verb"), "{}", err(&o));
+    // The two lines under it are the menu, not diagnostics, and stay bare.
+    assert!(err(&o).contains("\nwtree      verbs"), "{}", err(&o));
+
+    // An unknown flag is the same mistake one word further in, and always said
+    // so; the verb slot now matches it.
+    let o = run_wt(&fx.repo, &["new", "--frobnicate"]);
+    assert!(err(&o).starts_with("error: unknown flag"), "{}", err(&o));
+
+    // A layer under the verbs raises a bare sentence; main is the last hand on
+    // it, so the word is added there rather than at each of those layers.
+    let o = run_wt(&fx.tmp.0, &["list"]);
+    assert!(err(&o).starts_with("error:"), "{}", err(&o));
+
+    // A refusal already carries its word and must not collect a second.
+    let o = run_wt(&fx.repo, &["new", "junk/x"]);
+    assert!(err(&o).starts_with("refusal: new"), "{}", err(&o));
+}
+
+/// The two failures every reader meets — no repository, no rules — are wtree's
+/// to answer. Which plumbing command asked, and where the file would have
+/// sat, are answers to a question nobody standing there has yet.
+#[test]
+fn the_expected_failures_are_answered_without_git_or_paths() {
+    let fx = Fixture::new();
+
+    let o = run_wt(&fx.tmp.0, &["list"]);
+    assert_fail(&o);
+    assert_eq!(err(&o).trim(), "error: not inside a git repository");
+
+    // In a repository, with no rules written yet.
+    let o = run_wt(&fx.repo, &["list"]);
+    assert_fail(&o);
+    assert_eq!(
+        err(&o).trim(),
+        "error: no policy rules in this repository — run `wtree init` first"
+    );
+    assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
+    assert_ok(&run_wt(&fx.repo, &["list"]));
 }
 
 #[test]

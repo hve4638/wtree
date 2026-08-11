@@ -17,7 +17,7 @@ pub const ALL_MODES: [MergeMode; 4] = [
     MergeMode::Ff,
 ];
 
-const ADOPT_HINT: &str = "recover with: wtree adopt";
+pub(crate) const ADOPT_HINT: &str = "recover with: wtree adopt";
 
 /// Identity of a branch/worktree, resolved in DESIGN order:
 /// (1) valid state record (only when recorded branch == HEAD),
@@ -61,8 +61,18 @@ pub struct Refusal {
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "wtree {}: refused", self.verb)?;
-        writeln!(f, "  {}", self.subject)?;
+        // `refusal:` against `error:` everywhere else. The policy declining a
+        // request is this tool's job rather than a fault, and the two want
+        // different things done about them: one is answered by changing the
+        // rules or the name, the other by fixing what was typed or what is on
+        // disk.
+        //
+        // Verb and subject share the line: alone, a subject like `'main'` does
+        // not say which verb turned it down, and on its own line the verb was
+        // a second heading saying what the marker already said. Subjects
+        // therefore never spell the verb themselves.
+        let head = format!("refusal: {} {}", self.verb, self.subject);
+        writeln!(f, "{}", head.trim_end())?;
         for r in &self.reasons {
             // A reason may carry extra lines (rule citations); indent them.
             let mut lines = r.lines();
@@ -78,6 +88,32 @@ impl fmt::Display for Refusal {
 }
 
 pub type Decision<T> = Result<T, Refusal>;
+
+/// The branch name among `existing` that cannot coexist with `name`, if any.
+///
+/// git stores a ref as a file at its own path, so one name being another's
+/// prefix at a `/` boundary makes the shorter one a file and a directory at
+/// once. Equality is a different answer — the name is taken, and `open` picks
+/// it up — so it stays out of here.
+pub(crate) fn nested_ref<'a>(
+    existing: impl IntoIterator<Item = &'a str>,
+    name: &str,
+) -> Option<&'a str> {
+    fn under(parent: &str, child: &str) -> bool {
+        child.len() > parent.len()
+            && child.starts_with(parent)
+            && child.as_bytes()[parent.len()] == b'/'
+    }
+    existing
+        .into_iter()
+        .find(|e| under(e, name) || under(name, e))
+}
+
+/// Why two nesting names cannot both be branches, in the order git sees it.
+pub(crate) fn nesting_reason(a: &str, b: &str) -> String {
+    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    format!("git cannot hold '{short}' as a branch and as the path to '{long}'")
+}
 
 fn refuse<T>(verb: &'static str, subject: impl Into<String>, reasons: Vec<String>) -> Decision<T> {
     Err(Refusal {
@@ -253,7 +289,7 @@ fn unmanaged_parent(parent: &str, reasons: &[String]) -> Vec<String> {
     )];
     rs.extend(reasons.iter().cloned());
     rs.push(format!(
-        "restore it with: wtree open {parent}, then wtree adopt there"
+        "restore it with: 'wtree open {parent}', then 'wtree adopt' there"
     ));
     rs.push(
         "or re-parent this branch: wtree adopt --group <G> --parent <managed branch>".to_string(),
@@ -464,12 +500,12 @@ impl<'a> Ctx<'a> {
                     "current worktree is unmanaged — cannot be a parent (fail closed)".to_string(),
                 ];
                 rs.extend(reasons.clone());
-                return refuse("new", "new".to_string(), rs);
+                return refuse("new", String::new(), rs);
             }
             Identity::Free { branch, .. } => {
                 return refuse(
                     "new",
-                    format!("new from '{branch}'"),
+                    format!("from '{branch}'"),
                     vec![format!(
                         "'{branch}' is a free branch — free branches cannot have children (fail closed)"
                     )],
@@ -484,7 +520,7 @@ impl<'a> Ctx<'a> {
         if children.is_empty() {
             return refuse(
                 "new",
-                format!("new from '{parent}'"),
+                format!("from '{parent}'"),
                 vec![format!(
                     "{} declares no children — nothing may be created here (fail closed)",
                     sec_kind.header(&sec_name)
@@ -521,12 +557,12 @@ impl<'a> Ctx<'a> {
         // The gate's subject has no name in it (it judges without one); put it
         // back so the refusal reads as it always has.
         let g = self.gate_new().map_err(|mut r| {
-            r.subject = r.subject.replacen("new", &format!("new '{name}'"), 1);
+            r.subject = format!("'{name}' {}", r.subject).trim_end().to_string();
             r
         })?;
         let (parent, sec_kind, sec_name, star) =
             (g.parent.clone(), g.sec_kind, g.sec_name.clone(), g.star);
-        let subject = format!("new '{name}' from '{parent}'");
+        let subject = format!("'{name}' from '{parent}'");
         if self.world.branches.contains(name) {
             return refuse(
                 "new",
@@ -535,6 +571,18 @@ impl<'a> Ctx<'a> {
                     format!("branch '{name}' already exists"),
                     format!("to give it a worktree instead: wtree open {name}"),
                 ],
+            );
+        }
+        // Nesting has no escape hatch the way an exact match has `open`: the
+        // only way out is a name that does not nest, so the reason stands alone.
+        if let Some(clash) = nested_ref(self.world.branches.iter().map(String::as_str), name) {
+            return refuse(
+                "new",
+                subject,
+                vec![format!(
+                    "branch '{clash}' conflicts: {}",
+                    nesting_reason(clash, name)
+                )],
             );
         }
         let bares: Vec<&str> = g.bares.iter().map(String::as_str).collect();
@@ -655,7 +703,7 @@ impl<'a> Ctx<'a> {
     /// written — so the only questions are whether the branch exists and
     /// whether it is free to check out.
     pub fn plan_open(&self, branch: &str) -> Decision<OpenPlan> {
-        let subject = format!("open '{branch}'");
+        let subject = format!("'{branch}'");
         if !self.world.branches.contains(branch) {
             return refuse(
                 "open",
@@ -1426,7 +1474,13 @@ mod tests {
             ctx.plan_merge(None),
             &["unmanaged", "raw switch/rename", "adopt"],
         );
-        refused(ctx.plan_new("feature/b", None), &["cannot be a parent"]);
+        // The gate judges without a name, so its subject is empty and the name
+        // is put in front afterwards. No double space, and no trailing one.
+        let r = refused(ctx.plan_new("feature/b", None), &["cannot be a parent"]);
+        assert_eq!(
+            r.to_string().lines().next().unwrap(),
+            "refusal: new 'feature/b'"
+        );
         fx.git(&wt, &["switch", "-q", "feature/a"]);
 
         // raw rename: record still says the old name
@@ -1652,6 +1706,44 @@ mod tests {
         );
         // an existing branch name is always refused
         refused(ctx.plan_new("main", None), &["already exists"]);
+    }
+
+    #[test]
+    fn nesting_is_judged_before_git_sees_the_name() {
+        // A ref is a file at its own path, so `feature/a` and `feature/a/b`
+        // want that path to be a file and a directory at once. git says so
+        // only once the branch is being written; the judge says it first.
+        assert_eq!(nested_ref(["feature/a"], "feature/a/b"), Some("feature/a"));
+        assert_eq!(
+            nested_ref(["feature/a/b"], "feature/a"),
+            Some("feature/a/b")
+        );
+        // the same name is a different answer, and `open` answers it
+        assert_eq!(nested_ref(["feature/a"], "feature/a"), None);
+        // a prefix that is not a path boundary shares nothing
+        assert_eq!(nested_ref(["feature/a"], "feature/ab"), None);
+        assert_eq!(nested_ref(["feature/ab"], "feature/a"), None);
+        assert_eq!(nested_ref([] as [&str; 0], "feature/a"), None);
+
+        let fx = Fixture::new();
+        let c = cfg("[main]\nchildren = group:g\n\n[group:g]\nname-allow = feature/*\n");
+        fx.git(&fx.repo, &["branch", "feature/a"]);
+        let w = world(&fx.repo, &c);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        // named either way round, the reason names the file and the path
+        let r = refused(
+            ctx.plan_new("feature/a/b", None),
+            &[
+                "branch 'feature/a' conflicts",
+                "as the path to 'feature/a/b'",
+            ],
+        );
+        assert_eq!(r.reasons.len(), 1, "{r}");
+        assert!(!r.to_string().contains("wtree open"), "{r}");
     }
 
     #[test]
