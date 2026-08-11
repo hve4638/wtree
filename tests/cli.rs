@@ -969,7 +969,7 @@ fn list_shows_identities_unknowns_and_bare_branches() {
     );
     assert!(
         entries.contains(
-            "[unmanaged branch]  (recover with: wtree open <branch>, then wtree adopt there)"
+            "[unmanaged branch]  (recover with: 'wtree open <branch>', then 'wtree adopt' there)"
         ),
         "{entries}"
     );

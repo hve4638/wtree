@@ -1414,7 +1414,9 @@ pub fn list(cwd: &Path, view: UnmanagedView) -> CmdResult {
             (
                 false,
                 "branch",
-                "recover with: wtree open <branch>, then wtree adopt there",
+                // Two commands with prose after the second: quoted, so `there`
+                // reads as the place to stand and not as an argument.
+                "recover with: 'wtree open <branch>', then 'wtree adopt' there",
             ),
         ] {
             if matches!(view, UnmanagedView::Count) {

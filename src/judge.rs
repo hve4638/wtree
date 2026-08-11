@@ -253,7 +253,7 @@ fn unmanaged_parent(parent: &str, reasons: &[String]) -> Vec<String> {
     )];
     rs.extend(reasons.iter().cloned());
     rs.push(format!(
-        "restore it with: wtree open {parent}, then wtree adopt there"
+        "restore it with: 'wtree open {parent}', then 'wtree adopt' there"
     ));
     rs.push(
         "or re-parent this branch: wtree adopt --group <G> --parent <managed branch>".to_string(),
