@@ -148,7 +148,13 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         },
-        "list" => verbs::list(&cwd),
+        "list" => match parse_list_args(rest) {
+            Ok(view) => verbs::list(&cwd, view),
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::from(2);
+            }
+        },
         "info" => verbs::info(&cwd),
         v => {
             eprintln!("wtree: unknown verb '{v}'");
@@ -354,6 +360,27 @@ fn parse_merge_args(
     Ok((mode, msg))
 }
 
+const LIST_USAGE: &str = "usage: wtree list [--unmanaged]";
+
+/// The unmanaged block is folded to a count by default. It is the one part of
+/// the listing wtree did not arrange, and each entry costs several lines of
+/// recovery advice nobody asked for; the count keeps them from being forgotten
+/// without letting them crowd out the tree.
+fn parse_list_args(rest: &[String]) -> Result<verbs::UnmanagedView, String> {
+    let mut entries = false;
+    for a in rest {
+        match a.as_str() {
+            "--unmanaged" => entries = true,
+            s => return Err(format!("wtree list: unknown argument '{s}'\n{LIST_USAGE}")),
+        }
+    }
+    Ok(if entries {
+        verbs::UnmanagedView::Entries
+    } else {
+        verbs::UnmanagedView::Count
+    })
+}
+
 const DESTROY_USAGE: &str = "usage: wtree destroy [--force] [--key <key>]";
 
 /// `--key` rather than wtree.sh's positional key: the refusal that issues a key
@@ -473,7 +500,7 @@ const ROWS: &[(&str, &str, &str)] = &[
         ADOPT_USAGE,
         "record what a branch is, and whose child",
     ),
-    ("list", "usage: wtree list", "worktrees in this repo"),
+    ("list", LIST_USAGE, "worktrees in this repo"),
     (
         "info",
         "usage: wtree info",

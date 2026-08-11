@@ -12,6 +12,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use console::style;
+
 use crate::judge::{self, Affordance, Ctx, DestroyPlan, Identity, MergePlan, NewPlan};
 use crate::prompt;
 use crate::repo::{self, Repo};
@@ -1003,15 +1005,16 @@ fn divergence_text(g: &Glyphs, d: Option<(u32, u32)>) -> String {
     };
     let mut parts = Vec::new();
     if ahead > 0 {
-        parts.push(format!("{}{ahead}", g.ahead));
+        parts.push(style(format!("{}{ahead}", g.ahead)).green().to_string());
     }
     if behind > 0 {
-        parts.push(format!("{}{behind}", g.behind));
+        parts.push(style(format!("{}{behind}", g.behind)).yellow().to_string());
     }
     if parts.is_empty() {
         String::new()
     } else {
-        format!("  {}", parts.join(" "))
+        // No leading gap: this is a column now, and the caller spaces it.
+        parts.join(" ")
     }
 }
 
@@ -1052,28 +1055,12 @@ const TREE_PLAIN: Glyphs = Glyphs {
 /// Terminal columns `s` occupies. Branch names and worktree directory names can
 /// hold CJK, which is two columns wide; sizing the branch column by `chars()`
 /// would leave everything right of such a name a column short per wide char.
+///
+/// Rows carry colour by the time they are measured, so this has to skip the
+/// escape sequences too — counting them as the seven-odd columns their bytes
+/// look like shrinks every row and cuts the divergence counts off the end.
 fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
-}
-
-fn char_width(c: char) -> usize {
-    match c as u32 {
-        0x1100..=0x115F
-        | 0x2E80..=0x303E
-        | 0x3041..=0x33FF
-        | 0x3400..=0x4DBF
-        | 0x4E00..=0x9FFF
-        | 0xA000..=0xA4CF
-        | 0xAC00..=0xD7A3
-        | 0xF900..=0xFAFF
-        | 0xFE30..=0xFE6F
-        | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6
-        | 0x1F300..=0x1F64F
-        | 0x1F900..=0x1F9FF
-        | 0x20000..=0x3FFFD => 2,
-        _ => 1,
-    }
+    console::measure_text_width(s)
 }
 
 /// Columns the terminal on stdout has, `None` when stdout is not one or the
@@ -1094,25 +1081,12 @@ fn terminal_width() -> Option<usize> {
 /// Cut `s` to `width` columns, spending the last one on `…` so the cut is
 /// visible. Returns `s` whole when it already fits.
 fn truncate_to(s: &str, width: usize) -> String {
-    if display_width(s) <= width {
-        return s.to_string();
-    }
+    // `console::truncate_str` spends the tail even when there is no room for
+    // it, handing back a 1-wide `…` for a 0-wide budget.
     if width == 0 {
         return String::new();
     }
-    let budget = width - 1;
-    let mut out = String::new();
-    let mut used = 0;
-    for c in s.chars() {
-        let w = char_width(c);
-        if used + w > budget {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out.push('…');
-    out
+    console::truncate_str(s, width, "…").into_owned()
 }
 
 /// Floor for the branch column, so a narrow terminal does not shave names down
@@ -1125,35 +1099,69 @@ struct Node {
     branch: String,
     /// Declared fixed branches sort above the group/free churn beneath them.
     fixed: bool,
-    /// `@` current worktree, `+` some other worktree, `Glyphs::bare` for none.
+    /// The three states `git branch` marks, spelled its way: `*` the worktree
+    /// one stands in, `+` one checked out elsewhere, `Glyphs::bare` for a branch
+    /// no worktree claims. git leaves that last one blank; a tree row cannot,
+    /// or the slot reads as something cut off rather than something absent.
     mark: &'static str,
-    /// Everything printed to the right of the branch name.
-    tail: String,
+    /// What is printed right of the branch name, kept apart so each column can
+    /// be sized across every row. Run together, a row missing its directory
+    /// slides its divergence under the directories above it and the eye reads
+    /// the wrong column.
+    identity: String,
+    /// Empty for a branch no worktree has checked out.
+    dir: String,
+    /// Already carries its own colour, so measure it rather than count bytes.
+    div: String,
+    flags: String,
     kids: Vec<usize>,
 }
 
 /// A worktree or branch with no identity, and so no parent to hang it from.
 struct Stray {
-    head: String,
-    tail: String,
-    reasons: Vec<String>,
+    /// Which pass turned it up. Both kinds are unmanaged, but only one is a
+    /// checkout sitting in a directory, and the summary says which you have.
+    worktree: bool,
+    /// The whole row. No `UNKNOWN` column and no reason beneath it: the
+    /// heading above says both. Why a particular one could not be judged is
+    /// `wtree info`'s answer, standing in the worktree it is asking about.
+    line: String,
 }
 
-/// Recovery line for a branch that no worktree claims and no `[branch]`
-/// declares. The judge's own adopt hint cannot stand in here: it is written for
-/// a worktree being judged, where `adopt` acts on the checkout one is standing
-/// in. This branch has none, so a worktree has to be opened before there is
-/// anything to adopt — the same shape `unmanaged_parent` uses when the branch
-/// it names is somewhere other than here.
-fn unadopted_branch(branch: &str, reasons: &[String]) -> Vec<String> {
-    let mut rs = reasons.to_vec();
-    rs.push(format!(
-        "manage it with: wtree open {branch}, then wtree adopt there"
-    ));
-    rs
+fn plural(k: usize, one: &'static str, many: &'static str) -> &'static str {
+    if k == 1 { one } else { many }
 }
 
-pub fn list(cwd: &Path) -> CmdResult {
+/// `found 2 unmanaged: 1 worktree, 1 branch`. The breakdown earns its colon
+/// only when both kinds are present; with one kind the noun rides along with
+/// the count instead of being repeated after it.
+fn unmanaged_summary(strays: &[Stray]) -> String {
+    let n = strays.len();
+    let wt = strays.iter().filter(|s| s.worktree).count();
+    let br = n - wt;
+    if wt > 0 && br > 0 {
+        format!(
+            "found {n} unmanaged: {wt} {}, {br} {}",
+            plural(wt, "worktree", "worktrees"),
+            plural(br, "branch", "branches")
+        )
+    } else if wt > 0 {
+        format!("found {wt} unmanaged {}", plural(wt, "worktree", "worktrees"))
+    } else {
+        format!("found {br} unmanaged {}", plural(br, "branch", "branches"))
+    }
+}
+
+/// How much of the unmanaged block `list` prints. Knowing how many there are
+/// is a glance; knowing which ones is a second question. The heading over
+/// them carries the step either way.
+#[derive(Clone, Copy)]
+pub enum UnmanagedView {
+    Count,
+    Entries,
+}
+
+pub fn list(cwd: &Path, view: UnmanagedView) -> CmdResult {
     let repo = Repo::discover(cwd)?;
     let cfg = load_rules(&repo)?;
     // Light: nothing here judges work loss, and the reflected-in-parent probe
@@ -1190,15 +1198,26 @@ pub fn list(cwd: &Path) -> CmdResult {
             .unwrap_or_else(|| wt.path.display().to_string());
         let mut flags = String::new();
         if wt.dirty {
-            flags.push_str(" [dirty]");
+            // Yellow like the `behind` arrow: both say the worktree is carrying
+            // something its parent has not seen.
+            flags.push_str(&format!(" {}", style("[dirty]").yellow()));
         }
         let id = ctx.identity_of(wt);
-        if let Identity::Unknown { reasons } = &id {
-            let head = wt.head.clone().unwrap_or_else(|| "(detached)".into());
+        if let Identity::Unknown { .. } = &id {
+            // The path in full, as `git worktree list` gives it: an unmanaged
+            // checkout sits wherever it was made, so the name alone will not
+            // get anyone there. A detached one is called by its commit, having
+            // no branch to be called by.
+            // The path leads there and the name says which one it is, so the
+            // name keeps the full brightness and the path steps back a shade.
+            let what = match (&wt.head, &wt.head_short) {
+                (Some(h), _) => h.clone(),
+                (None, Some(o)) => format!("{o}{}", style(" (detached)").dim()),
+                (None, None) => style("(detached)").dim().to_string(),
+            };
             strays.push(Stray {
-                head: format!("{dir}  {head}"),
-                tail: format!("UNKNOWN{flags}"),
-                reasons: reasons.clone(),
+                worktree: true,
+                line: format!("{}  {what}{flags}", style(wt.path.display()).dim()),
             });
             continue;
         }
@@ -1215,8 +1234,11 @@ pub fn list(cwd: &Path) -> CmdResult {
         nodes.push(Node {
             branch,
             fixed: matches!(id, Identity::Fixed { .. }),
-            mark: if i == world.current { "@" } else { "+" },
-            tail: format!("{}  {dir}{div}{flags}", describe_identity(&ctx, &id)),
+            mark: if i == world.current { "*" } else { "+" },
+            identity: describe_identity(&id),
+            dir: dir.clone(),
+            div: div.clone(),
+            flags: flags.trim_start().to_string(),
             kids: Vec::new(),
         });
     }
@@ -1226,11 +1248,10 @@ pub fn list(cwd: &Path) -> CmdResult {
             continue;
         }
         let id = ctx.branch_identity(b);
-        if let Identity::Unknown { reasons } = &id {
+        if let Identity::Unknown { .. } = &id {
             strays.push(Stray {
-                head: b.clone(),
-                tail: "UNKNOWN".to_string(),
-                reasons: unadopted_branch(b, reasons),
+                worktree: false,
+                line: b.clone(),
             });
             continue;
         }
@@ -1248,7 +1269,10 @@ pub fn list(cwd: &Path) -> CmdResult {
             branch: b.clone(),
             fixed: matches!(id, Identity::Fixed { .. }),
             mark: g.bare,
-            tail: format!("{}{div}", describe_identity(&ctx, &id)),
+            identity: describe_identity(&id),
+            dir: String::new(),
+            div: div.clone(),
+            flags: String::new(),
             kids: Vec::new(),
         });
     }
@@ -1305,7 +1329,15 @@ pub fn list(cwd: &Path) -> CmdResult {
 
     let head_of = |(gutter, i): &(String, usize)| {
         let n: &Node = &nodes[*i];
-        format!("{gutter}{} {}", n.mark, n.branch)
+        // `git branch` already colours these three states, and its readers are
+        // ours: the branch one stands in green, one checked out in another
+        // worktree cyan, one no worktree claims left in the default colour.
+        let name = match n.mark {
+            "*" => style(&n.branch).green().to_string(),
+            "+" => style(&n.branch).cyan().to_string(),
+            _ => n.branch.clone(),
+        };
+        format!("{gutter}{} {name}", n.mark)
     };
     let natural = rows.iter().map(|r| display_width(&head_of(r))).max().unwrap_or(0);
     // Piped output is never cut: a reader that is not a terminal is grepping or
@@ -1317,10 +1349,38 @@ pub fn list(cwd: &Path) -> CmdResult {
         Some(t) => natural.min((t / 2).max(MIN_NAME_COL)),
         None => natural,
     };
-    for r in &rows {
+    // The tail columns are sized the same way, so a row with no directory
+    // leaves the gap open instead of pulling its divergence left.
+    let col_w = |f: fn(&Node) -> &String| -> usize {
+        rows.iter()
+            .map(|r| display_width(f(&nodes[r.1])))
+            .max()
+            .unwrap_or(0)
+    };
+    let id_w = col_w(|n| &n.identity);
+    let dir_w = col_w(|n| &n.dir);
+    let div_w = col_w(|n| &n.div);
+    let pad_to = |s: &str, w: usize| " ".repeat(w.saturating_sub(display_width(s)));
+    // `--unmanaged` is its own screen, not an addition to this one. Left out,
+    // the block below is free of the tree's column budget — an absolute path
+    // has room to be printed whole.
+    for r in rows.iter().take(match view {
+        UnmanagedView::Count => rows.len(),
+        UnmanagedView::Entries => 0,
+    }) {
+        let n = &nodes[r.1];
         let head = truncate_to(&head_of(r), name_w);
-        let pad = " ".repeat(name_w.saturating_sub(display_width(&head)));
-        let line = format!("{head}{pad}  {}", nodes[r.1].tail);
+        let line = format!(
+            "{head}{}  {}{}  {}{}  {}{}  {}",
+            pad_to(&head, name_w),
+            style(&n.identity).dim(),
+            pad_to(&n.identity, id_w),
+            style(&n.dir).dim(),
+            pad_to(&n.dir, dir_w),
+            n.div,
+            pad_to(&n.div, div_w),
+            n.flags,
+        );
         let line = line.trim_end();
         match term {
             Some(t) => println!("{}", truncate_to(line, t)),
@@ -1329,28 +1389,69 @@ pub fn list(cwd: &Path) -> CmdResult {
     }
 
     if !strays.is_empty() {
-        println!("\nunmanaged:");
-        for s in &strays {
-            println!("  {}  {}", s.head, s.tail);
-            for r in &s.reasons {
-                println!("      ! {r}");
+        // What the policy does not cover is the one thing on screen that is not
+        // wtree's to arrange, so it recedes rather than competing with the tree.
+        if matches!(view, UnmanagedView::Count) {
+            println!(
+                "\n{}",
+                style(format!(
+                    "{}. See 'wtree list --unmanaged'.",
+                    unmanaged_summary(&strays)
+                ))
+                .dim()
+            );
+        }
+        // Listed apart by kind: a checkout left on disk and a branch nobody
+        // opened want different things done to them, and a heading says which
+        // without the reader pairing every row against its recovery line.
+        // The recovery rides on the heading: every row under one takes the same
+        // step, and repeating it per row said the same thing five times over.
+        // Which rows that step actually works on is the gate's call, not this
+        // listing's — `adopt` refuses a detached HEAD with its own reason.
+        let mut first = matches!(view, UnmanagedView::Entries);
+        for (kind, label, how) in [
+            (true, "worktree", judge::ADOPT_HINT),
+            (
+                false,
+                "branch",
+                "recover with: wtree open <branch>, then wtree adopt there",
+            ),
+        ] {
+            if matches!(view, UnmanagedView::Count) {
+                break;
+            }
+            let group: Vec<&Stray> = strays.iter().filter(|s| s.worktree == kind).collect();
+            if group.is_empty() {
+                continue;
+            }
+            if !first {
+                println!();
+            }
+            first = false;
+            // Asked for by name, this screen is nobody's appendix: what recedes
+            // here is the hint, read once, and not the rows that were the point
+            // of typing it.
+            println!(
+                "{}  {}",
+                style(format!("[unmanaged {label}]")).bold(),
+                style(format!("({how})")).dim()
+            );
+            for s in group {
+                println!("{}", s.line);
             }
         }
     }
     Ok(())
 }
 
-fn describe_identity(ctx: &Ctx, id: &Identity) -> String {
+/// What the policy says a branch is. Not what the policy will *do* with it:
+/// `ephemeral` is a property of the group, identical on every row under it, and
+/// only `destroy` ever consults it. `wtree info` answers that question.
+fn describe_identity(id: &Identity) -> String {
     match id {
         Identity::Fixed { .. } => "fixed".into(),
         Identity::Free { .. } => "free".into(),
-        Identity::GroupMember { group, .. } => {
-            if ctx.cfg.ephemeral(group) {
-                format!("group:{group} (ephemeral)")
-            } else {
-                format!("group:{group}")
-            }
-        }
+        Identity::GroupMember { group, .. } => format!("group:{group}"),
         Identity::Unknown { .. } => "UNKNOWN".into(),
     }
 }

@@ -181,15 +181,18 @@ impl Repo {
                 cur = Some(WorktreeInfo {
                     path: PathBuf::from(p),
                     head_branch: None,
+                    head_oid: None,
                     bare: false,
                 });
             } else if let Some(wt) = cur.as_mut() {
                 if let Some(b) = line.strip_prefix("branch ") {
                     wt.head_branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+                } else if let Some(o) = line.strip_prefix("HEAD ") {
+                    wt.head_oid = Some(o.to_string());
                 } else if line == "bare" {
                     wt.bare = true;
                 }
-                // "HEAD <oid>", "detached", "prunable ..." etc. are ignored.
+                // "detached", "prunable ..." etc. are ignored.
             }
         }
         if let Some(wt) = cur.take() {
@@ -204,6 +207,8 @@ pub struct WorktreeInfo {
     pub path: PathBuf,
     /// Short branch name of HEAD; `None` = detached (or bare).
     pub head_branch: Option<String>,
+    /// Commit HEAD resolves to. The only name a detached checkout has.
+    pub head_oid: Option<String>,
     pub bare: bool,
 }
 
@@ -292,6 +297,9 @@ pub struct WtFact {
     pub unreflected: bool,
     /// `None` when it cannot be computed (e.g. unborn HEAD).
     pub confirmation_key: Option<String>,
+    /// Abbreviated commit HEAD sits on. What a detached checkout is called,
+    /// having no branch to be called by.
+    pub head_short: Option<String>,
 }
 
 /// Snapshot of every fact the judgment core needs — gathered once so the
@@ -353,6 +361,10 @@ fn gather_with(cwd: &Path, cfg: &Rules, reflection: bool) -> Result<World, Strin
         }
         let path = wt.path.canonicalize().unwrap_or(wt.path);
         let head = wt.head_branch;
+        let head_short = wt
+            .head_oid
+            .as_ref()
+            .map(|o| o.chars().take(7).collect::<String>());
         let state = match private_git_dir(&path) {
             Ok(d) => state::read(&d),
             Err(e) => StateRead::Invalid { reason: e },
@@ -373,6 +385,7 @@ fn gather_with(cwd: &Path, cfg: &Rules, reflection: bool) -> Result<World, Strin
             dirty,
             unreflected,
             confirmation_key,
+            head_short,
         });
     }
     let current = facts

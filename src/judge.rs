@@ -17,7 +17,7 @@ pub const ALL_MODES: [MergeMode; 4] = [
     MergeMode::Ff,
 ];
 
-const ADOPT_HINT: &str = "recover with: wtree adopt";
+pub(crate) const ADOPT_HINT: &str = "recover with: wtree adopt";
 
 /// Identity of a branch/worktree, resolved in DESIGN order:
 /// (1) valid state record (only when recorded branch == HEAD),

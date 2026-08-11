@@ -940,37 +940,95 @@ fn list_shows_identities_unknowns_and_bare_branches() {
     let stdout = out(&o);
     // Parentage is position in the tree now, not a `parent: X` column. Piped
     // output uses the ASCII glyphs.
-    assert!(stdout.contains("@ main         fixed  repo"), "{stdout}");
+    assert!(stdout.contains("* main         fixed       repo"), "{stdout}");
     assert!(stdout.contains("`-+ feature/a  group:feat"), "{stdout}");
     assert!(stdout.contains("|-. dev        fixed"), "declared, no worktree:\n{stdout}");
     // An unmanaged worktree has no identity, so no parent, so no place in the
-    // tree — it is listed apart with the reason it cannot be judged.
-    assert!(stdout.contains("unmanaged:"), "{stdout}");
-    assert!(stdout.contains("wtree-junk  junk  UNKNOWN"), "{stdout}");
-
-    // Each stray carries its own recovery line, and they differ: `adopt` acts
-    // on the worktree one stands in, so the branch that has none must be told
-    // to open one first. Scoped per row — a whole-stdout `contains` would let
-    // either row answer for both.
-    let reasons_under = |head: &str| -> Vec<&str> {
-        stdout
-            .lines()
-            .skip_while(|l| !l.contains(head))
-            .skip(1)
-            .take_while(|l| l.trim_start().starts_with('!'))
-            .collect()
-    };
-    let junk = reasons_under("wtree-junk  junk  UNKNOWN");
+    // tree. Plain `list` only says how many there are; the entries and their
+    // entries wait behind `--unmanaged` rather than crowding the tree.
+    // `junk` is a checkout on disk and `loose` is only a branch, so the summary
+    // counts them apart rather than calling both the same thing.
     assert!(
-        junk.iter().any(|l| l.contains("recover with: wtree adopt")),
-        "the worktree stray adopts in place: {junk:?}\n{stdout}"
+        stdout.contains("found 2 unmanaged: 1 worktree, 1 branch. See 'wtree list --unmanaged'."),
+        "{stdout}"
     );
-    let loose = reasons_under("  loose  UNKNOWN");
     assert!(
-        loose
-            .iter()
-            .any(|l| l.contains("wtree open loose, then wtree adopt there")),
-        "the branch stray has no worktree to adopt yet: {loose:?}\n{stdout}"
+        !stdout.contains("wtree-junk"),
+        "no entries by default:\n{stdout}"
+    );
+
+    // `--unmanaged` is its own screen: the strays under a heading per kind, no
+    // tree above them, and the step to take on the heading.
+    let oe = run_wt(&fx.repo, &["list", "--unmanaged"]);
+    assert_ok(&oe);
+    let entries = out(&oe);
+    // The recovery rides on the heading rather than on every row beneath it.
+    assert!(
+        entries.contains("[unmanaged worktree]  (recover with: wtree adopt)"),
+        "{entries}"
+    );
+    assert!(
+        entries.contains(
+            "[unmanaged branch]  (recover with: wtree open <branch>, then wtree adopt there)"
+        ),
+        "{entries}"
+    );
+    // No tree above them: this view answers one question.
+    assert!(!entries.contains("@ main"), "no tree here:\n{entries}");
+    // The worktree row leads with the path in full — an unmanaged checkout
+    // sits wherever it was made. The branch row is just the branch.
+    assert!(
+        entries.lines().any(|l| l.starts_with('/') && l.ends_with("  junk")),
+        "absolute path then branch:\n{entries}"
+    );
+    assert!(entries.contains("\nloose\n"), "{entries}");
+    // The headings carry the count, so the summary sentence stands down.
+    assert!(!entries.contains("found 2 unmanaged"), "{entries}");
+    // No reason beneath a row: the heading says the step, and `wtree info`
+    // standing in the worktree says why that particular one could not be
+    // judged. A branch stray has only ever one reason, so nothing is lost.
+    assert!(
+        !entries.lines().any(|l| l.trim_start().starts_with('!')),
+        "rows carry no reason lines:\n{entries}"
+    );
+
+    // The level that printed them is gone with them.
+    let od = run_wt(&fx.repo, &["list", "--detail"]);
+    assert_eq!(od.status.code(), Some(2), "{}", err(&od));
+    assert!(
+        err(&od).contains("unknown argument '--detail'"),
+        "{}",
+        err(&od)
+    );
+}
+
+/// A branch no worktree has checked out has nothing for the directory column.
+/// Run together, its divergence would slide left under the directories above it
+/// and read as one, so the columns are sized across every row instead.
+#[test]
+fn list_keeps_the_divergence_column_when_a_row_has_no_directory() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = stage, group:feat\n\n[stage]\n\n[group:feat]\nname-allow = feature/*\n",
+    );
+    // no `v` in either name: the plain glyph for "behind" is `v` too.
+    fx.git(&fx.repo, &["branch", "stage", "main"]); // declared, never opened
+    member(&fx, "feature/a", "feat", "main"); // opened, so it has a directory
+    fx.commit(&fx.repo, "main moves"); // both fall a commit behind
+
+    let stdout = out(&run_wt(&fx.repo, &["list"]));
+    let col = |branch: &str| -> usize {
+        let l = stdout
+            .lines()
+            .find(|l| l.contains(branch))
+            .unwrap_or_else(|| panic!("no row for {branch}:\n{stdout}"));
+        l.find('v').unwrap_or_else(|| panic!("no divergence on {l:?}:\n{stdout}"))
+    };
+    assert_eq!(
+        col("stage"),
+        col("feature/a"),
+        "the counts share a column whether or not the row has a directory:\n{stdout}"
     );
 }
 
@@ -990,7 +1048,7 @@ fn list_indents_a_grandchild_under_its_own_parent() {
     let stdout = out(&run_wt(&fx.repo, &["list"]));
     let l: Vec<&str> = stdout.lines().collect();
     assert_eq!(l.len(), 4, "one row per branch, no section headers:\n{stdout}");
-    assert!(l[0].starts_with("@ main"), "{stdout}");
+    assert!(l[0].starts_with("* main"), "{stdout}");
     assert!(l[1].starts_with("|-+ dev"), "{stdout}");
     // the leading `|` is main's line continuing past dev down to feature/b
     assert!(l[2].starts_with("| `-+ feature/a"), "{stdout}");
@@ -1012,7 +1070,7 @@ fn list_keeps_a_branch_whose_recorded_parent_is_gone() {
         stdout.lines().any(|l| l.starts_with("+ feature/a")),
         "shown at the root, not swallowed:\n{stdout}"
     );
-    assert!(stdout.contains("@ main"), "{stdout}");
+    assert!(stdout.contains("* main"), "{stdout}");
 }
 
 /// The counts are what say `sync` or `merge` is due; nothing else on screen
@@ -1051,7 +1109,7 @@ fn list_counts_divergence_from_the_parent_in_both_directions() {
     );
     assert!(
         both.lines()
-            .any(|l| l.contains("@ main") && !l.contains("^") && !l.contains("v2")),
+            .any(|l| l.contains("* main") && !l.contains("^") && !l.contains("v2")),
         "main is the root — it has no parent to diverge from:\n{both}"
     );
 }
@@ -2189,9 +2247,10 @@ fn close_group_branch_drops_its_record() {
     assert!(!wt.exists());
     assert_eq!(branches(&fx), vec!["feature/a".to_string(), "main".into()]);
     // the record lived in the worktree, so the branch reads as unknown now
-    let l = run_wt(&fx.repo, &["list"]);
+    let l = run_wt(&fx.repo, &["list", "--unmanaged"]);
     assert_ok(&l);
-    assert!(out(&l).contains("feature/a  UNKNOWN"), "{}", out(&l));
+    assert!(out(&l).contains("[unmanaged branch]"), "{}", out(&l));
+    assert!(out(&l).contains("\nfeature/a\n"), "{}", out(&l));
 }
 
 #[test]
