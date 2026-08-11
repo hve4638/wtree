@@ -84,7 +84,9 @@ fn main() -> ExitCode {
             }
         },
         "new" => match parse_new_args(rest) {
-            Ok((name, group)) => verbs::new(&cwd, &name, group.as_deref()),
+            Ok((names, group, dir)) => {
+                verbs::new(&cwd, &names, group.as_deref(), dir.as_deref())
+            }
             Err(ArgErr::Missing) => {
                 verbs::usage_new(&cwd);
                 return ExitCode::from(2);
@@ -112,7 +114,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         },
-        "merge" => match parse_merge_args("merge", rest) {
+        "merge" => match parse_merge_args(rest) {
             Ok((mode, msg)) => verbs::merge(&cwd, mode, msg.as_deref()),
             Err(msg) => {
                 eprintln!("{msg}");
@@ -122,7 +124,7 @@ fn main() -> ExitCode {
         // land inherits merge's mode flag and -m: it runs a merge, and the
         // policy that decides how a merge lands does not change because a
         // destroy follows it.
-        "land" => match parse_merge_args("land", rest) {
+        "land" => match parse_merge_args(rest) {
             Ok((mode, msg)) => verbs::land(&cwd, mode, msg.as_deref()),
             Err(msg) => {
                 eprintln!("{msg}");
@@ -138,7 +140,7 @@ fn main() -> ExitCode {
         },
         "sync" => {
             if args.len() > 1 {
-                eprintln!("wtree sync: takes no arguments");
+                eprintln!("error: takes no arguments");
                 return ExitCode::from(2);
             }
             verbs::sync(&cwd)
@@ -174,34 +176,55 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_new_args(rest: &[String]) -> Result<(String, Option<String>), ArgErr> {
-    let mut name = None;
+type NewArgs = (Vec<String>, Option<String>, Option<String>);
+
+fn parse_new_args(rest: &[String]) -> Result<NewArgs, ArgErr> {
+    let mut names: Vec<String> = Vec::new();
     let mut group = None;
+    let mut dir: Option<String> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--group" => match it.next() {
                 Some(_) if group.is_some() => {
-                    return Err(ArgErr::Bad("wtree new: --group given twice".into()));
+                    return Err(ArgErr::Bad("error: --group given twice".into()));
                 }
                 Some(g) => group = Some(g.clone()),
-                None => return Err(ArgErr::Bad("wtree new: --group requires a value".into())),
+                None => return Err(ArgErr::Bad("error: --group requires a value".into())),
+            },
+            "--dir" => match it.next() {
+                Some(_) if dir.is_some() => {
+                    return Err(ArgErr::Bad("error: --dir given twice".into()));
+                }
+                // A directory name, never a path: the policy owns where
+                // worktrees live, and this only relabels one of them.
+                Some(d) if d.is_empty() || d.contains('/') || d == "." || d == ".." => {
+                    return Err(ArgErr::Bad(format!(
+                        "error: --dir takes a directory name, not a path: '{d}'"
+                    )));
+                }
+                Some(d) => dir = Some(d.clone()),
+                None => return Err(ArgErr::Bad("error: --dir requires a value".into())),
             },
             s if s.starts_with('-') => {
-                return Err(ArgErr::Bad(format!("wtree new: unknown flag '{s}'")));
+                return Err(ArgErr::Bad(format!("error: unknown flag '{s}'")));
             }
-            s if name.is_some() => {
-                return Err(ArgErr::Bad(format!(
-                    "wtree new: unexpected extra argument '{s}'"
-                )));
-            }
-            s => name = Some(s.to_string()),
+            s => names.push(s.to_string()),
         }
     }
-    match name {
-        Some(n) => Ok((n, group)),
-        None => Err(ArgErr::Missing),
+    // Several names each want their own directory, so the one `--dir` names
+    // cannot be shared out. Refusing beats picking a branch to honour it for.
+    if dir.is_some() && names.len() > 1 {
+        return Err(ArgErr::Bad(format!(
+            "error: --dir names one directory, but {} branches were given\n{}",
+            names.len(),
+            wtree::verbs::NEW_USAGE
+        )));
     }
+    if names.is_empty() {
+        return Err(ArgErr::Missing);
+    }
+    Ok((names, group, dir))
 }
 
 /// A missing argument is not the same kind of mistake as a wrong one: `new` and
@@ -221,12 +244,12 @@ fn parse_open_args(rest: &[String]) -> Result<String, ArgErr> {
         match a.as_str() {
             s if s.starts_with('-') => {
                 return Err(ArgErr::Bad(format!(
-                    "wtree open: unknown flag '{s}'\n{OPEN_USAGE}"
+                    "error: unknown flag '{s}'\n{OPEN_USAGE}"
                 )));
             }
             s if branch.is_some() => {
                 return Err(ArgErr::Bad(format!(
-                    "wtree open: unexpected extra argument '{s}'\n{OPEN_USAGE}"
+                    "error: unexpected extra argument '{s}'\n{OPEN_USAGE}"
                 )));
             }
             s => branch = Some(s.to_string()),
@@ -246,13 +269,13 @@ fn parse_close_args(rest: &[String]) -> Result<Option<String>, String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--key" => match it.next() {
-                Some(_) if key.is_some() => return Err("wtree close: --key given twice".into()),
+                Some(_) if key.is_some() => return Err("error: --key given twice".into()),
                 Some(k) => key = Some(k.clone()),
-                None => return Err("wtree close: --key requires a value".into()),
+                None => return Err("error: --key requires a value".into()),
             },
             s => {
                 return Err(format!(
-                    "wtree close: unknown argument '{s}'\n{CLOSE_USAGE}"
+                    "error: unknown argument '{s}'\n{CLOSE_USAGE}"
                 ));
             }
         }
@@ -273,21 +296,21 @@ fn parse_adopt_args(rest: &[String]) -> Result<(Option<String>, bool, String), S
     while let Some(a) = it.next() {
         match a.as_str() {
             "--group" => match it.next() {
-                Some(_) if group.is_some() => return Err("wtree adopt: --group given twice".into()),
+                Some(_) if group.is_some() => return Err("error: --group given twice".into()),
                 Some(g) => group = Some(g.clone()),
-                None => return Err("wtree adopt: --group requires a value".into()),
+                None => return Err("error: --group requires a value".into()),
             },
             "--free" => free = true,
             "--parent" => match it.next() {
                 Some(_) if parent.is_some() => {
-                    return Err("wtree adopt: --parent given twice".into());
+                    return Err("error: --parent given twice".into());
                 }
                 Some(p) => parent = Some(p.clone()),
-                None => return Err("wtree adopt: --parent requires a value".into()),
+                None => return Err("error: --parent requires a value".into()),
             },
             s => {
                 return Err(format!(
-                    "wtree adopt: unknown argument '{s}'\n{ADOPT_USAGE}"
+                    "error: unknown argument '{s}'\n{ADOPT_USAGE}"
                 ));
             }
         }
@@ -295,12 +318,12 @@ fn parse_adopt_args(rest: &[String]) -> Result<(Option<String>, bool, String), S
     match (&group, free) {
         (Some(_), true) => {
             return Err(format!(
-                "wtree adopt: --group and --free are mutually exclusive\n{ADOPT_USAGE}"
+                "error: --group and --free are mutually exclusive\n{ADOPT_USAGE}"
             ));
         }
         (None, false) => {
             return Err(format!(
-                "wtree adopt: one of --group <X> or --free is required\n{ADOPT_USAGE}"
+                "error: one of --group <X> or --free is required\n{ADOPT_USAGE}"
             ));
         }
         _ => {}
@@ -308,14 +331,13 @@ fn parse_adopt_args(rest: &[String]) -> Result<(Option<String>, bool, String), S
     match parent {
         Some(p) => Ok((group, free, p)),
         None => Err(format!(
-            "wtree adopt: --parent <branch> is required\n{ADOPT_USAGE}"
+            "error: --parent <branch> is required\n{ADOPT_USAGE}"
         )),
     }
 }
 
-/// Shared by `merge` and `land`; `verb` only names the one that was typed.
+/// Shared by `merge` and `land`.
 fn parse_merge_args(
-    verb: &str,
     rest: &[String],
 ) -> Result<(Option<rules::MergeMode>, Option<String>), String> {
     let mut mode = None;
@@ -326,18 +348,18 @@ fn parse_merge_args(
             "--squash" | "--rebase" | "--no-ff" | "--ff" => {
                 let m = rules::MergeMode::parse(&a[2..]).expect("flag names mirror mode names");
                 if mode.is_some() {
-                    return Err(format!(
-                        "wtree {verb}: pass exactly one of --squash | --rebase | --no-ff | --ff"
-                    ));
+                    return Err(
+                        "error: pass exactly one of --squash | --rebase | --no-ff | --ff".into(),
+                    );
                 }
                 mode = Some(m);
             }
             "-m" => {
                 let Some(v) = it.next() else {
-                    return Err(format!("wtree {verb}: -m needs a message"));
+                    return Err("error: -m needs a message".into());
                 };
                 if msg.is_some() {
-                    return Err(format!("wtree {verb}: -m given twice"));
+                    return Err("error: -m given twice".into());
                 }
                 // A separated value that looks like a flag is a typo, not a
                 // message; -m<text> is the way to spell a dash-leading one
@@ -345,18 +367,18 @@ fn parse_merge_args(
                 // plainly the value).
                 if v.starts_with('-') && !v.contains(char::is_whitespace) {
                     return Err(format!(
-                        "wtree {verb}: -m takes a value, but '{v}' reads as a flag; write it as -m{v} if it is really the message"
+                        "error: -m takes a value, but '{v}' reads as a flag; write it as -m{v} if it is really the message"
                     ));
                 }
                 msg = Some(v.clone());
             }
             s if s.starts_with("-m") => {
                 if msg.is_some() {
-                    return Err(format!("wtree {verb}: -m given twice"));
+                    return Err("error: -m given twice".into());
                 }
                 msg = Some(s[2..].to_string());
             }
-            s => return Err(format!("wtree {verb}: unknown argument '{s}'")),
+            s => return Err(format!("error: unknown argument '{s}'")),
         }
     }
     Ok((mode, msg))
@@ -373,7 +395,7 @@ fn parse_list_args(rest: &[String]) -> Result<verbs::UnmanagedView, String> {
     for a in rest {
         match a.as_str() {
             "--unmanaged" => entries = true,
-            s => return Err(format!("wtree list: unknown argument '{s}'\n{LIST_USAGE}")),
+            s => return Err(format!("error: unknown argument '{s}'\n{LIST_USAGE}")),
         }
     }
     Ok(if entries {
@@ -396,13 +418,13 @@ fn parse_destroy_args(rest: &[String]) -> Result<(bool, Option<String>), String>
         match a.as_str() {
             "--force" => force = true,
             "--key" => match it.next() {
-                Some(_) if key.is_some() => return Err("wtree destroy: --key given twice".into()),
+                Some(_) if key.is_some() => return Err("error: --key given twice".into()),
                 Some(k) => key = Some(k.clone()),
-                None => return Err("wtree destroy: --key requires a value".into()),
+                None => return Err("error: --key requires a value".into()),
             },
             s => {
                 return Err(format!(
-                    "wtree destroy: unknown argument '{s}'\n{DESTROY_USAGE}"
+                    "error: unknown argument '{s}'\n{DESTROY_USAGE}"
                 ));
             }
         }
@@ -431,11 +453,11 @@ fn parse_init_args(rest: &[String]) -> Result<(verbs::InitMode, bool), String> {
                 force = true;
                 continue;
             }
-            s => return Err(format!("wtree init: unknown argument '{s}'\n{INIT_USAGE}")),
+            s => return Err(format!("error: unknown argument '{s}'\n{INIT_USAGE}")),
         };
         if mode.is_some() {
             return Err(format!(
-                "wtree init: --new and --load are mutually exclusive\n{INIT_USAGE}"
+                "error: --new and --load are mutually exclusive\n{INIT_USAGE}"
             ));
         }
         mode = Some(picked);
@@ -445,12 +467,12 @@ fn parse_init_args(rest: &[String]) -> Result<(verbs::InitMode, bool), String> {
         // Nothing to force: the interactive path asks about overwriting to your
         // face, and there is no template-versus-load decision to pre-answer.
         None if force => Err(format!(
-            "wtree init: --force only applies to --new or --load\n{INIT_USAGE}"
+            "error: --force only applies to --new or --load\n{INIT_USAGE}"
         )),
         // Refused here rather than deeper in: there is nothing to ask on, and a
         // missing flag is a usage error (exit 2) whether or not this is a repo.
         None if !prompt::available() => Err(format!(
-            "wtree init: no terminal to ask on — say which source to use\n  \
+            "error: no terminal to ask on — say which source to use\n  \
              wtree init --new\n  wtree init --load [path]\n{INIT_USAGE}"
         )),
         None => Ok((verbs::InitMode::Ask, false)),
@@ -464,10 +486,10 @@ fn parse_save_args(rest: &[String]) -> Result<(Option<PathBuf>, bool), String> {
         match a.as_str() {
             "--force" => force = true,
             s if s.starts_with("--") => {
-                return Err(format!("wtree save: unknown flag '{s}'\n{SAVE_USAGE}"));
+                return Err(format!("error: unknown flag '{s}'\n{SAVE_USAGE}"));
             }
             s if dest.is_some() => {
-                return Err(format!("wtree save: '{s}' is a second path\n{SAVE_USAGE}"));
+                return Err(format!("error: '{s}' is a second path\n{SAVE_USAGE}"));
             }
             s => dest = Some(PathBuf::from(s)),
         }
@@ -558,7 +580,7 @@ fn cmd_check(path: Option<&str>) -> ExitCode {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("wtree check: cannot read '{path}': {e}");
+            eprintln!("error: cannot read '{path}': {e}");
             return ExitCode::from(2);
         }
     };
@@ -676,41 +698,41 @@ mod tests {
     #[test]
     fn merge_args_modes_and_message() {
         assert_eq!(
-            parse_merge_args("merge", &args(&["--squash", "-m", "msg"])).unwrap(),
+            parse_merge_args(&args(&["--squash", "-m", "msg"])).unwrap(),
             (Some(MergeMode::Squash), Some("msg".into()))
         );
         assert_eq!(
-            parse_merge_args("merge", &args(&["-mjoined", "--no-ff"])).unwrap(),
+            parse_merge_args(&args(&["-mjoined", "--no-ff"])).unwrap(),
             (Some(MergeMode::NoFf), Some("joined".into()))
         );
-        assert_eq!(parse_merge_args("merge", &args(&[])).unwrap(), (None, None));
+        assert_eq!(parse_merge_args(&args(&[])).unwrap(), (None, None));
         // a dash-leading phrase is plainly a value, not a flag
         assert_eq!(
-            parse_merge_args("merge", &args(&["-m", "- fix the thing"]))
+            parse_merge_args(&args(&["-m", "- fix the thing"]))
                 .unwrap()
                 .1,
             Some("- fix the thing".into())
         );
         // land takes the same flags, and says so when it refuses them
         assert_eq!(
-            parse_merge_args("land", &args(&["--rebase"])).unwrap(),
+            parse_merge_args(&args(&["--rebase"])).unwrap(),
             (Some(MergeMode::Rebase), None)
         );
-        let e = parse_merge_args("land", &args(&["--bogus"])).unwrap_err();
-        assert!(e.starts_with("wtree land:"), "{e}");
+        let e = parse_merge_args(&args(&["--bogus"])).unwrap_err();
+        assert!(e.starts_with("error:"), "{e}");
     }
 
     #[test]
     fn merge_args_refusals() {
-        let e = parse_merge_args("merge", &args(&["--squash", "--ff"])).unwrap_err();
+        let e = parse_merge_args(&args(&["--squash", "--ff"])).unwrap_err();
         assert!(e.contains("exactly one"), "{e}");
-        let e = parse_merge_args("merge", &args(&["-m"])).unwrap_err();
+        let e = parse_merge_args(&args(&["-m"])).unwrap_err();
         assert!(e.contains("needs a message"), "{e}");
-        let e = parse_merge_args("merge", &args(&["-m", "--ff"])).unwrap_err();
+        let e = parse_merge_args(&args(&["-m", "--ff"])).unwrap_err();
         assert!(e.contains("reads as a flag"), "{e}");
-        let e = parse_merge_args("merge", &args(&["-m", "a", "-m", "b"])).unwrap_err();
+        let e = parse_merge_args(&args(&["-m", "a", "-m", "b"])).unwrap_err();
         assert!(e.contains("given twice"), "{e}");
-        let e = parse_merge_args("merge", &args(&["--bogus"])).unwrap_err();
+        let e = parse_merge_args(&args(&["--bogus"])).unwrap_err();
         assert!(e.contains("unknown argument"), "{e}");
     }
 

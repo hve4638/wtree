@@ -61,8 +61,18 @@ pub struct Refusal {
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "wtree {}: refused", self.verb)?;
-        writeln!(f, "  {}", self.subject)?;
+        // `refusal:` against `error:` everywhere else. The policy declining a
+        // request is this tool's job rather than a fault, and the two want
+        // different things done about them: one is answered by changing the
+        // rules or the name, the other by fixing what was typed or what is on
+        // disk.
+        //
+        // Verb and subject share the line: alone, a subject like `'main'` does
+        // not say which verb turned it down, and on its own line the verb was
+        // a second heading saying what the marker already said. Subjects
+        // therefore never spell the verb themselves.
+        let head = format!("refusal: {} {}", self.verb, self.subject);
+        writeln!(f, "{}", head.trim_end())?;
         for r in &self.reasons {
             // A reason may carry extra lines (rule citations); indent them.
             let mut lines = r.lines();
@@ -464,12 +474,12 @@ impl<'a> Ctx<'a> {
                     "current worktree is unmanaged — cannot be a parent (fail closed)".to_string(),
                 ];
                 rs.extend(reasons.clone());
-                return refuse("new", "new".to_string(), rs);
+                return refuse("new", String::new(), rs);
             }
             Identity::Free { branch, .. } => {
                 return refuse(
                     "new",
-                    format!("new from '{branch}'"),
+                    format!("from '{branch}'"),
                     vec![format!(
                         "'{branch}' is a free branch — free branches cannot have children (fail closed)"
                     )],
@@ -484,7 +494,7 @@ impl<'a> Ctx<'a> {
         if children.is_empty() {
             return refuse(
                 "new",
-                format!("new from '{parent}'"),
+                format!("from '{parent}'"),
                 vec![format!(
                     "{} declares no children — nothing may be created here (fail closed)",
                     sec_kind.header(&sec_name)
@@ -521,12 +531,12 @@ impl<'a> Ctx<'a> {
         // The gate's subject has no name in it (it judges without one); put it
         // back so the refusal reads as it always has.
         let g = self.gate_new().map_err(|mut r| {
-            r.subject = r.subject.replacen("new", &format!("new '{name}'"), 1);
+            r.subject = format!("'{name}' {}", r.subject).trim_end().to_string();
             r
         })?;
         let (parent, sec_kind, sec_name, star) =
             (g.parent.clone(), g.sec_kind, g.sec_name.clone(), g.star);
-        let subject = format!("new '{name}' from '{parent}'");
+        let subject = format!("'{name}' from '{parent}'");
         if self.world.branches.contains(name) {
             return refuse(
                 "new",
@@ -655,7 +665,7 @@ impl<'a> Ctx<'a> {
     /// written — so the only questions are whether the branch exists and
     /// whether it is free to check out.
     pub fn plan_open(&self, branch: &str) -> Decision<OpenPlan> {
-        let subject = format!("open '{branch}'");
+        let subject = format!("'{branch}'");
         if !self.world.branches.contains(branch) {
             return refuse(
                 "open",
@@ -1426,7 +1436,13 @@ mod tests {
             ctx.plan_merge(None),
             &["unmanaged", "raw switch/rename", "adopt"],
         );
-        refused(ctx.plan_new("feature/b", None), &["cannot be a parent"]);
+        // The gate judges without a name, so its subject is empty and the name
+        // is put in front afterwards. No double space, and no trailing one.
+        let r = refused(ctx.plan_new("feature/b", None), &["cannot be a parent"]);
+        assert_eq!(
+            r.to_string().lines().next().unwrap(),
+            "refusal: new 'feature/b'"
+        );
         fx.git(&wt, &["switch", "-q", "feature/a"]);
 
         // raw rename: record still says the old name
