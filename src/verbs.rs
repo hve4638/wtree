@@ -1580,9 +1580,14 @@ pub fn info(cwd: &Path) -> CmdResult {
     Ok(())
 }
 
-/// The contextual menu — `wtree` with no arguments, or `wtree help`. Lists the
-/// verbs that would get past policy here and nothing else, so the screen is a
-/// truthful answer to "what can I do from this worktree?".
+/// The contextual menu — `wtree` with no arguments. Lists the verbs that would
+/// get past policy here and nothing else, so the screen is a truthful answer to
+/// "what can I do from this worktree?".
+///
+/// `help` and `help --all` still reach this and the manual, undocumented: the
+/// word is what a lost user types first, and turning that into an error to
+/// teach them a shorter spelling is a poor trade. Nothing points at them, so
+/// there is one name on screen for each of the two screens.
 ///
 /// Only the shape of each invocation appears. The data a verb operates on (the
 /// branches `open` would take, the names `new` accepts) belongs to that verb's
@@ -1679,7 +1684,7 @@ pub fn help(cwd: &Path) -> CmdResult {
     for (usage, note) in &rows {
         println!("  {usage:width$}  {note}");
     }
-    println!("\nwtree help --all for every verb, whether or not it applies here");
+    println!("\nwtree -h for every verb, whether or not it applies here");
     Ok(())
 }
 

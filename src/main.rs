@@ -43,7 +43,9 @@ fn main() -> ExitCode {
     // `--help` outranks everything else on the line, wherever it sits. Asking a
     // verb what it does and having it do the thing instead is the one answer
     // that cannot be taken back, and no verb here wants `--help` as a value.
-    if args.iter().any(|a| a == "--help") {
+    // `-h` rides along on the same rule: `-v` already answers for `--version`,
+    // and the pair everyone types blind should not be half missing.
+    if args.iter().any(|a| a == "-h" || a == "--help") {
         help_for(verb);
         return ExitCode::SUCCESS;
     }
@@ -158,8 +160,8 @@ fn main() -> ExitCode {
         "info" => verbs::info(&cwd),
         v => {
             eprintln!("wtree: unknown verb '{v}'");
-            eprintln!("wtree           verbs available where you are");
-            eprintln!("wtree help --all   every verb");
+            eprintln!("wtree      verbs available where you are");
+            eprintln!("wtree -h   every verb");
             return ExitCode::from(2);
         }
     };
@@ -533,7 +535,7 @@ fn help_for(verb: &str) {
     }
 }
 
-/// `wtree help --all` — every verb, judged against nothing. It reads no repo
+/// `wtree -h` — every verb, judged against nothing. It reads no repo
 /// and no rules on purpose: broken rules are when a user most needs to look
 /// something up, and that is exactly when the contextual menu cannot be built.
 fn manual() {
@@ -544,8 +546,8 @@ fn manual() {
     println!("\n-m is required for --squash and --no-ff, and rejected for --rebase and --ff.");
     println!("--key and --force appear only when a verb asks for them.");
     println!("\nwtree (no verb) lists just the verbs available where you are.");
-    println!("wtree <verb> --help prints that verb's line on its own.");
-    println!("wtree --version (or -v) prints the version.");
+    println!("wtree <verb> -h (or --help) prints that verb's line on its own.");
+    println!("wtree -v (or --version) prints the version.");
 }
 
 fn cmd_check(path: Option<&str>) -> ExitCode {

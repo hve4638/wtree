@@ -2634,7 +2634,7 @@ fn the_menu_lists_what_policy_allows_and_hides_what_it_refuses() {
     // list/info are unconditional, and the hint names the way to the rest
     assert!(menu.contains("  list "), "{menu}");
     assert!(menu.contains("  info "), "{menu}");
-    assert!(menu.contains("wtree help --all"), "{menu}");
+    assert!(menu.contains("wtree -h"), "{menu}");
     assert_hidden_verbs_refuse(&fx.repo, &menu);
 
     // A group member: the leaf where the work happens, so nearly everything is.
@@ -2857,12 +2857,45 @@ fn help_anywhere_on_the_line_beats_the_verb() {
         );
     }
 
+    // `-h` is the same rule, not a second one: same reach, same answer.
+    for (short, long) in [
+        (vec!["-h"], vec!["--help"]),
+        (vec!["list", "-h"], vec!["list", "--help"]),
+        (vec!["init", "--new", "-h"], vec!["init", "--new", "--help"]),
+    ] {
+        let s = run_wt(&fx.repo, &short);
+        assert_ok(&s);
+        assert_eq!(out(&s), out(&run_wt(&fx.repo, &long)), "{short:?}");
+    }
+    assert!(!fx.repo.join(".git/wtree").exists(), "-h must not init");
+
     // Broken rules are when a verb's usage is most needed, so it reads none.
     write_rules(&fx, "[main]\nbogus-key = 1\n");
     assert_fail(&run_wt(&fx.repo, &[]));
     let o = run_wt(&fx.repo, &["merge", "--help"]);
     assert_ok(&o);
     assert!(out(&o).contains("merge into the parent"), "{}", out(&o));
+}
+
+/// `help` answers but is never offered: it is the word a lost user reaches for
+/// first, and refusing it to teach a shorter spelling costs them a try. Nothing
+/// on screen names it, so each of the two screens has one advertised way in.
+#[test]
+fn the_help_verb_answers_without_being_advertised() {
+    let fx = Fixture::new();
+    write_rules(&fx, "[main]\nchildren = group:feat\n\n[group:feat]\n");
+
+    assert_eq!(out(&run_wt(&fx.repo, &["help"])), out(&run_wt(&fx.repo, &[])));
+    assert_eq!(
+        out(&run_wt(&fx.repo, &["help", "--all"])),
+        out(&run_wt(&fx.repo, &["-h"]))
+    );
+
+    for a in [vec![], vec!["-h"], vec!["bogus"]] {
+        let o = run_wt(&fx.repo, &a);
+        let all = format!("{}{}", out(&o), String::from_utf8_lossy(&o.stderr));
+        assert!(!all.contains("wtree help"), "{a:?} points at it:\n{all}");
+    }
 }
 
 /// The command is `wtree` and the crate is `gitwtree`, so the version line names
