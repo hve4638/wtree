@@ -28,7 +28,7 @@ pub const RULES_LABEL: &str = ".git/wtree/rules";
 /// `Err` is printed to stderr by main, exit 1.
 pub type CmdResult = Result<(), String>;
 
-pub const NEW_USAGE: &str = "usage: wtree new <name>... [--group G] [--dir <name>]";
+pub const NEW_USAGE: &str = "usage: wtree new <name> [--group G] [--dir <name>]";
 pub const OPEN_USAGE: &str = "usage: wtree open <branch>";
 pub const INIT_USAGE: &str = "usage: wtree init [--new | --load [path]] [--force]";
 pub const SAVE_USAGE: &str = "usage: wtree save [path] [--force]";
@@ -637,15 +637,7 @@ pub fn save(cwd: &Path, dest: Option<&Path>, force: bool) -> CmdResult {
 
 // ------------------------------------------------------------------- new ----
 
-/// Create a branch and its worktree, once per name.
-///
-/// Every name is judged, and every destination checked, before the first one is
-/// made. A batch that stopped at the third name would leave two worktrees the
-/// user has to notice and undo; refusing the whole line leaves nothing to
-/// clean up. Judging up front is sound because one `new` cannot change another's
-/// verdict — the only way it could is by taking the same name or the same
-/// directory, and both are caught right here.
-pub fn new(cwd: &Path, names: &[String], group: Option<&str>, dir: Option<&str>) -> CmdResult {
+pub fn new(cwd: &Path, name: &str, group: Option<&str>, dir: Option<&str>) -> CmdResult {
     let repo = Repo::discover(cwd)?;
     let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
@@ -654,63 +646,23 @@ pub fn new(cwd: &Path, names: &[String], group: Option<&str>, dir: Option<&str>)
         cfg: &cfg,
         label: RULES_LABEL,
     };
+    let plan = ctx.plan_new(name, group).map_err(|r| r.to_string())?;
     let sett = settings::load(&settings_path(&repo.common_dir))?;
     let root = primary_root(&repo)?;
-
-    let mut planned: Vec<(&String, NewPlan, PathBuf)> = Vec::new();
-    for name in names {
-        let plan = ctx.plan_new(name, group).map_err(|r| r.to_string())?;
-        // plan_new weighs the name against the branches that existed when the
-        // world was gathered, which is every name but the ones this line is
-        // about to add. Those are the batch's own to check.
-        if let Some(first) = judge::nested_ref(planned.iter().map(|(n, _, _)| n.as_str()), name) {
-            return Err(format!(
-                "error: '{first}' and '{name}' cannot both be branches: {}",
-                judge::nesting_reason(first, name)
+    let dest = match dir {
+        Some(d) => worktree_dest_in(&root, &sett, d)?,
+        None => worktree_dest(&root, &sett, name)?,
+    };
+    if dest.exists() {
+        let mut msg = occupied(&ctx, &dest);
+        if occupant(&ctx, &dest).is_some() {
+            msg.push_str(&format!(
+                "\n  or put it elsewhere: wtree new {name} --dir <name>"
             ));
         }
-        let dest = match dir {
-            Some(d) => worktree_dest_in(&root, &sett, d)?,
-            None => worktree_dest(&root, &sett, name)?,
-        };
-        if let Some((first, _, _)) = planned.iter().find(|(_, _, d)| *d == dest) {
-            return Err(format!(
-                "error: '{first}' and '{name}' both want {}",
-                dest.display()
-            ));
-        }
-        if dest.exists() {
-            let mut msg = occupied(&ctx, &dest);
-            if occupant(&ctx, &dest).is_some() {
-                msg.push_str(&format!("\n  or put it elsewhere: wtree new {name} --dir <name>"));
-            }
-            return Err(msg);
-        }
-        planned.push((name, plan, dest));
+        return Err(msg);
     }
 
-    // One `cd` is a place to go; several are a question. Printed only when the
-    // line named a single branch, which is also every invocation that existed
-    // before names became plural.
-    let solo = planned.len() == 1;
-    for (name, plan, dest) in planned {
-        create_one(cwd, &repo, &cfg, &world, name, plan, &dest, &root, solo)?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn create_one(
-    cwd: &Path,
-    repo: &Repo,
-    cfg: &Rules,
-    world: &repo::World,
-    name: &str,
-    plan: NewPlan,
-    dest: &Path,
-    root: &Path,
-    solo: bool,
-) -> CmdResult {
     // The section whose `copy` list applies is the one the branch lands in. A
     // free branch has none, so it carries nothing (fail closed).
     let (parent, kind, copy_sec) = match plan {
@@ -751,7 +703,7 @@ fn create_one(
             kind,
             parent: parent.clone(),
         };
-        let written = repo::private_git_dir(dest)
+        let written = repo::private_git_dir(&dest)
             .and_then(|d| state::write(&d, &record).map_err(|e| e.to_string()));
         if let Err(e) = written {
             // Roll back so no unmanaged residue is left behind.
@@ -770,15 +722,13 @@ fn create_one(
         }
     }
 
-    run_post_create(&repo.common_dir, dest, name, &parent, root);
+    run_post_create(&repo.common_dir, &dest, name, &parent, &root);
 
     println!("created '{name}' ({identity}) from '{parent}'");
-    for line in copy_from_parent(world, dest, &parent, &patterns) {
+    for line in copy_from_parent(&world, &dest, &parent, &patterns) {
         println!("{line}");
     }
-    if solo {
-        println!("cd {}", dest.display());
-    }
+    println!("cd {}", dest.display());
     Ok(())
 }
 

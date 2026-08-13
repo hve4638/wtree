@@ -648,75 +648,36 @@ fn new_refusal_prints_judge_reasons_and_creates_nothing() {
     assert_eq!(refs.trim(), "main");
 }
 
-/// Several names on one line, and nothing made unless every one of them passes.
+/// `new` names one branch. A second name is a mistake, not a second worktree.
 #[test]
-fn new_takes_many_names_and_creates_all_or_none() {
+fn new_refuses_a_second_name() {
     let fx = Fixture::new();
     write_rules(&fx, GROUP_CFG);
 
-    let o = run_wt(&fx.repo, &["new", "feature/a", "feature/b", "feature/c"]);
-    assert_ok(&o);
-    for b in ["feature/a", "feature/b", "feature/c"] {
-        assert!(default_dest(&fx, b).exists(), "{b}: {}", out(&o));
-    }
-    // One `cd` is a place to go and three are a question, so a batch prints none.
-    assert!(!out(&o).contains("cd "), "{}", out(&o));
-    assert!(out(&run_wt(&fx.repo, &["new", "feature/solo"])).contains("cd "));
-
-    // A bad name anywhere on the line leaves the good ones unmade.
-    let o = run_wt(&fx.repo, &["new", "feature/d", "junk/x"]);
-    assert_fail(&o);
-    assert!(err(&o).contains("does not match name-allow"), "{}", err(&o));
-    assert!(!default_dest(&fx, "feature/d").exists(), "d was created");
+    let o = run_wt(&fx.repo, &["new", "feature/a", "feature/b"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("unexpected extra argument"), "{}", err(&o));
+    assert!(err(&o).contains("usage: wtree new"), "{}", err(&o));
+    assert_eq!(branches(&fx), vec!["main".to_string()], "{}", err(&o));
+    assert!(!default_dest(&fx, "feature/a").exists(), "a was created");
 }
 
-/// `feature/x` and `feature-x` both fold onto `feature-x`, so a line asking for
-/// both is answered before either is made rather than halfway through.
+/// `feature/a` nests under nothing until `feature/a/b` exists, and then git
+/// cannot hold both. The refusal comes from the policy layer — `fatal: cannot
+/// lock ref` never reaches the reader.
 #[test]
-fn new_refuses_two_names_that_want_one_directory() {
-    let fx = Fixture::new();
-    write_rules(
-        &fx,
-        "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*, feature-*\n",
-    );
-    let o = run_wt(&fx.repo, &["new", "feature/x", "feature-x"]);
-    assert_fail(&o);
-    assert!(err(&o).contains("both want"), "{}", err(&o));
-    assert!(!default_dest(&fx, "feature/x").exists(), "one was created");
-}
-
-/// `feature/a` and `feature/a/b` land in different directories, so only the ref
-/// names collide — a collision git reports halfway through the batch, once the
-/// first branch is already written.
-#[test]
-fn new_refuses_two_names_that_nest_as_refs() {
+fn new_refuses_a_name_that_nests_as_a_ref() {
     let fx = Fixture::new();
     write_rules(&fx, GROUP_CFG);
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
 
-    for pair in [
-        ["feature/a", "feature/a/b"],
-        ["feature/a/b", "feature/a"], // the second one first: same answer
-    ] {
-        let o = run_wt(&fx.repo, &["new", pair[0], pair[1]]);
-        assert_fail(&o);
-        assert!(err(&o).contains("cannot both be branches"), "{}", err(&o));
-        assert_eq!(branches(&fx), vec!["main".to_string()], "{}", err(&o));
-        assert!(
-            !default_dest(&fx, pair[0]).exists(),
-            "{} was created",
-            pair[0]
-        );
-    }
-
-    // Sharing a prefix is not the same as nesting under one.
-    assert_ok(&run_wt(&fx.repo, &["new", "feature/a", "feature/ab"]));
-
-    // A branch already on disk nests by the same rule, and is answered by the
-    // same layer — `fatal: cannot lock ref` never reaches the reader.
     let o = run_wt(&fx.repo, &["new", "feature/a/b"]);
     assert_fail(&o);
     assert!(err(&o).starts_with("refusal:"), "{}", err(&o));
     assert!(!err(&o).contains("fatal:"), "{}", err(&o));
+
+    // Sharing a prefix is not the same as nesting under one.
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/ab"]));
 }
 
 /// The occupant is named, because "already exists" fits three situations that
@@ -777,10 +738,6 @@ fn new_dir_renames_the_directory_but_not_the_place() {
     assert!(!default_dest(&fx, "feature/b").exists(), "{}", out(&o));
 
     for (args, want) in [
-        (
-            vec!["new", "feature/c", "feature/d", "--dir", "x"],
-            "--dir names one directory",
-        ),
         (
             vec!["new", "feature/c", "--dir", "../escape"],
             "not a path",

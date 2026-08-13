@@ -61,7 +61,7 @@ That squash-merges into main and cleans up the worktree and the branch. To merge
 
 | verb | |
 |---|---|
-| `new <name>...` | create a branch and its worktree |
+| `new <name>` | create a branch and its worktree |
 | `open <branch>` | give an existing branch a worktree |
 | `close` | remove the worktree, keep the branch |
 | `merge` | merge into its parent |

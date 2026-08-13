@@ -84,9 +84,7 @@ fn main() -> ExitCode {
             }
         },
         "new" => match parse_new_args(rest) {
-            Ok((names, group, dir)) => {
-                verbs::new(&cwd, &names, group.as_deref(), dir.as_deref())
-            }
+            Ok((name, group, dir)) => verbs::new(&cwd, &name, group.as_deref(), dir.as_deref()),
             Err(ArgErr::Missing) => {
                 verbs::usage_new(&cwd);
                 return ExitCode::from(2);
@@ -184,10 +182,10 @@ fn main() -> ExitCode {
     }
 }
 
-type NewArgs = (Vec<String>, Option<String>, Option<String>);
+type NewArgs = (String, Option<String>, Option<String>);
 
 fn parse_new_args(rest: &[String]) -> Result<NewArgs, ArgErr> {
-    let mut names: Vec<String> = Vec::new();
+    let mut name: Option<String> = None;
     let mut group = None;
     let mut dir: Option<String> = None;
     let mut it = rest.iter();
@@ -217,22 +215,19 @@ fn parse_new_args(rest: &[String]) -> Result<NewArgs, ArgErr> {
             s if s.starts_with('-') => {
                 return Err(ArgErr::Bad(format!("error: unknown flag '{s}'")));
             }
-            s => names.push(s.to_string()),
+            s if name.is_some() => {
+                return Err(ArgErr::Bad(format!(
+                    "error: unexpected extra argument '{s}'\n{}",
+                    wtree::verbs::NEW_USAGE
+                )));
+            }
+            s => name = Some(s.to_string()),
         }
     }
-    // Several names each want their own directory, so the one `--dir` names
-    // cannot be shared out. Refusing beats picking a branch to honour it for.
-    if dir.is_some() && names.len() > 1 {
-        return Err(ArgErr::Bad(format!(
-            "error: --dir names one directory, but {} branches were given\n{}",
-            names.len(),
-            wtree::verbs::NEW_USAGE
-        )));
+    match name {
+        Some(n) => Ok((n, group, dir)),
+        None => Err(ArgErr::Missing),
     }
-    if names.is_empty() {
-        return Err(ArgErr::Missing);
-    }
-    Ok((names, group, dir))
 }
 
 /// A missing argument is not the same kind of mistake as a wrong one: `new` and
