@@ -84,7 +84,9 @@ fn main() -> ExitCode {
             }
         },
         "new" => match parse_new_args(rest) {
-            Ok((name, group, dir)) => verbs::new(&cwd, &name, group.as_deref(), dir.as_deref()),
+            Ok((name, group, dir, no_hooks)) => {
+                verbs::new(&cwd, &name, group.as_deref(), dir.as_deref(), no_hooks)
+            }
             Err(ArgErr::Missing) => {
                 verbs::usage_new(&cwd);
                 return ExitCode::from(2);
@@ -95,7 +97,7 @@ fn main() -> ExitCode {
             }
         },
         "open" => match parse_open_args(rest) {
-            Ok(branch) => verbs::open(&cwd, &branch),
+            Ok((branch, no_hooks)) => verbs::open(&cwd, &branch, no_hooks),
             Err(ArgErr::Missing) => {
                 verbs::usage_open(&cwd);
                 return ExitCode::from(2);
@@ -113,7 +115,7 @@ fn main() -> ExitCode {
             }
         },
         "merge" => match parse_merge_args(rest) {
-            Ok((mode, msg)) => verbs::merge(&cwd, mode, msg.as_deref()),
+            Ok((mode, msg, no_hooks)) => verbs::merge(&cwd, mode, msg.as_deref(), no_hooks),
             Err(msg) => {
                 eprintln!("{msg}");
                 return ExitCode::from(2);
@@ -123,14 +125,14 @@ fn main() -> ExitCode {
         // policy that decides how a merge lands does not change because a
         // destroy follows it.
         "land" => match parse_merge_args(rest) {
-            Ok((mode, msg)) => verbs::land(&cwd, mode, msg.as_deref()),
+            Ok((mode, msg, no_hooks)) => verbs::land(&cwd, mode, msg.as_deref(), no_hooks),
             Err(msg) => {
                 eprintln!("{msg}");
                 return ExitCode::from(2);
             }
         },
         "destroy" => match parse_destroy_args(rest) {
-            Ok((force, key)) => verbs::destroy(&cwd, force, key.as_deref()),
+            Ok((force, key, no_hooks)) => verbs::destroy(&cwd, force, key.as_deref(), no_hooks),
             Err(msg) => {
                 eprintln!("{msg}");
                 return ExitCode::from(2);
@@ -168,12 +170,18 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            // The two words are the contract, so the last hand on the message
-            // guarantees one. Layers under the verbs raise a plain sentence —
-            // they answer a git call or a missing file, not a request, and
-            // cannot tell which word that request deserved.
+            // The three words are the contract, so the last hand on the
+            // message guarantees one. Layers under the verbs raise a plain
+            // sentence — they answer a git call or a missing file, not a
+            // request, and cannot tell which word that request deserved.
+            // `stopped:` may arrive wearing colour, so the check looks at the
+            // words, not the bytes.
             let msg = msg.trim_end();
-            match msg.starts_with("error:") || msg.starts_with("refusal:") {
+            let plain = console::strip_ansi_codes(msg);
+            match ["error:", "refusal:", "stopped:"]
+                .iter()
+                .any(|w| plain.starts_with(w))
+            {
                 true => eprintln!("{msg}"),
                 false => eprintln!("error: {msg}"),
             }
@@ -182,12 +190,13 @@ fn main() -> ExitCode {
     }
 }
 
-type NewArgs = (String, Option<String>, Option<String>);
+type NewArgs = (String, Option<String>, Option<String>, bool);
 
 fn parse_new_args(rest: &[String]) -> Result<NewArgs, ArgErr> {
     let mut name: Option<String> = None;
     let mut group = None;
     let mut dir: Option<String> = None;
+    let mut no_hooks = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -195,12 +204,30 @@ fn parse_new_args(rest: &[String]) -> Result<NewArgs, ArgErr> {
                 Some(_) if group.is_some() => {
                     return Err(ArgErr::Bad("error: --group given twice".into()));
                 }
+                // No value these flags take may start with '-' (git refuses
+                // such branch names, and groups, keys and directory names
+                // follow), so a dash here is always a swallowed flag — same
+                // judgment as -m's, minus its dash-leading-phrase escape.
+                Some(g) if g.starts_with('-') => {
+                    return Err(ArgErr::Bad(format!(
+                        "error: --group takes a value, but '{g}' reads as a flag"
+                    )));
+                }
                 Some(g) => group = Some(g.clone()),
                 None => return Err(ArgErr::Bad("error: --group requires a value".into())),
             },
             "--dir" => match it.next() {
                 Some(_) if dir.is_some() => {
                     return Err(ArgErr::Bad("error: --dir given twice".into()));
+                }
+                // Dash-leading names are refused as a rule, not just flag
+                // lookalikes: a folder every shell command reads as a flag
+                // is a trap, and allowing them would cost the swallowed-flag
+                // check its ground.
+                Some(d) if d.starts_with('-') => {
+                    return Err(ArgErr::Bad(format!(
+                        "error: --dir takes a directory name, and it may not start with '-': '{d}'"
+                    )));
                 }
                 // A directory name, never a path: the policy owns where
                 // worktrees live, and this only relabels one of them.
@@ -212,6 +239,7 @@ fn parse_new_args(rest: &[String]) -> Result<NewArgs, ArgErr> {
                 Some(d) => dir = Some(d.clone()),
                 None => return Err(ArgErr::Bad("error: --dir requires a value".into())),
             },
+            "--no-hooks" => no_hooks = true,
             s if s.starts_with('-') => {
                 return Err(ArgErr::Bad(format!("error: unknown flag '{s}'")));
             }
@@ -225,7 +253,7 @@ fn parse_new_args(rest: &[String]) -> Result<NewArgs, ArgErr> {
         }
     }
     match name {
-        Some(n) => Ok((n, group, dir)),
+        Some(n) => Ok((n, group, dir, no_hooks)),
         None => Err(ArgErr::Missing),
     }
 }
@@ -241,10 +269,12 @@ enum ArgErr {
 
 /// One branch name, no flags: open takes its target as an argument rather than
 /// from cwd, because the branch it attaches a worktree to has none.
-fn parse_open_args(rest: &[String]) -> Result<String, ArgErr> {
+fn parse_open_args(rest: &[String]) -> Result<(String, bool), ArgErr> {
     let mut branch: Option<String> = None;
+    let mut no_hooks = false;
     for a in rest {
         match a.as_str() {
+            "--no-hooks" => no_hooks = true,
             s if s.starts_with('-') => {
                 return Err(ArgErr::Bad(format!(
                     "error: unknown flag '{s}'\n{OPEN_USAGE}"
@@ -258,7 +288,7 @@ fn parse_open_args(rest: &[String]) -> Result<String, ArgErr> {
             s => branch = Some(s.to_string()),
         }
     }
-    branch.ok_or(ArgErr::Missing)
+    branch.map(|b| (b, no_hooks)).ok_or(ArgErr::Missing)
 }
 
 const CLOSE_USAGE: &str = "usage: wtree close [--key <key>]";
@@ -273,13 +303,16 @@ fn parse_close_args(rest: &[String]) -> Result<Option<String>, String> {
         match a.as_str() {
             "--key" => match it.next() {
                 Some(_) if key.is_some() => return Err("error: --key given twice".into()),
+                Some(k) if k.starts_with('-') => {
+                    return Err(format!(
+                        "error: --key takes a value, but '{k}' reads as a flag"
+                    ));
+                }
                 Some(k) => key = Some(k.clone()),
                 None => return Err("error: --key requires a value".into()),
             },
             s => {
-                return Err(format!(
-                    "error: unknown argument '{s}'\n{CLOSE_USAGE}"
-                ));
+                return Err(format!("error: unknown argument '{s}'\n{CLOSE_USAGE}"));
             }
         }
     }
@@ -300,6 +333,11 @@ fn parse_adopt_args(rest: &[String]) -> Result<(Option<String>, bool, String), S
         match a.as_str() {
             "--group" => match it.next() {
                 Some(_) if group.is_some() => return Err("error: --group given twice".into()),
+                Some(g) if g.starts_with('-') => {
+                    return Err(format!(
+                        "error: --group takes a value, but '{g}' reads as a flag"
+                    ));
+                }
                 Some(g) => group = Some(g.clone()),
                 None => return Err("error: --group requires a value".into()),
             },
@@ -308,13 +346,16 @@ fn parse_adopt_args(rest: &[String]) -> Result<(Option<String>, bool, String), S
                 Some(_) if parent.is_some() => {
                     return Err("error: --parent given twice".into());
                 }
+                Some(p) if p.starts_with('-') => {
+                    return Err(format!(
+                        "error: --parent takes a value, but '{p}' reads as a flag"
+                    ));
+                }
                 Some(p) => parent = Some(p.clone()),
                 None => return Err("error: --parent requires a value".into()),
             },
             s => {
-                return Err(format!(
-                    "error: unknown argument '{s}'\n{ADOPT_USAGE}"
-                ));
+                return Err(format!("error: unknown argument '{s}'\n{ADOPT_USAGE}"));
             }
         }
     }
@@ -342,12 +383,14 @@ fn parse_adopt_args(rest: &[String]) -> Result<(Option<String>, bool, String), S
 /// Shared by `merge` and `land`.
 fn parse_merge_args(
     rest: &[String],
-) -> Result<(Option<rules::MergeMode>, Option<String>), String> {
+) -> Result<(Option<rules::MergeMode>, Option<String>, bool), String> {
     let mut mode = None;
     let mut msg: Option<String> = None;
+    let mut no_hooks = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--no-hooks" => no_hooks = true,
             "--squash" | "--rebase" | "--no-ff" | "--ff" => {
                 let m = rules::MergeMode::parse(&a[2..]).expect("flag names mirror mode names");
                 if mode.is_some() {
@@ -384,7 +427,7 @@ fn parse_merge_args(
             s => return Err(format!("error: unknown argument '{s}'")),
         }
     }
-    Ok((mode, msg))
+    Ok((mode, msg, no_hooks))
 }
 
 const LIST_USAGE: &str = "usage: wtree list [--unmanaged]";
@@ -408,31 +451,36 @@ fn parse_list_args(rest: &[String]) -> Result<verbs::UnmanagedView, String> {
     })
 }
 
-const DESTROY_USAGE: &str = "usage: wtree destroy [--force] [--key <key>]";
+const DESTROY_USAGE: &str = "usage: wtree destroy [--force] [--key <key>] [--no-hooks]";
 
 /// `--key` rather than wtree.sh's positional key: the refusal that issues a key
 /// spells the re-run as `wtree destroy --key <key>`, and that message is the
 /// only place a caller ever reads one from.
-fn parse_destroy_args(rest: &[String]) -> Result<(bool, Option<String>), String> {
+fn parse_destroy_args(rest: &[String]) -> Result<(bool, Option<String>, bool), String> {
     let mut force = false;
     let mut key: Option<String> = None;
+    let mut no_hooks = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--force" => force = true,
+            "--no-hooks" => no_hooks = true,
             "--key" => match it.next() {
                 Some(_) if key.is_some() => return Err("error: --key given twice".into()),
+                Some(k) if k.starts_with('-') => {
+                    return Err(format!(
+                        "error: --key takes a value, but '{k}' reads as a flag"
+                    ));
+                }
                 Some(k) => key = Some(k.clone()),
                 None => return Err("error: --key requires a value".into()),
             },
             s => {
-                return Err(format!(
-                    "error: unknown argument '{s}'\n{DESTROY_USAGE}"
-                ));
+                return Err(format!("error: unknown argument '{s}'\n{DESTROY_USAGE}"));
             }
         }
     }
-    Ok((force, key))
+    Ok((force, key, no_hooks))
 }
 
 /// `--new` and `--load` name the two things `init` can do, and one of them has
@@ -508,7 +556,7 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("close", CLOSE_USAGE, "remove a worktree, keep the branch"),
     (
         "merge",
-        "usage: wtree merge [--squash|--rebase|--no-ff|--ff] [-m <msg>]",
+        "usage: wtree merge [--squash|--rebase|--no-ff|--ff] [-m <msg>] [--no-hooks]",
         "merge into the parent",
     ),
     (
@@ -518,7 +566,7 @@ const ROWS: &[(&str, &str, &str)] = &[
     ),
     (
         "land",
-        "usage: wtree land [--squash|--rebase|--no-ff|--ff] [-m <msg>]",
+        "usage: wtree land [--squash|--rebase|--no-ff|--ff] [-m <msg>] [--no-hooks]",
         "merge, then destroy",
     ),
     ("destroy", DESTROY_USAGE, "delete a branch and its worktree"),
@@ -570,6 +618,7 @@ fn manual() {
     }
     println!("\n-m is required for --squash and --no-ff, and rejected for --rebase and --ff.");
     println!("--key and --force appear only when a verb asks for them.");
+    println!("--no-hooks skips this run's hooks, the pre- ones that can refuse included.");
     println!("\nwtree (no verb) lists just the verbs available where you are.");
     println!("wtree <verb> -h (or --help) prints that verb's line on its own.");
     println!("wtree -v (or --version) prints the version.");
@@ -702,13 +751,18 @@ mod tests {
     fn merge_args_modes_and_message() {
         assert_eq!(
             parse_merge_args(&args(&["--squash", "-m", "msg"])).unwrap(),
-            (Some(MergeMode::Squash), Some("msg".into()))
+            (Some(MergeMode::Squash), Some("msg".into()), false)
         );
         assert_eq!(
             parse_merge_args(&args(&["-mjoined", "--no-ff"])).unwrap(),
-            (Some(MergeMode::NoFf), Some("joined".into()))
+            (Some(MergeMode::NoFf), Some("joined".into()), false)
         );
-        assert_eq!(parse_merge_args(&args(&[])).unwrap(), (None, None));
+        assert_eq!(parse_merge_args(&args(&[])).unwrap(), (None, None, false));
+        // --no-hooks is orthogonal to the mode and to -m
+        assert_eq!(
+            parse_merge_args(&args(&["--no-hooks", "--rebase"])).unwrap(),
+            (Some(MergeMode::Rebase), None, true)
+        );
         // a dash-leading phrase is plainly a value, not a flag
         assert_eq!(
             parse_merge_args(&args(&["-m", "- fix the thing"]))
@@ -719,7 +773,7 @@ mod tests {
         // land takes the same flags, and says so when it refuses them
         assert_eq!(
             parse_merge_args(&args(&["--rebase"])).unwrap(),
-            (Some(MergeMode::Rebase), None)
+            (Some(MergeMode::Rebase), None, false)
         );
         let e = parse_merge_args(&args(&["--bogus"])).unwrap_err();
         assert!(e.starts_with("error:"), "{e}");
@@ -741,7 +795,14 @@ mod tests {
 
     #[test]
     fn open_takes_one_branch_and_close_takes_only_a_key() {
-        assert_eq!(parse_open_args(&args(&["feature/a"])).unwrap(), "feature/a");
+        assert_eq!(
+            parse_open_args(&args(&["feature/a"])).unwrap(),
+            ("feature/a".to_string(), false)
+        );
+        assert_eq!(
+            parse_open_args(&args(&["feature/a", "--no-hooks"])).unwrap(),
+            ("feature/a".to_string(), true)
+        );
         // No branch at all is Missing, so the caller can list the candidates.
         assert!(matches!(parse_open_args(&args(&[])), Err(ArgErr::Missing)));
         for (a, needle) in [
@@ -761,6 +822,7 @@ mod tests {
         for (a, needle) in [
             (vec!["--key"], "--key requires a value"),
             (vec!["--key", "a", "--key", "b"], "--key given twice"),
+            (vec!["--key", "--force"], "reads as a flag"),
             // close has no relation layer, so there is no --force to pass it
             (vec!["--force"], "unknown argument '--force'"),
         ] {
@@ -769,16 +831,54 @@ mod tests {
         }
     }
 
+    /// No value a flag takes here may start with '-': git refuses such
+    /// branch names, the rules parser such group names, and --dir refuses
+    /// such directories itself — so a dash after any of these flags is
+    /// always a swallowed flag, not a value.
+    #[test]
+    fn a_flag_is_never_eaten_as_another_flags_value() {
+        for (a, needle) in [
+            (
+                vec!["feat/a", "--group", "--no-hooks"],
+                "--group takes a value, but '--no-hooks' reads as a flag",
+            ),
+            (
+                vec!["feat/a", "--dir", "-sandbox"],
+                "--dir takes a directory name, and it may not start with '-'",
+            ),
+        ] {
+            let Err(ArgErr::Bad(e)) = parse_new_args(&args(&a)) else {
+                panic!("for {a:?}: expected a bad-argument error");
+            };
+            assert!(e.contains(needle), "{e}");
+        }
+        let e = parse_adopt_args(&args(&["--group", "--free", "--parent", "m"])).unwrap_err();
+        assert!(e.contains("--group takes a value"), "{e}");
+        let e = parse_adopt_args(&args(&["--free", "--parent", "--group"])).unwrap_err();
+        assert!(e.contains("--parent takes a value"), "{e}");
+    }
+
     #[test]
     fn destroy_args_force_and_key() {
-        assert_eq!(parse_destroy_args(&args(&[])).unwrap(), (false, None));
+        assert_eq!(
+            parse_destroy_args(&args(&[])).unwrap(),
+            (false, None, false)
+        );
         assert_eq!(
             parse_destroy_args(&args(&["--force", "--key", "ab12c"])).unwrap(),
-            (true, Some("ab12c".into()))
+            (true, Some("ab12c".into()), false)
+        );
+        // --force clears the judge's refusals, --no-hooks the user's own gate:
+        // separate flags because they answer to different authors
+        assert_eq!(
+            parse_destroy_args(&args(&["--no-hooks"])).unwrap(),
+            (false, None, true)
         );
         for (a, needle) in [
             (vec!["--key"], "--key requires a value"),
             (vec!["--key", "a", "--key", "b"], "--key given twice"),
+            // a key never starts with '-', so this is --no-hooks swallowed
+            (vec!["--key", "--no-hooks"], "reads as a flag"),
             // wtree.sh's positional key is not carried over: the refusal that
             // issues one spells --key, so a bare word is a typo
             (vec!["ab12c"], "unknown argument 'ab12c'"),

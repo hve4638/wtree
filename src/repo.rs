@@ -258,39 +258,55 @@ pub fn is_dirty(worktree: &Path) -> Result<bool, String> {
 }
 
 /// First 5 hex chars of a hash over (HEAD oid, diff vs HEAD, untracked file
-/// list) — the destroy confirmation key. Any commit, tracked edit or new
-/// untracked file changes the key, invalidating a stale confirmation.
-/// Hashing is delegated to `git hash-object` to avoid a hash crate.
+/// names and contents) — the destroy confirmation key. Any commit, tracked
+/// edit, new untracked file or rewrite inside one changes the key,
+/// invalidating a stale confirmation. Hashing is delegated to
+/// `git hash-object` to avoid a hash crate.
 pub fn confirmation_key(worktree: &Path) -> Result<String, String> {
     let head = run_git(worktree, &["rev-parse", "HEAD"])?;
     let diff = run_git(worktree, &["diff", "HEAD"])?;
     let untracked = run_git(worktree, &["ls-files", "--others", "--exclude-standard"])?;
-    let material = format!("{head}\0{diff}\0{untracked}");
+    // Names alone would let a rewrite inside an already-untracked file slip
+    // by unnoticed; the contents belong to the state the key confirms.
+    // `--exclude-standard` keeps ignored trees (build output) off this list,
+    // so the per-file hashing stays cheap.
+    let untracked_hashes = if untracked.trim().is_empty() {
+        String::new()
+    } else {
+        run_git_stdin(worktree, &["hash-object", "--stdin-paths"], &untracked)?
+    };
+    let material = format!("{head}\0{diff}\0{untracked}\0{untracked_hashes}");
+    let hex = run_git_stdin(worktree, &["hash-object", "--stdin"], &material)?;
+    Ok(hex.trim().chars().take(5).collect())
+}
+
+/// `run_git` with `input` piped to stdin.
+fn run_git_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String, String> {
+    let name = args.first().copied().unwrap_or("git");
     let mut child = Command::new("git")
-        .current_dir(worktree)
-        .args(["hash-object", "--stdin"])
+        .current_dir(dir)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot run git hash-object: {e}"))?;
+        .map_err(|e| format!("cannot run git {name}: {e}"))?;
     child
         .stdin
         .take()
         .expect("stdin was piped")
-        .write_all(material.as_bytes())
-        .map_err(|e| format!("cannot write to git hash-object: {e}"))?;
+        .write_all(input.as_bytes())
+        .map_err(|e| format!("cannot write to git {name}: {e}"))?;
     let out = child
         .wait_with_output()
-        .map_err(|e| format!("git hash-object failed: {e}"))?;
+        .map_err(|e| format!("git {name} failed: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "git hash-object failed: {}",
+            "git {name} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let hex = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(hex.chars().take(5).collect())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Facts about one worktree, as needed by the judgment core.
@@ -566,9 +582,14 @@ mod tests {
         fx.make_dirty(&wt); // untracked file
         let k2 = confirmation_key(&wt).unwrap();
         assert_ne!(k1, k2);
+        // an untracked file's CONTENTS are part of the state: overwriting them
+        // changes nothing git-visible by name, and the key must still move
+        std::fs::write(wt.join("scratch.txt"), "rewritten\n").unwrap();
+        let k2b = confirmation_key(&wt).unwrap();
+        assert_ne!(k2, k2b);
         fx.commit(&wt, "work"); // HEAD moves
         let k3 = confirmation_key(&wt).unwrap();
-        assert_ne!(k2, k3);
+        assert_ne!(k2b, k3);
         // stable when nothing changes
         assert_eq!(k3, confirmation_key(&wt).unwrap());
     }

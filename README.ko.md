@@ -82,7 +82,7 @@ main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크
 |---|---|
 | `rules` | branch 정책 |
 | `settings` | 워크트리 생성 위치 등 설정 |
-| `hooks/post-create` | `wtree new` 직후 실행되는 훅 |
+| `hooks/` | `new`, `merge`, `destroy` 전후에 실행되는 스크립트 |
 
 `rules`에서 `[X]`는 고정 브랜치, `[group:X]`는 같은 정책을 적용받는 작업 브랜치 그룹이다. `children`은 이 섹션을 부모로 삼을 수 있는 브랜치를 선언한다.
 
@@ -106,6 +106,28 @@ main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크
 | `no-ff` | 머지 커밋 하나 | 유지, 두 번째 부모에 |
 
 `no-ff`는 아무것도 버리지 않으면서 squash처럼 읽힌다. `git log --first-parent`는 브랜치당 한 줄을 보여주고, 그냥 `git log`에는 커밋이 전부 남아 있다.
+
+## 훅
+
+`hooks/` 안의 실행 파일이고, 이름이 곧 실행 시점이다. `init`이 전체 계약을 설명하는 `post-create.sample`을 써 두므로 이름만 바꾸면 켜진다. 여러 이름으로 링크해두고 `$WTREE_HOOK`으로 분기해도 된다.
+
+| 훅 | 실행 시점 |
+|---|---|
+| `pre-create` / `post-create` | `wtree new`과 `wtree open` 전후 |
+| `pre-merge` / `post-merge` | `wtree merge`와 `land`의 병합 단계 전후 |
+| `pre-destroy` / `post-destroy` | `wtree destroy`와 `land`의 삭제 단계 전후 |
+
+`pre-` 훅은 관문이다. 0이 아닌 종료 코드는 아무것도 건드리기 전에 동사를 중단시킨다. `post-` 훅은 보고만 하므로 0이 아닌 종료 코드는 경고로 끝나고 동사가 한 일은 그대로 남는다. `sync`와 `close`는 훅을 실행하지 않는다. `land`에서는 두 관문이 모두 병합 전에 실행되므로 어느 쪽이든 동사 전체를 중단시킬 수 있다.
+
+훅은 워킹트리를 원래대로 두고 나와야 한다. 훅이 새 파일을 남기면 `land`는 그것을 지우는 대신 멈춘다(`stopped:`, 파일과 실행된 훅을 나열). 파일을 처리한 뒤 `wtree destroy`로 마무리하면 된다.
+
+모든 훅이 `WTREE_HOOK`, `WTREE_REPO`, `WTREE_INTERACTIVE`를 받고, 대상 워크트리에 대한 `WTREE_PATH`와 `WTREE_BRANCH`가 따라온다. `WTREE_VERB`는 실제로 타이핑된 동사라, create 쌍은 이것으로 `new`와 `open`을, 나머지 둘은 단독 동사와 `land`를 구분한다. 병합 훅에는 `WTREE_TARGET`, `WTREE_MODE`, `WTREE_MESSAGE`, `WTREE_DIRTY`가, `post-merge`에는 `WTREE_TIP`이 추가된다. 전체 목록은 샘플에 있다.
+
+`--no-hooks`는 그 실행에 한해 `pre-` 훅을 포함한 모든 훅을 건너뛴다. 훅 파일을 잠시 꺼놓고 되돌리는 걸 잊는 상황을 대신한다.
+
+```sh
+wtree merge --squash -m 'fix the thing' --no-hooks
+```
 
 ## 라이선스
 

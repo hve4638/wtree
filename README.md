@@ -82,7 +82,7 @@ That squash-merges into main and cleans up the worktree and the branch. To merge
 |---|---|
 | `rules` | branch policy |
 | `settings` | where worktrees are created, and other settings |
-| `hooks/post-create` | runs right after `wtree new` |
+| `hooks/` | scripts run around `new`, `merge` and `destroy` |
 
 In `rules`, `[X]` is a fixed branch and `[group:X]` is a group of work branches sharing one policy. `children` declares what may take this section as its parent.
 
@@ -106,6 +106,28 @@ What each `merge-mode` leaves in the parent:
 | `no-ff` | one merge commit | kept, on its second parent |
 
 `no-ff` reads as a squash without discarding anything. `git log --first-parent` shows one line per branch, and plain `git log` still has every commit.
+
+## Hooks
+
+Executables in `hooks/`, named after the moment they run at. `init` writes a `post-create.sample` documenting the whole contract; rename it to enable it, or link it under several names and branch on `$WTREE_HOOK`.
+
+| hook | runs |
+|---|---|
+| `pre-create` / `post-create` | around `wtree new` and `wtree open` |
+| `pre-merge` / `post-merge` | around `wtree merge`, and the merge half of `land` |
+| `pre-destroy` / `post-destroy` | around `wtree destroy`, and the destroy half of `land` |
+
+A `pre-` hook is a gate: a non-zero exit aborts the verb before anything has been touched. A `post-` hook only reports, so a non-zero exit is a warning and what the verb did stands. `sync` and `close` run no hooks. Under `land` both gates run before the merge, so either can still abort the whole verb.
+
+A hook must leave the working tree as it found it. New files a hook leaves there make `land` stop (`stopped:`, naming the files and the hooks that ran) rather than force-delete them; `wtree destroy` then finishes the job once they are dealt with.
+
+Each hook gets `WTREE_HOOK`, `WTREE_REPO` and `WTREE_INTERACTIVE`, plus `WTREE_PATH` and `WTREE_BRANCH` for the worktree it concerns. `WTREE_VERB` names the verb that was typed, which is how the create pair tells `new` from `open` and the other two tell a bare verb from `land`'s. The merge pair adds `WTREE_TARGET`, `WTREE_MODE`, `WTREE_MESSAGE` and `WTREE_DIRTY`, and `WTREE_TIP` for `post-merge`. The sample lists all of them.
+
+`--no-hooks` skips every hook for one run, the `pre-` ones included. It takes the place of disabling a hook file and forgetting to put it back:
+
+```sh
+wtree merge --squash -m 'fix the thing' --no-hooks
+```
 
 ## License
 

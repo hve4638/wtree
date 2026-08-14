@@ -6,9 +6,11 @@
 //! renders output.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -28,8 +30,8 @@ pub const RULES_LABEL: &str = ".git/wtree/rules";
 /// `Err` is printed to stderr by main, exit 1.
 pub type CmdResult = Result<(), String>;
 
-pub const NEW_USAGE: &str = "usage: wtree new <name> [--group G] [--dir <name>]";
-pub const OPEN_USAGE: &str = "usage: wtree open <branch>";
+pub const NEW_USAGE: &str = "usage: wtree new <name> [--group G] [--dir <name>] [--no-hooks]";
+pub const OPEN_USAGE: &str = "usage: wtree open <branch> [--no-hooks]";
 pub const INIT_USAGE: &str = "usage: wtree init [--new | --load [path]] [--force]";
 pub const SAVE_USAGE: &str = "usage: wtree save [path] [--force]";
 
@@ -233,7 +235,10 @@ pub fn init(cwd: &Path, mode: InitMode, force: bool) -> CmdResult {
             ""
         }
     );
-    println!("  {}  (rename to post-create to enable)", sample.display());
+    println!(
+        "  {}  (rename to any hook name to enable; it documents all six)",
+        sample.display()
+    );
     if let Some(b) = backup {
         println!(
             "previous {} kept in {}",
@@ -498,27 +503,72 @@ const SETTINGS_TEMPLATE: &str = "\
 
 const HOOK_SAMPLE: &str = "\
 #!/usr/bin/env sh
-# Runs after `wtree new` has created a worktree, with that worktree as the cwd.
-# Rename this file to `post-create` to enable it.
+# Rename this file to one of the six hook names to enable it, or link it under
+# several and branch on $WTREE_HOOK. Six hooks, in pairs:
 #
-#   WT_PATH         absolute path of the new worktree
-#   WT_BRANCH       branch that was created
-#   WT_PARENT       branch it was created from
-#   WT_REPO         primary worktree root
-#   WT_INTERACTIVE  1 when stdout is a terminal, else 0
+#   pre-create   post-create    `wtree new` and `wtree open`
+#   pre-merge    post-merge     `wtree merge`, and the merge half of `wtree land`
+#   pre-destroy  post-destroy   `wtree destroy`, and the destroy half of `land`
 #
-# A non-zero exit is reported as a warning and the worktree is kept either way,
-# so `set -e` is how a failure gets noticed.
+# A `pre-` hook is a gate: a non-zero exit aborts before anything is touched.
+# A `post-` hook only reports, so a non-zero exit is a warning and what the
+# verb did stands. `set -e` is how a failure gets noticed either way.
+# `wtree <verb> --no-hooks` skips both halves for one run.
+#
+# Under `land` both gates run before the merge, so either can still abort the
+# whole verb. Leave the working tree as you found it: new files a hook leaves
+# there make `land` stop (`stopped:`) rather than force-delete them — write
+# scratch output outside the worktree, or clean it up before exiting.
+#
+# Every hook gets:
+#   WTREE_HOOK         which of the six is running
+#   WTREE_REPO         primary worktree root
+#   WTREE_INTERACTIVE  1 when stdout is a terminal, else 0
+# Names a pair does not set arrive empty, never with another run's values.
+#
+# create hooks, cwd = the new worktree (the one you are in, for pre-create):
+#   WTREE_PATH         the worktree — under pre-create, where it will be
+#   WTREE_BRANCH       branch the worktree is for
+#   WTREE_PARENT       its parent; empty under `open` when none is declared
+#   WTREE_VERB         new | open
+#
+# merge hooks, cwd = the worktree being merged:
+#   WTREE_PATH         that worktree
+#   WTREE_BRANCH       branch being merged
+#   WTREE_TARGET       branch it lands on
+#   WTREE_MODE         squash | rebase | no-ff | ff
+#   WTREE_MESSAGE      -m text; empty under --rebase and --ff
+#   WTREE_VERB         merge | land
+#   WTREE_DIRTY        1 when the working tree has uncommitted changes, else 0
+#   WTREE_TIP          post-merge only: the target's tip after the merge
+#
+# destroy hooks, cwd = the worktree (post-destroy: the repo root, it is gone):
+#   WTREE_PATH         the worktree — under post-destroy it no longer exists
+#   WTREE_BRANCH       branch being removed
+#   WTREE_VERB         destroy | land
+#
+# A cascade removes several branches, so the destroy hooks run once per branch.
+# Every pre-destroy runs before the first removal.
 #
 # Files the parent already has belong in the rules' `copy` key; a hook
 # is for what has to be generated here.
 
 set -eu
 
-# cat > .cargo/config.toml <<CFG
+# case \"$WTREE_HOOK\" in
+# post-create)
+#   cat > .cargo/config.toml <<CFG
 # [build]
-# target-dir = \"$WT_REPO/../.wtree-target\"
+# target-dir = \"$WTREE_REPO/../.wtree-target\"
 # CFG
+#   ;;
+# pre-merge)
+#   # Only commits are merged. A dirty tree would make the suite test
+#   # something other than what lands, so refuse to judge it.
+#   [ \"$WTREE_DIRTY\" = 0 ] || { echo 'uncommitted changes; commit first'; exit 1; }
+#   cargo test
+#   ;;
+# esac
 ";
 
 /// DESIGN "root seeding": origin/HEAD symref -> main/master existence ->
@@ -637,7 +687,13 @@ pub fn save(cwd: &Path, dest: Option<&Path>, force: bool) -> CmdResult {
 
 // ------------------------------------------------------------------- new ----
 
-pub fn new(cwd: &Path, name: &str, group: Option<&str>, dir: Option<&str>) -> CmdResult {
+pub fn new(
+    cwd: &Path,
+    name: &str,
+    group: Option<&str>,
+    dir: Option<&str>,
+    no_hooks: bool,
+) -> CmdResult {
     let repo = Repo::discover(cwd)?;
     let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
@@ -679,6 +735,15 @@ pub fn new(cwd: &Path, name: &str, group: Option<&str>, dir: Option<&str>) -> Cm
     let patterns = copy_sec
         .map(|(k, n)| cfg.copy_list(k, &n))
         .unwrap_or_default();
+
+    // Ahead of the placement folder, so a refusal leaves the filesystem as it
+    // was. `WTREE_PATH` names where the worktree is going to be, which does not
+    // exist yet — the cwd is the worktree the branch is being forked from.
+    let hooks = Hooks::new(&repo, no_hooks)?;
+    let hook_env = create_env(&dest, name, &parent, "new");
+    hooks
+        .run("pre-create", &world.current().path, &hook_env)
+        .map_err(|e| format!("error: {e}; nothing was created"))?;
 
     if let Some(base) = dest.parent() {
         fs::create_dir_all(base).map_err(|e| format!("cannot create {}: {e}", base.display()))?;
@@ -722,12 +787,17 @@ pub fn new(cwd: &Path, name: &str, group: Option<&str>, dir: Option<&str>) -> Cm
         }
     }
 
-    run_post_create(&repo.common_dir, &dest, name, &parent, &root);
-
     println!("created '{name}' ({identity}) from '{parent}'");
+    // Before the hook, not after. The two split one job — `copy` carries what
+    // the parent already has, the hook makes what has to be generated here —
+    // and a hook that generates from `.env` has to find it already in place.
     for line in copy_from_parent(&world, &dest, &parent, &patterns) {
         println!("{line}");
     }
+    warn_hook(
+        hooks.run("post-create", &dest, &hook_env),
+        "the worktree was still created",
+    );
     println!("cd {}", dest.display());
     Ok(())
 }
@@ -843,7 +913,7 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 // branch's identity is its rules declaration, and any other branch stays
 // unknown until the user adopts it from the worktree this creates.
 
-pub fn open(cwd: &Path, branch: &str) -> CmdResult {
+pub fn open(cwd: &Path, branch: &str, no_hooks: bool) -> CmdResult {
     let repo = Repo::discover(cwd)?;
     let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
@@ -873,6 +943,18 @@ pub fn open(cwd: &Path, branch: &str) -> CmdResult {
     if dest.exists() {
         return Err(occupied(&ctx, &dest));
     }
+
+    // `open` makes a worktree the same way `new` does, `copy` list and all, so
+    // it answers to the same pair. `WTREE_VERB` is what tells them apart — the
+    // branch here already existed, and its parent is only known once the policy
+    // declares it.
+    let hooks = Hooks::new(&repo, no_hooks)?;
+    let parent = carry.as_ref().map(|(p, _)| p.as_str()).unwrap_or("");
+    let hook_env = create_env(&dest, &plan.branch, parent, "open");
+    hooks
+        .run("pre-create", &world.current().path, &hook_env)
+        .map_err(|e| format!("error: {e}; nothing was opened"))?;
+
     if let Some(base) = dest.parent() {
         fs::create_dir_all(base).map_err(|e| format!("cannot create {}: {e}", base.display()))?;
     }
@@ -883,11 +965,17 @@ pub fn open(cwd: &Path, branch: &str) -> CmdResult {
 
     let identity = if plan.fixed { "fixed" } else { "unknown" };
     println!("opened '{}' ({identity})", plan.branch);
-    if let Some((parent, patterns)) = carry {
-        for line in copy_from_parent(&world, &dest, &parent, &patterns) {
+    // Same order as `new`: what the parent carries lands before the hook that
+    // may be counting on it.
+    if let Some((parent, patterns)) = carry.as_ref() {
+        for line in copy_from_parent(&world, &dest, parent, patterns) {
             println!("{line}");
         }
     }
+    warn_hook(
+        hooks.run("post-create", &dest, &hook_env),
+        "the worktree was still opened",
+    );
     println!("cd {}", dest.display());
     if !plan.fixed {
         println!(
@@ -977,39 +1065,201 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-/// `<common>/wtree/hooks/post-create`, run with cwd = the new worktree and the
-/// WT_* env contract of the legacy mkwt hook. Hook failure is a warning; the
-/// worktree is kept.
-fn run_post_create(common: &Path, wt: &Path, branch: &str, parent: &str, repo_root: &Path) {
-    let hook = hooks_dir(common).join("post-create");
-    let Ok(meta) = fs::metadata(&hook) else {
-        return; // no hook installed
-    };
-    if meta.permissions().mode() & 0o111 == 0 {
-        eprintln!(
-            "warning: {} exists but is not executable — skipped",
-            hook.display()
-        );
-        return;
+// ------------------------------------------------------------------ hooks ----
+//
+// `<common>/wtree/hooks/<name>`, in pairs around the three verbs that change
+// what exists. The two halves of a pair have opposite failure contracts:
+//
+//   pre-*   a gate. Non-zero aborts, and it runs before anything has been
+//           touched, so "nothing was changed" is true when it refuses.
+//   post-*  a report. Non-zero is a warning; what the verb did stands.
+//
+// Policy that can be spelled in `rules` belongs there — the judge is where
+// this codebase keeps its decisions. A `pre-` hook is for what rules cannot
+// reach: a test suite, an external service.
+//
+// `--no-hooks` skips both halves. It names the mechanism rather than a purpose
+// (git's `--no-verify` names one) because a hook here is as free to be a side
+// effect as a check, and skipping it means neither runs.
+
+/// What a hook invocation needs beyond its own name, gathered once per verb so
+/// each call site names only what is specific to it.
+struct Hooks {
+    dir: PathBuf,
+    repo_root: PathBuf,
+    /// `--no-hooks`: every lookup misses, so nothing runs.
+    skip: bool,
+}
+
+impl Hooks {
+    fn new(repo: &Repo, skip: bool) -> Result<Self, String> {
+        Ok(Hooks {
+            dir: hooks_dir(&repo.common_dir),
+            repo_root: primary_root(repo)?,
+            skip,
+        })
     }
-    let interactive = if io::stdout().is_terminal() { "1" } else { "0" };
-    match Command::new(&hook)
-        .current_dir(wt)
-        .env("WT_PATH", wt)
-        .env("WT_BRANCH", branch)
-        .env("WT_PARENT", parent)
-        .env("WT_REPO", repo_root)
-        .env("WT_INTERACTIVE", interactive)
-        .status()
-    {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!(
-            "warning: post-create hook failed (exit {}); the worktree was still created",
-            s.code().unwrap_or(-1)
-        ),
-        Err(e) => {
-            eprintln!("warning: cannot run post-create hook: {e}; the worktree was still created")
+
+    /// Runs `hooks/<name>` with cwd `dir` and `env` on top of the three pairs
+    /// every hook gets. `Ok` when the hook is absent, is not installed
+    /// executable, or exits 0; the caller decides whether an `Err` aborts.
+    ///
+    /// The executable bit is the enable switch (a hook goes live by rename +
+    /// chmod), so a file without it is parked: warned about and skipped, like
+    /// git does. A hook that carries the bit but cannot be run — a broken
+    /// shebang, say — is enabled and failing, and errs like any other spawn
+    /// failure: an enabled gate that did not run is not a pass.
+    ///
+    /// `WTREE_HOOK` names the hook that is running, so one script linked under
+    /// several names can tell which call it is answering.
+    fn run(&self, name: &str, dir: &Path, env: &[(&str, &OsStr)]) -> Result<(), String> {
+        if self.skip {
+            return Ok(());
         }
+        let hook = self.dir.join(name);
+        // Only "not there" means "not installed". Any other answer — an
+        // unreadable hooks/, a file where the directory should be — must not
+        // silently wave a gate through.
+        let meta = match fs::metadata(&hook) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("cannot read {}: {e}", hook.display())),
+        };
+        if meta.permissions().mode() & 0o111 == 0 {
+            eprintln!(
+                "warning: {} exists but is not executable — skipped",
+                hook.display()
+            );
+            return Ok(());
+        }
+        let interactive = if io::stdout().is_terminal() { "1" } else { "0" };
+        let mut cmd = Command::new(&hook);
+        cmd.current_dir(dir)
+            .env("WTREE_HOOK", name)
+            .env("WTREE_REPO", &self.repo_root)
+            .env("WTREE_INTERACTIVE", interactive);
+        // Every name any hook can get, blanked first: a wtree run from inside
+        // a hook (or any shell that exports WTREE_*) would otherwise hand this
+        // hook another invocation's values for the names its own pair does not
+        // set. Empty already means "absent here" (WTREE_MESSAGE, WTREE_PARENT).
+        for n in [
+            "WTREE_PATH",
+            "WTREE_BRANCH",
+            "WTREE_PARENT",
+            "WTREE_VERB",
+            "WTREE_TARGET",
+            "WTREE_MODE",
+            "WTREE_MESSAGE",
+            "WTREE_DIRTY",
+            "WTREE_TIP",
+        ] {
+            cmd.env(n, "");
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        match cmd.status() {
+            Ok(s) if s.success() => Ok(()),
+            // No code means the hook did not exit — a signal took it down.
+            Ok(s) => Err(match (s.code(), s.signal()) {
+                (Some(c), _) => format!("{name} hook failed (exit {c})"),
+                (None, Some(sig)) => format!("{name} hook failed (signal {sig})"),
+                (None, None) => format!("{name} hook failed (no exit status)"),
+            }),
+            Err(e) => Err(format!("cannot run {name} hook: {e}")),
+        }
+    }
+
+    /// The paths under `names` that could actually have run — the suspects a
+    /// `stopped:` diagnostic lists. Empty under `--no-hooks`, and a hook
+    /// `run` skipped as non-executable is no suspect either.
+    fn installed(&self, names: &[&str]) -> Vec<PathBuf> {
+        if self.skip {
+            return Vec::new();
+        }
+        names
+            .iter()
+            .map(|n| self.dir.join(n))
+            .filter(|p| {
+                fs::metadata(p)
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+}
+
+/// What `git status --porcelain` reports in `wt`, as bare paths. Under `land`
+/// the preflight saw a clean tree, so anything here appeared during the run.
+fn tree_changes(wt: &Path) -> Result<Vec<String>, String> {
+    Ok(repo::run_git(wt, &["status", "--porcelain"])?
+        .lines()
+        .map(|l| l.get(3..).unwrap_or(l).trim().to_string())
+        .collect())
+}
+
+/// `tree_changes` over every worktree the destroy half will touch — the
+/// cascade's ephemeral children included, since a hook can write into any of
+/// them. Entries outside `current` carry the branch that owns them.
+fn targets_changes(targets: &[Target], current: &Path) -> Result<Vec<String>, String> {
+    let mut all = Vec::new();
+    for t in targets {
+        for f in tree_changes(&t.path)? {
+            if t.path == current {
+                all.push(f);
+            } else {
+                all.push(format!("{f}  (in '{}')", t.branch));
+            }
+        }
+    }
+    Ok(all)
+}
+
+/// The third diagnostic word. `error:` is a fault and `refusal:` is policy
+/// declining a request; `stopped:` is `land` halting between its steps because
+/// the working tree stopped being the clean one the preflight approved. The
+/// expected cause is a hook writing into the worktree, so the hooks that held
+/// the pen since the last clean check are named — force-deleting the files
+/// instead would discard data nothing can recover (untracked files live in no
+/// git object).
+fn stopped(headline: &str, appeared: &str, files: &[String], pens: &[PathBuf]) -> String {
+    let mut msg = format!("{} {headline}", style("stopped:").red().for_stderr());
+    msg.push_str(&format!("\n  {appeared}"));
+    for f in files {
+        msg.push_str(&format!("\n    {}", style(f).yellow().for_stderr()));
+    }
+    if !pens.is_empty() {
+        msg.push_str("\n  a hook may be writing into the worktree:");
+        for p in pens {
+            msg.push_str(&format!("\n    {}", p.display()));
+        }
+    }
+    msg
+}
+
+/// The create pair's environment, shared by the two verbs that make a
+/// worktree. `parent` is empty when there is none to name: `open` attaches a
+/// branch that may not be under the policy yet, and an unmanaged branch has no
+/// recorded parent — the same empty-for-absent spelling `WTREE_MESSAGE` uses.
+fn create_env<'a>(
+    dest: &'a Path,
+    branch: &'a str,
+    parent: &'a str,
+    verb: &'a str,
+) -> [(&'static str, &'a OsStr); 4] {
+    [
+        ("WTREE_PATH", dest.as_os_str()),
+        ("WTREE_BRANCH", OsStr::new(branch)),
+        ("WTREE_PARENT", OsStr::new(parent)),
+        ("WTREE_VERB", OsStr::new(verb)),
+    ]
+}
+
+/// A `post-` hook's failure changes nothing about what the verb did, so it is
+/// reported beside what stands rather than raised.
+fn warn_hook(r: Result<(), String>, stands: &str) {
+    if let Err(e) = r {
+        eprintln!("warning: {e}; {stands}");
     }
 }
 
@@ -1186,7 +1436,10 @@ fn unmanaged_summary(strays: &[Stray]) -> String {
             plural(br, "branch", "branches")
         )
     } else if wt > 0 {
-        format!("found {wt} unmanaged {}", plural(wt, "worktree", "worktrees"))
+        format!(
+            "found {wt} unmanaged {}",
+            plural(wt, "worktree", "worktrees")
+        )
     } else {
         format!("found {br} unmanaged {}", plural(br, "branch", "branches"))
     }
@@ -1213,7 +1466,11 @@ pub fn list(cwd: &Path, view: UnmanagedView) -> CmdResult {
         cfg: &cfg,
         label: RULES_LABEL,
     };
-    let g = if io::stdout().is_terminal() { &TREE_PRETTY } else { &TREE_PLAIN };
+    let g = if io::stdout().is_terminal() {
+        &TREE_PRETTY
+    } else {
+        &TREE_PLAIN
+    };
 
     let mut nodes: Vec<Node> = Vec::new();
     let mut parent_of: Vec<Option<String>> = Vec::new();
@@ -1261,7 +1518,10 @@ pub fn list(cwd: &Path, view: UnmanagedView) -> CmdResult {
             });
             continue;
         }
-        let branch = id.branch().expect("a judged identity names its branch").to_string();
+        let branch = id
+            .branch()
+            .expect("a judged identity names its branch")
+            .to_string();
         let (parent, div) = match ctx.parent_of(&id) {
             Some((p, _)) => {
                 let d = divergence_text(g, divergence(&repo.common_dir, &branch, &p));
@@ -1379,7 +1639,11 @@ pub fn list(cwd: &Path, view: UnmanagedView) -> CmdResult {
         };
         format!("{gutter}{} {name}", n.mark)
     };
-    let natural = rows.iter().map(|r| display_width(&head_of(r))).max().unwrap_or(0);
+    let natural = rows
+        .iter()
+        .map(|r| display_width(&head_of(r)))
+        .max()
+        .unwrap_or(0);
     // Piped output is never cut: a reader that is not a terminal is grepping or
     // diffing, and half a branch name serves neither. On a terminal, one long
     // name would otherwise push every row's tail past the right edge, so the
@@ -1910,7 +2174,12 @@ pub fn adopt(cwd: &Path, group: Option<&str>, free: bool, parent: &str) -> CmdRe
 // refuses the fast-forward by itself when it would overwrite work in
 // progress there, and leaves unrelated work in progress alone.
 
-pub fn merge(cwd: &Path, mode_flag: Option<MergeMode>, msg: Option<&str>) -> CmdResult {
+pub fn merge(
+    cwd: &Path,
+    mode_flag: Option<MergeMode>,
+    msg: Option<&str>,
+    no_hooks: bool,
+) -> CmdResult {
     let repo = Repo::discover(cwd)?;
     let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
@@ -1931,7 +2200,8 @@ pub fn merge(cwd: &Path, mode_flag: Option<MergeMode>, msg: Option<&str>) -> Cmd
             plan.source, plan.target
         ));
     }
-    run_merge(&world, &plan, commit_msg, false)
+    let hooks = Hooks::new(&repo, no_hooks)?;
+    run_merge(&world, &plan, commit_msg, None, &hooks)
 }
 
 /// The message rule depends on the judged mode (the flag may be omitted when
@@ -1978,15 +2248,20 @@ fn has_changes_to_merge(world: &repo::World, plan: &MergePlan) -> Result<bool, S
     }
 }
 
-/// The execution half of merge, shared with `land`. `in_land` suppresses the
-/// "worktree kept" note and the destroy hint (the worktree is about to go) and
-/// attributes errors to the verb that was typed.
+/// The execution half of merge, shared with `land`. `land_targets` carries the
+/// destroy half's targets when the caller is `land`: their `pre-destroy` gates
+/// run here, after the merge gate and before the merge, so every gate has
+/// spoken while "nothing has happened" is still literally true. It also
+/// suppresses the "worktree kept" note and the destroy hint (the worktree is
+/// about to go) and attributes errors to the verb that was typed.
 fn run_merge(
     world: &repo::World,
     plan: &MergePlan,
     commit_msg: Option<&str>,
-    in_land: bool,
+    land_targets: Option<&[Target]>,
+    hooks: &Hooks,
 ) -> CmdResult {
+    let in_land = land_targets.is_some();
     let verb = if in_land { "land" } else { "merge" };
     let (branch, target, mode) = (plan.source.clone(), plan.target.clone(), plan.mode);
     let wt = world.current().path.clone();
@@ -1999,6 +2274,61 @@ fn run_merge(
         .find(|f| f.head.as_deref() == Some(target.as_str()))
         .map(|f| f.path.clone());
 
+    // Every mode's gate, ahead of even the conflict precheck: `pre-merge` is
+    // the one hook likely to run a test suite, and a suite that decides the
+    // merge should not happen must be able to assume nothing has. That the
+    // working tree may still be dirty here is the hook's to check — `land`
+    // refuses a dirty tree by itself, and stashing before a veto would put
+    // the caller's work somewhere they did not ask for.
+    let mode_str = mode.as_str();
+    let merge_env: [(&str, &OsStr); 7] = [
+        ("WTREE_PATH", wt.as_os_str()),
+        ("WTREE_BRANCH", OsStr::new(branch.as_str())),
+        ("WTREE_TARGET", OsStr::new(target.as_str())),
+        ("WTREE_MODE", OsStr::new(mode_str)),
+        // Empty under --rebase and --ff, which take no message.
+        ("WTREE_MESSAGE", OsStr::new(commit_msg.unwrap_or(""))),
+        // `land` is a merge that a destroy follows; the hook may care.
+        ("WTREE_VERB", OsStr::new(verb)),
+        // Only commits are merged: a gate that builds or tests the tree is
+        // judging something else whenever this is 1.
+        (
+            "WTREE_DIRTY",
+            OsStr::new(if world.current().dirty { "1" } else { "0" }),
+        ),
+    ];
+    hooks
+        .run("pre-merge", &wt, &merge_env)
+        .map_err(|e| format!("error: {e}; nothing was changed"))?;
+
+    if let Some(targets) = land_targets {
+        gate_destroy(hooks, targets, verb, "; nothing was changed")?;
+        // land's preflight approved clean trees, and the gates above are the
+        // only thing that has run since: anything in them now is theirs, and
+        // merging would either sweep it into the squash commit or leave it
+        // for the destroy half to force-delete. Stop while both halves are
+        // still undone.
+        let dirt = targets_changes(targets, &wt)?;
+        if !dirt.is_empty() {
+            let mut msg = stopped(
+                "the working tree is no longer clean, so the merge did not start",
+                "files that appeared while the gates ran:",
+                &dirt,
+                &hooks.installed(&["pre-merge", "pre-destroy"]),
+            );
+            msg.push_str(
+                "\n  a hook must leave the tree as it found it; clean this up, then re-run\
+                 \n\
+                 \n    wtree land\
+                 \n\
+                 \n  or, if the hook keeps writing, skip every hook for one run\
+                 \n\
+                 \n    wtree land --no-hooks",
+            );
+            return Err(msg);
+        }
+    }
+
     // --ff never rewrites this branch and never creates a commit, so there is
     // nothing to precheck, stash or roll back: either the target can simply
     // advance, or the merge is refused — ff-only with no fallback (DESIGN).
@@ -2010,10 +2340,9 @@ fn run_merge(
         }
         ff_target(&wt, target_wt.as_deref(), &target, &branch, verb)
             .map_err(|e| format!("error: {e}; nothing was changed"))?;
-        println!(
-            "fast-forwarded '{target}' to '{branch}' ({})",
-            short_head(&wt)
-        );
+        let tip = short_head(&wt);
+        println!("fast-forwarded '{target}' to '{branch}' ({tip})");
+        run_post_merge(hooks, &wt, &merge_env, &tip);
         print_kept(&wt, in_land);
         return Ok(());
     }
@@ -2150,8 +2479,21 @@ fn run_merge(
             MergeMode::Ff => unreachable!("returned above"),
         }
     }
+    run_post_merge(hooks, &wt, &merge_env, &tip);
     print_kept(&wt, in_land);
     Ok(())
+}
+
+/// `post-merge` from either exit of `run_merge`, with the tip the merge
+/// produced added to what `pre-merge` was given. Under `land` this still runs
+/// in the source worktree — the destroy that follows has not happened yet.
+fn run_post_merge(hooks: &Hooks, wt: &Path, base: &[(&str, &OsStr)], tip: &str) {
+    let mut env = base.to_vec();
+    env.push(("WTREE_TIP", OsStr::new(tip)));
+    warn_hook(
+        hooks.run("post-merge", wt, &env),
+        "the merge already happened",
+    );
 }
 
 /// Under `land` the worktree is about to go, so neither the "kept" note nor
@@ -2223,7 +2565,7 @@ pub fn sync(cwd: &Path) -> CmdResult {
 // ordered leaf first, so running it in order never removes a parent before its
 // ephemeral children.
 
-pub fn destroy(cwd: &Path, force: bool, key: Option<&str>) -> CmdResult {
+pub fn destroy(cwd: &Path, force: bool, key: Option<&str>, no_hooks: bool) -> CmdResult {
     let repo = Repo::discover(cwd)?;
     let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
@@ -2234,7 +2576,9 @@ pub fn destroy(cwd: &Path, force: bool, key: Option<&str>) -> CmdResult {
     };
     let plan = ctx.plan_destroy(force, key).map_err(|r| r.to_string())?;
     let targets = resolve_targets(&world, &plan)?;
-    execute_destroy(&primary_root(&repo)?, &targets, "")
+    let hooks = Hooks::new(&repo, no_hooks)?;
+    gate_destroy(&hooks, &targets, "destroy", "\n  nothing was removed")?;
+    execute_destroy(&primary_root(&repo)?, &targets, "", "destroy", &hooks)
 }
 
 /// One branch of a destroy plan, with what removing it needs.
@@ -2245,6 +2589,9 @@ struct Target {
     /// destroy the judge cleared through the confirmation key needs `--force`
     /// to carry out what the key confirmed.
     dirty: bool,
+    /// The worktree's confirmation key as the approved plan saw it — the
+    /// exact state any `--force` below is entitled to discard.
+    key: Option<String>,
 }
 
 /// Every branch in the plan, cascade first, paired with the worktree that
@@ -2263,6 +2610,7 @@ fn resolve_targets(world: &repo::World, plan: &DestroyPlan) -> Result<Vec<Target
                     branch: b.clone(),
                     path: f.path.clone(),
                     dirty: f.dirty,
+                    key: f.confirmation_key.clone(),
                 })
                 .ok_or_else(|| {
                     format!("error: '{b}' has no worktree to remove; nothing was changed")
@@ -2271,24 +2619,69 @@ fn resolve_targets(world: &repo::World, plan: &DestroyPlan) -> Result<Vec<Target
         .collect()
 }
 
+/// Every `pre-destroy` gate, for the whole cascade, before the first removal.
+/// A gate that refused partway through the removals would already have taken
+/// the branches ahead of it with no way to put them back — the same reason
+/// `land` judges both of its halves before merging. Under `land` these run
+/// before even the merge, so a veto still aborts the verb whole; `suffix` is
+/// how each caller says what had (not) happened by then.
+fn gate_destroy(hooks: &Hooks, targets: &[Target], verb: &str, suffix: &str) -> CmdResult {
+    for t in targets {
+        hooks
+            .run(
+                "pre-destroy",
+                &t.path,
+                &[
+                    ("WTREE_PATH", t.path.as_os_str()),
+                    ("WTREE_BRANCH", OsStr::new(t.branch.as_str())),
+                    ("WTREE_VERB", OsStr::new(verb)),
+                ],
+            )
+            .map_err(|e| format!("error: {e}{suffix}"))?;
+    }
+    Ok(())
+}
+
 /// Remove each target in order. A failure stops the run and names exactly how
 /// far it got — under `land` the removals sit after a merge that already
-/// succeeded, and git's own error says nothing about that.
-fn execute_destroy(root: &Path, targets: &[Target], note: &str) -> CmdResult {
+/// succeeded, and git's own error says nothing about that. The gates have
+/// already run (`gate_destroy`); this half only acts.
+fn execute_destroy(
+    root: &Path,
+    targets: &[Target],
+    note: &str,
+    // Only the hooks need it: the messages carry `error:` and name the branch,
+    // but `WTREE_VERB` is how a hook tells a bare destroy from `land`'s.
+    verb: &str,
+    hooks: &Hooks,
+) -> CmdResult {
     for (i, t) in targets.iter().enumerate() {
-        let Err(e) = remove_one(root, t) else {
-            continue;
-        };
-        let mut msg = format!("error: {e}{note}");
-        let done: Vec<&str> = targets[..i].iter().map(|t| t.branch.as_str()).collect();
-        if done.is_empty() {
-            msg.push_str("\n  nothing was removed");
-        } else {
-            msg.push_str(&format!("\n  already removed: {}", done.join(", ")));
+        if let Err(e) = remove_one(root, t) {
+            let mut msg = format!("error: {e}{note}");
+            let done: Vec<&str> = targets[..i].iter().map(|t| t.branch.as_str()).collect();
+            if done.is_empty() {
+                msg.push_str("\n  nothing was removed");
+            } else {
+                msg.push_str(&format!("\n  already removed: {}", done.join(", ")));
+            }
+            let left: Vec<&str> = targets[i..].iter().map(|t| t.branch.as_str()).collect();
+            msg.push_str(&format!("\n  still present: {}", left.join(", ")));
+            return Err(msg);
         }
-        let left: Vec<&str> = targets[i..].iter().map(|t| t.branch.as_str()).collect();
-        msg.push_str(&format!("\n  still present: {}", left.join(", ")));
-        return Err(msg);
+        // The worktree is gone, so there is nowhere to stand but the primary
+        // root; `WTREE_PATH` is the path that was removed and no longer exists.
+        warn_hook(
+            hooks.run(
+                "post-destroy",
+                root,
+                &[
+                    ("WTREE_PATH", t.path.as_os_str()),
+                    ("WTREE_BRANCH", OsStr::new(t.branch.as_str())),
+                    ("WTREE_VERB", OsStr::new(verb)),
+                ],
+            ),
+            "the branch was already removed",
+        );
     }
     Ok(())
 }
@@ -2299,8 +2692,25 @@ fn remove_one(root: &Path, t: &Target) -> Result<(), String> {
         .to_str()
         .ok_or_else(|| format!("worktree path {} is not valid UTF-8", t.path.display()))?;
     let mut args = vec!["worktree", "remove"];
-    if t.dirty {
-        args.push("--force");
+    // What is removed must be the exact state the plan judged, so the
+    // confirmation key — HEAD, tracked diff, untracked names and contents —
+    // is recomputed against the plan's snapshot for every target, clean plans
+    // included: a hook's write shows up as dirt, but a hook's COMMIT is clean
+    // by every dirtiness test and would still be discarded by `branch -D`.
+    // Any change, and any error answering, refuses; `--force` (what a dirty
+    // plan's key approved) rides only on an exact match.
+    match (repo::confirmation_key(&t.path), &t.key) {
+        (Ok(now), Some(approved)) if now == *approved => {
+            if t.dirty {
+                args.push("--force");
+            }
+        }
+        _ => {
+            return Err(format!(
+                "'{}' changed since its removal was approved — nothing confirmed discarding what is there now",
+                t.branch
+            ));
+        }
     }
     args.push(path);
     repo::run_git(root, &args)
@@ -2388,7 +2798,12 @@ pub fn close(cwd: &Path, key: Option<&str>) -> CmdResult {
 
 const LAND_NOTE: &str = "\n  the merge before it already succeeded";
 
-pub fn land(cwd: &Path, mode_flag: Option<MergeMode>, msg: Option<&str>) -> CmdResult {
+pub fn land(
+    cwd: &Path,
+    mode_flag: Option<MergeMode>,
+    msg: Option<&str>,
+    no_hooks: bool,
+) -> CmdResult {
     let repo = Repo::discover(cwd)?;
     let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
@@ -2411,17 +2826,19 @@ pub fn land(cwd: &Path, mode_flag: Option<MergeMode>, msg: Option<&str>) -> CmdR
         ));
     }
     let preflight = plan_destroy_for_land(&ctx).map_err(as_land)?;
-    // Resolved and discarded: it proves every branch the destroy half will
-    // touch still has a worktree, while nothing has happened yet.
-    let _ = resolve_targets(&world, &preflight)?;
+    // Resolved for the gates below, and to prove every branch the destroy
+    // half will touch still has a worktree, while nothing has happened yet.
+    let preflight_targets = resolve_targets(&world, &preflight)?;
 
+    let hooks = Hooks::new(&repo, no_hooks)?;
     let merged = has_changes_to_merge(&world, &plan)?;
     if merged {
-        run_merge(&world, &plan, commit_msg, true)?;
+        run_merge(&world, &plan, commit_msg, Some(&preflight_targets), &hooks)?;
     } else {
         // Not a failure: there is nothing to publish, so the cleanup is the
         // whole remaining job — and it is the state a successful `merge`
         // leaves behind, which is the documented way to reach `land`.
+        gate_destroy(&hooks, &preflight_targets, "land", "; nothing was changed")?;
         println!(
             "nothing to merge onto '{}'; going straight to destroy",
             plan.target
@@ -2437,10 +2854,176 @@ pub fn land(cwd: &Path, mode_flag: Option<MergeMode>, msg: Option<&str>) -> CmdR
         cfg: &cfg,
         label: RULES_LABEL,
     };
+
+    let (merge_source, merge_target) = (plan.source.clone(), plan.target.clone());
+
+    // "nothing to merge" was decided before the gates ran, and a gate that
+    // commits reverses it: the destroy below would then discard that commit
+    // on land's own key. The question is re-asked here, after the gates and
+    // the fresh gather; the merged path's answer is the reflected-in-target
+    // check further down.
+    if !merged && has_changes_to_merge(&world, &plan)? {
+        let stray = repo::run_git(
+            &world.current().path,
+            &[
+                "log",
+                "--oneline",
+                &format!("{merge_target}..{merge_source}"),
+            ],
+        )
+        .unwrap_or_default();
+        let commits: Vec<String> = stray.lines().map(str::to_string).collect();
+        let mut msg = stopped(
+            &format!(
+                "'{merge_source}' gained work to merge while the gates ran, so it was not destroyed"
+            ),
+            "commits that appeared during the run:",
+            &commits,
+            &hooks.installed(&["pre-merge", "pre-destroy"]),
+        );
+        msg.push_str(
+            "\n  a hook may have committed them; publish them with another\
+             \n\
+             \n    wtree land",
+        );
+        return Err(msg);
+    }
+
     let plan =
         plan_destroy_for_land(&ctx).map_err(|r| format!("{}{note}", as_land(r).trim_end()))?;
     let targets = resolve_targets(&world, &plan)?;
-    execute_destroy(&primary_root(&repo)?, &targets, note)
+
+    // The gates spoke for the preflight's target set, identified by branch,
+    // worktree AND state: a member that appeared, vanished, moved or was
+    // replaced under the same name (a hook destroying and recreating it) is
+    // one no gate's judgment covers. Only the subject's key is exempt — the
+    // merge legitimately moved its state, and the reflected-in-target check
+    // below covers what the exemption gives up — its branch and worktree are
+    // held to the same identity as everyone else's. Refuse the whole destroy
+    // half rather than remove what nothing gated.
+    let snapshot = |ts: &[Target]| -> BTreeMap<String, (PathBuf, Option<String>)> {
+        let subject = ts.len().saturating_sub(1);
+        ts.iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let key = if i == subject { None } else { t.key.clone() };
+                (t.branch.clone(), (t.path.clone(), key))
+            })
+            .collect()
+    };
+    let before = snapshot(&preflight_targets);
+    let after = snapshot(&targets);
+    if before != after {
+        let drifted: Vec<String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|b| before.get(*b) != after.get(*b))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let headline = if merged {
+            format!(
+                "merged onto '{merge_target}', but the destroy plan changed since the gates ran, so nothing was removed"
+            )
+        } else {
+            "the destroy plan changed since the gates ran, so nothing was removed".to_string()
+        };
+        let mut msg = stopped(
+            &headline,
+            "branches whose worktrees changed during the run:",
+            &drifted,
+            &hooks.installed(if merged {
+                &["post-merge"]
+            } else {
+                &["pre-merge", "pre-destroy"]
+            }),
+        );
+        msg.push_str(
+            "\n  deal with them, then this finishes the job\
+             \n\
+             \n    wtree destroy",
+        );
+        return Err(msg);
+    }
+
+    // Every tree was clean at the preflight and clean again under the merge's
+    // own check; only `post-merge` (or, with nothing merged, the gates) has
+    // run since. Anything in them now would be force-deleted below — and an
+    // untracked file lives in no git object, so that loss is unrecoverable.
+    // Swept after the gather, so the key the plan above handed itself came
+    // from a snapshot this sweep clears (dirt at gather time is still here to
+    // see; dirt arriving later meets `remove_one`'s own refusal), and after
+    // the drift check, so every path swept is one that exists. The merge
+    // stands either way; `wtree destroy` is the documented rest.
+    let wt = world.current().path.clone();
+    let dirt = targets_changes(&targets, &wt)?;
+    if !dirt.is_empty() {
+        let headline = if merged {
+            format!(
+                "merged onto '{merge_target}', but the working tree is no longer clean, so '{merge_source}' was not destroyed"
+            )
+        } else {
+            format!("the working tree is no longer clean, so '{merge_source}' was not destroyed")
+        };
+        let pens = if merged {
+            hooks.installed(&["post-merge"])
+        } else {
+            hooks.installed(&["pre-destroy"])
+        };
+        let mut msg = stopped(
+            &headline,
+            "files that appeared during the run:",
+            &dirt,
+            &pens,
+        );
+        msg.push_str(
+            "\n  inspect the files, then this finishes the job (its confirmation\
+             \n  key is how discarding them is approved)\
+             \n\
+             \n    wtree destroy",
+        );
+        return Err(msg);
+    }
+
+    // The merge's outcome must still hold when the removal happens: every
+    // commit of the source reflected in the target. A commit made since — a
+    // hook's version bump, a replaced source carrying new history — would be
+    // discarded on the strength of land's own key, so it stops the destroy
+    // half instead. (Skipped when nothing was merged: a squash-merged branch
+    // is legitimately no ancestor of its target.)
+    if merged && !repo::is_ancestor(&wt, &merge_source, &merge_target) {
+        let stray = repo::run_git(
+            &wt,
+            &[
+                "log",
+                "--oneline",
+                &format!("{merge_target}..{merge_source}"),
+            ],
+        )
+        .unwrap_or_default();
+        let commits: Vec<String> = stray.lines().map(str::to_string).collect();
+        let mut msg = stopped(
+            &format!(
+                "merged onto '{merge_target}', but '{merge_source}' gained commits since, so it was not destroyed"
+            ),
+            "commits that appeared during the run:",
+            &commits,
+            &hooks.installed(&["post-merge"]),
+        );
+        msg.push_str(
+            "\n  a hook may have committed them; publish them with another\
+             \n\
+             \n    wtree land\
+             \n\
+             \n  or discard them through the confirmation key\
+             \n\
+             \n    wtree destroy",
+        );
+        return Err(msg);
+    }
+
+    execute_destroy(&primary_root(&repo)?, &targets, note, "land", &hooks)
 }
 
 /// A refusal is attributed to the verb that was typed, not to the half that
@@ -2452,13 +3035,17 @@ fn as_land(r: judge::Refusal) -> String {
 
 /// destroy's judgment as `land` needs it.
 ///
-/// land refuses a dirty worktree up front, so the only work-loss cause left
-/// for the subject branch is "commits not reflected in the parent" — which is
-/// precisely what the merge half resolves; counting it as loss would make land
-/// refuse the work it is there to do. Handing `plan_destroy` the current
-/// confirmation key clears that one layer and nothing else: the policy layer,
-/// the child scan and the relation layer still decide, and each ephemeral
-/// child's own dirty/unreflected state still blocks the whole cascade.
+/// The one work-loss cause `land` may wave through for the subject branch is
+/// "commits not reflected in the parent" — precisely what the merge half
+/// resolves; counting it as loss would make land refuse the work it is there
+/// to do. Handing `plan_destroy` the current confirmation key clears that
+/// layer; the policy layer, the child scan and the relation layer still
+/// decide, and each ephemeral child's own state still blocks the cascade.
+///
+/// The key is a whole-state pass, though, so it would bless a dirty tree just
+/// as readily — which is why land re-checks cleanliness itself before every
+/// call (`stopped:`): by the time this key is handed over, "dirty" has been
+/// ruled out and unreflected commits are all it can be waving through.
 fn plan_destroy_for_land(ctx: &Ctx) -> judge::Decision<DestroyPlan> {
     let key = ctx.world.current().confirmation_key.clone();
     ctx.plan_destroy(false, key.as_deref())

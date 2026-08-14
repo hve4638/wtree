@@ -222,9 +222,12 @@ pub fn parse(text: &str, label: &str) -> (Rules, Vec<String>) {
                 errors.push(format!("empty section name '{line}' ({label}:{lineno})"));
                 continue;
             }
-            // git forbids both in a ref name, so neither can be part of a
-            // legitimate branch or group name.
+            // git forbids whitespace in a ref name and refuses a branch name
+            // that starts with '-'; a group name follows the same shape,
+            // since a dash-leading one could never be named on a command
+            // line without being read as a flag.
             if name.contains(char::is_whitespace)
+                || name.starts_with('-')
                 || (kind == SectionKind::Group && name.contains(':'))
             {
                 errors.push(format!(
@@ -774,6 +777,13 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
         assert!(has(
             &load("[group:a:b]\n").errors,
             "invalid section name 'a:b'"
+        ));
+        // git refuses dash-leading branch names, and a dash-leading group
+        // could never be named on the command line
+        assert!(has(&load("[-foo]\n").errors, "invalid section name '-foo'"));
+        assert!(has(
+            &load("[group:-urgent]\n").errors,
+            "invalid section name '-urgent'"
         ));
     }
 
