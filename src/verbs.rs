@@ -1880,17 +1880,21 @@ pub fn info(cwd: &Path) -> CmdResult {
             println!("  merge to '{p}': no rules readable — '{p}' is unmanaged (fail closed)");
         } else {
             let (modes, _cite) = ctx.target_merge_modes(&p);
-            let list = modes
-                .iter()
-                .map(|m| m.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let flag = if modes.len() == 1 {
-                format!("(flag optional, --{} implied)", modes[0].as_str())
+            if modes.is_empty() {
+                println!("  merge to '{p}': none — accepts no merges");
             } else {
-                "(flag required)".to_string()
-            };
-            println!("  merge to '{p}': {list} {flag}");
+                let list = modes
+                    .iter()
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let flag = if modes.len() == 1 {
+                    format!("(flag optional, --{} implied)", modes[0].as_str())
+                } else {
+                    "(flag required)".to_string()
+                };
+                println!("  merge to '{p}': {list} {flag}");
+            }
         }
     }
     match &id {

@@ -92,7 +92,7 @@ In `rules`, `[X]` is a fixed branch and `[group:X]` is a group of work branches 
 | `destroyable` | `[X]` | `false` refuses destroy unconditionally. Default `true` |
 | `name-allow` / `name-deny` | `[group:X]` | glob patterns for branch names (only `*` and `?` are special) |
 | `ephemeral` | `[group:X]` | collected along with the parent on destroy, if the safety checks pass. Default `false` |
-| `merge-mode` | `[X]` `[group:X]` | merge methods this branch accepts. `squash`, `rebase`, `no-ff`, `ff`, comma-separated |
+| `merge-mode` | `[X]` `[group:X]` | merge methods this branch accepts. `squash`, `rebase`, `no-ff`, `ff`, comma-separated. `none` (alone) accepts no merges |
 | `copy` | `[X]` `[group:X]` | untracked files a new worktree takes from its parent's |
 | `description` | `[X]` `[group:X]` | one line on what the branch is for, printed by `wtree` and `info` |
 

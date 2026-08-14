@@ -918,6 +918,11 @@ impl<'a> Ctx<'a> {
             return refuse("merge", subject, unmanaged_parent(&target, &reasons));
         }
         let (modes, cite) = self.target_merge_modes(&target);
+        if modes.is_empty() {
+            let mut rs = vec![format!("'{target}': accepts no merges")];
+            rs.extend(cite);
+            return refuse("merge", subject, rs);
+        }
         Ok(MergeGate {
             source: branch,
             target,
@@ -965,6 +970,7 @@ impl<'a> Ctx<'a> {
 
     /// Merge-mode set of a target branch: fixed -> its `[branch]` section,
     /// group member -> its `[group]` section, free/undeclared -> every mode.
+    /// Empty = `merge-mode = none` = the target accepts no merges.
     pub fn target_merge_modes(&self, target: &str) -> (Vec<MergeMode>, Option<String>) {
         let (kind, name) = match self.branch_identity(target) {
             Identity::Fixed { branch } => (SectionKind::Branch, branch),
@@ -972,11 +978,11 @@ impl<'a> Ctx<'a> {
             _ => return (ALL_MODES.to_vec(), None),
         };
         match self.cfg.merge_modes(kind, &name) {
-            Some(modes) if !modes.is_empty() => {
+            Some(modes) => {
                 let cite = self.rule(kind, &name, "merge-mode");
                 (modes, Some(cite))
             }
-            _ => (ALL_MODES.to_vec(), None),
+            None => (ALL_MODES.to_vec(), None),
         }
     }
 
@@ -1837,6 +1843,40 @@ mod tests {
             ctx.plan_merge(Some(MergeMode::Ff)).unwrap().mode,
             MergeMode::Ff
         );
+    }
+
+    #[test]
+    fn merge_mode_none_refuses_merge_and_hides_the_affordances() {
+        let fx = Fixture::new();
+        let d = fx.add_worktree("dev", "main");
+        let c = cfg("[main]\nchildren = dev\nmerge-mode = none\n\n[dev]\n");
+        let w = world(&d, &c);
+        let ctx = Ctx {
+            world: &w,
+            cfg: &c,
+            label: ".git/wtree/rules",
+        };
+        // refused with or without a flag — no mode can satisfy an empty set
+        refused(
+            ctx.plan_merge(None),
+            &[
+                "accepts no merges",
+                "rule: merge-mode = none",
+                "(.git/wtree/rules:3)",
+            ],
+        );
+        refused(
+            ctx.plan_merge(Some(MergeMode::Squash)),
+            &["accepts no merges"],
+        );
+        // the menu offers neither merge nor land, both riding the same gate
+        assert!(
+            !ctx.affordances()
+                .iter()
+                .any(|a| matches!(a, Affordance::Merge(_) | Affordance::Land(_)))
+        );
+        // merge-mode rules what comes in, not what the branch pulls down
+        assert!(ctx.plan_sync().is_ok());
     }
 
     #[test]

@@ -4026,6 +4026,42 @@ fn the_menu_spells_merge_modes_but_never_key_or_force() {
 }
 
 #[test]
+fn merge_mode_none_refuses_and_stays_out_of_the_menu() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:feat\nmerge-mode = none\n\n\
+         [group:feat]\nname-allow = feature/*\n",
+    );
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
+    let wt = default_dest(&fx, "feature/a");
+    fx.commit(&wt, "work");
+
+    let e = err(&run_wt(&wt, &["merge", "-m", "up"]));
+    assert!(e.contains("'main': accepts no merges"), "{e}");
+    assert!(e.contains("rule: merge-mode = none"), "{e}");
+    let e = err(&run_wt(&wt, &["land", "-m", "up"]));
+    assert!(e.contains("'main': accepts no merges"), "{e}");
+
+    // the menu offers neither merge nor land, but sync stays — merge-mode
+    // rules what main takes in, not what this branch pulls down
+    let menu = out(&run_wt(&wt, &[]));
+    assert!(
+        !menu
+            .lines()
+            .any(|l| l.trim_start().starts_with("merge") || l.trim_start().starts_with("land")),
+        "{menu}"
+    );
+    assert!(menu.contains("sync"), "{menu}");
+
+    let info = out(&run_wt(&wt, &["info"]));
+    assert!(
+        info.contains("merge to 'main': none — accepts no merges"),
+        "{info}"
+    );
+}
+
+#[test]
 fn an_unmanaged_worktree_offers_only_the_way_back() {
     let fx = Fixture::new();
     write_rules(&fx, GROUP_CFG);
