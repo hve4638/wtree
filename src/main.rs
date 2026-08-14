@@ -45,7 +45,14 @@ fn main() -> ExitCode {
     // that cannot be taken back, and no verb here wants `--help` as a value.
     // `-h` rides along on the same rule: `-v` already answers for `--version`,
     // and the pair everyone types blind should not be half missing.
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    // The scan stops at `--`: past the separator the words are hook arguments,
+    // promised to arrive verbatim, and a hook argument spelled `--help` is not
+    // a question to wtree.
+    if args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "-h" || a == "--help")
+    {
         help_for(verb);
         return ExitCode::SUCCESS;
     }
@@ -84,9 +91,14 @@ fn main() -> ExitCode {
             }
         },
         "new" => match parse_new_args(rest) {
-            Ok((name, group, dir, no_hooks)) => {
-                verbs::new(&cwd, &name, group.as_deref(), dir.as_deref(), no_hooks)
-            }
+            Ok((name, group, dir, no_hooks, argv)) => verbs::new(
+                &cwd,
+                &name,
+                group.as_deref(),
+                dir.as_deref(),
+                no_hooks,
+                &argv,
+            ),
             Err(ArgErr::Missing) => {
                 verbs::usage_new(&cwd);
                 return ExitCode::from(2);
@@ -97,7 +109,7 @@ fn main() -> ExitCode {
             }
         },
         "open" => match parse_open_args(rest) {
-            Ok((branch, no_hooks)) => verbs::open(&cwd, &branch, no_hooks),
+            Ok((branch, no_hooks, argv)) => verbs::open(&cwd, &branch, no_hooks, &argv),
             Err(ArgErr::Missing) => {
                 verbs::usage_open(&cwd);
                 return ExitCode::from(2);
@@ -190,16 +202,29 @@ fn main() -> ExitCode {
     }
 }
 
-type NewArgs = (String, Option<String>, Option<String>, bool);
+type NewArgs = (String, Option<String>, Option<String>, bool, Vec<String>);
+
+/// "Skip the hooks" and "hand the hooks these arguments" cannot both be meant.
+/// A bare `--` with nothing behind it is only a separator, and conflicts with
+/// nothing.
+const NO_HOOKS_ARGV_CONFLICT: &str =
+    "error: '--' hands its arguments to the create hooks, and --no-hooks skips them";
 
 fn parse_new_args(rest: &[String]) -> Result<NewArgs, ArgErr> {
     let mut name: Option<String> = None;
     let mut group = None;
     let mut dir: Option<String> = None;
     let mut no_hooks = false;
+    let mut argv: Vec<String> = Vec::new();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            // `--` ends flag parsing: the rest belongs to the create hooks,
+            // verbatim, dashes and all.
+            "--" => {
+                argv = it.cloned().collect();
+                break;
+            }
             "--group" => match it.next() {
                 Some(_) if group.is_some() => {
                     return Err(ArgErr::Bad("error: --group given twice".into()));
@@ -252,8 +277,11 @@ fn parse_new_args(rest: &[String]) -> Result<NewArgs, ArgErr> {
             s => name = Some(s.to_string()),
         }
     }
+    if no_hooks && !argv.is_empty() {
+        return Err(ArgErr::Bad(NO_HOOKS_ARGV_CONFLICT.into()));
+    }
     match name {
-        Some(n) => Ok((n, group, dir, no_hooks)),
+        Some(n) => Ok((n, group, dir, no_hooks, argv)),
         None => Err(ArgErr::Missing),
     }
 }
@@ -269,11 +297,18 @@ enum ArgErr {
 
 /// One branch name, no flags: open takes its target as an argument rather than
 /// from cwd, because the branch it attaches a worktree to has none.
-fn parse_open_args(rest: &[String]) -> Result<(String, bool), ArgErr> {
+fn parse_open_args(rest: &[String]) -> Result<(String, bool, Vec<String>), ArgErr> {
     let mut branch: Option<String> = None;
     let mut no_hooks = false;
-    for a in rest {
+    let mut argv: Vec<String> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
+            // As in `new`: the rest is the create hooks', verbatim.
+            "--" => {
+                argv = it.cloned().collect();
+                break;
+            }
             "--no-hooks" => no_hooks = true,
             s if s.starts_with('-') => {
                 return Err(ArgErr::Bad(format!(
@@ -288,7 +323,10 @@ fn parse_open_args(rest: &[String]) -> Result<(String, bool), ArgErr> {
             s => branch = Some(s.to_string()),
         }
     }
-    branch.map(|b| (b, no_hooks)).ok_or(ArgErr::Missing)
+    if no_hooks && !argv.is_empty() {
+        return Err(ArgErr::Bad(NO_HOOKS_ARGV_CONFLICT.into()));
+    }
+    branch.map(|b| (b, no_hooks, argv)).ok_or(ArgErr::Missing)
 }
 
 const CLOSE_USAGE: &str = "usage: wtree close [--key <key>]";
@@ -619,6 +657,7 @@ fn manual() {
     println!("\n-m is required for --squash and --no-ff, and rejected for --rebase and --ff.");
     println!("--key and --force appear only when a verb asks for them.");
     println!("--no-hooks skips this run's hooks, the pre- ones that can refuse included.");
+    println!("everything after -- goes to the create hooks as arguments (new and open).");
     println!("\nwtree (no verb) lists just the verbs available where you are.");
     println!("wtree <verb> -h (or --help) prints that verb's line on its own.");
     println!("wtree -v (or --version) prints the version.");
@@ -797,11 +836,11 @@ mod tests {
     fn open_takes_one_branch_and_close_takes_only_a_key() {
         assert_eq!(
             parse_open_args(&args(&["feature/a"])).unwrap(),
-            ("feature/a".to_string(), false)
+            ("feature/a".to_string(), false, vec![])
         );
         assert_eq!(
             parse_open_args(&args(&["feature/a", "--no-hooks"])).unwrap(),
-            ("feature/a".to_string(), true)
+            ("feature/a".to_string(), true, vec![])
         );
         // No branch at all is Missing, so the caller can list the candidates.
         assert!(matches!(parse_open_args(&args(&[])), Err(ArgErr::Missing)));
@@ -856,6 +895,45 @@ mod tests {
         assert!(e.contains("--group takes a value"), "{e}");
         let e = parse_adopt_args(&args(&["--free", "--parent", "--group"])).unwrap_err();
         assert!(e.contains("--parent takes a value"), "{e}");
+    }
+
+    /// `--` ends flag parsing: what follows is the create hooks' argv,
+    /// verbatim, dashes and all. Beside `--no-hooks` it is a contradiction —
+    /// the arguments would go to the hooks being skipped — unless nothing
+    /// actually follows, in which case `--` was only a separator.
+    #[test]
+    fn everything_after_the_separator_is_hook_argv() {
+        let (name, group, dir, no_hooks, argv) = parse_new_args(&args(&[
+            "feat/a",
+            "--",
+            "claude",
+            "GH #322 fix",
+            "--no-hooks",
+        ]))
+        .unwrap();
+        assert_eq!(name, "feat/a");
+        assert_eq!((group, dir, no_hooks), (None, None, false));
+        assert_eq!(argv, ["claude", "GH #322 fix", "--no-hooks"]);
+        let (.., argv) = parse_new_args(&args(&["feat/a", "--"])).unwrap();
+        assert!(argv.is_empty());
+        assert_eq!(
+            parse_open_args(&args(&["feat/a", "--", "codex"])).unwrap(),
+            ("feat/a".to_string(), false, vec!["codex".to_string()])
+        );
+        assert_eq!(
+            parse_open_args(&args(&["feat/a", "--no-hooks", "--"])).unwrap(),
+            ("feat/a".to_string(), true, vec![])
+        );
+        let Err(ArgErr::Bad(e)) = parse_new_args(&args(&["feat/a", "--no-hooks", "--", "claude"]))
+        else {
+            panic!("expected the no-hooks contradiction to be refused");
+        };
+        assert!(e.contains("--no-hooks skips them"), "{e}");
+        let Err(ArgErr::Bad(e)) = parse_open_args(&args(&["feat/a", "--no-hooks", "--", "claude"]))
+        else {
+            panic!("expected the no-hooks contradiction to be refused");
+        };
+        assert!(e.contains("--no-hooks skips them"), "{e}");
     }
 
     #[test]

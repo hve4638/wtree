@@ -30,8 +30,9 @@ pub const RULES_LABEL: &str = ".git/wtree/rules";
 /// `Err` is printed to stderr by main, exit 1.
 pub type CmdResult = Result<(), String>;
 
-pub const NEW_USAGE: &str = "usage: wtree new <name> [--group G] [--dir <name>] [--no-hooks]";
-pub const OPEN_USAGE: &str = "usage: wtree open <branch> [--no-hooks]";
+pub const NEW_USAGE: &str =
+    "usage: wtree new <name> [--group G] [--dir <name>] [--no-hooks] [-- <hook args>]";
+pub const OPEN_USAGE: &str = "usage: wtree open <branch> [--no-hooks] [-- <hook args>]";
 pub const INIT_USAGE: &str = "usage: wtree init [--new | --load [path]] [--force]";
 pub const SAVE_USAGE: &str = "usage: wtree save [path] [--force]";
 
@@ -531,6 +532,8 @@ const HOOK_SAMPLE: &str = "\
 #   WTREE_BRANCH       branch the worktree is for
 #   WTREE_PARENT       its parent; empty under `open` when none is declared
 #   WTREE_VERB         new | open
+# Everything after `--` on the `new`/`open` command line arrives here as \"$@\":
+# the same arguments to both halves, word boundaries intact, nothing expanded.
 #
 # merge hooks, cwd = the worktree being merged:
 #   WTREE_PATH         that worktree
@@ -693,6 +696,7 @@ pub fn new(
     group: Option<&str>,
     dir: Option<&str>,
     no_hooks: bool,
+    argv: &[String],
 ) -> CmdResult {
     let repo = Repo::discover(cwd)?;
     let cfg = load_rules(&repo)?;
@@ -739,7 +743,8 @@ pub fn new(
     // Ahead of the placement folder, so a refusal leaves the filesystem as it
     // was. `WTREE_PATH` names where the worktree is going to be, which does not
     // exist yet — the cwd is the worktree the branch is being forked from.
-    let hooks = Hooks::new(&repo, no_hooks)?;
+    let hooks = Hooks::new(&repo, no_hooks, argv)?;
+    hooks.warn_unclaimed_args();
     let hook_env = create_env(&dest, name, &parent, "new");
     hooks
         .run("pre-create", &world.current().path, &hook_env)
@@ -913,7 +918,7 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 // branch's identity is its rules declaration, and any other branch stays
 // unknown until the user adopts it from the worktree this creates.
 
-pub fn open(cwd: &Path, branch: &str, no_hooks: bool) -> CmdResult {
+pub fn open(cwd: &Path, branch: &str, no_hooks: bool, argv: &[String]) -> CmdResult {
     let repo = Repo::discover(cwd)?;
     let cfg = load_rules(&repo)?;
     let world = repo::gather(cwd, &cfg)?;
@@ -948,7 +953,8 @@ pub fn open(cwd: &Path, branch: &str, no_hooks: bool) -> CmdResult {
     // it answers to the same pair. `WTREE_VERB` is what tells them apart — the
     // branch here already existed, and its parent is only known once the policy
     // declares it.
-    let hooks = Hooks::new(&repo, no_hooks)?;
+    let hooks = Hooks::new(&repo, no_hooks, argv)?;
+    hooks.warn_unclaimed_args();
     let parent = carry.as_ref().map(|(p, _)| p.as_str()).unwrap_or("");
     let hook_env = create_env(&dest, &plan.branch, parent, "open");
     hooks
@@ -1089,15 +1095,39 @@ struct Hooks {
     repo_root: PathBuf,
     /// `--no-hooks`: every lookup misses, so nothing runs.
     skip: bool,
+    /// Everything after `--` on the command line, handed to each hook that
+    /// runs as its positional arguments. Only the create pair takes any: the
+    /// words mean "start this in the new worktree", and the other verbs have
+    /// no new worktree to mean it about.
+    args: Vec<String>,
 }
 
 impl Hooks {
-    fn new(repo: &Repo, skip: bool) -> Result<Self, String> {
+    fn new(repo: &Repo, skip: bool, args: &[String]) -> Result<Self, String> {
         Ok(Hooks {
             dir: hooks_dir(&repo.common_dir),
             repo_root: primary_root(repo)?,
             skip,
+            args: args.to_vec(),
         })
+    }
+
+    /// Arguments were given but no create-pair hook file exists to receive
+    /// them: say so and carry on — the worktree is the primary ask, and the
+    /// same command is sound where a hook is installed. A parked hook is
+    /// deliberately not this case: `run`'s own warning already says why it
+    /// did not run, and this line would say it twice.
+    fn warn_unclaimed_args(&self) {
+        if self.args.is_empty()
+            || ["pre-create", "post-create"]
+                .iter()
+                .any(|n| self.dir.join(n).exists())
+        {
+            return;
+        }
+        eprintln!(
+            "warning: no create hook is installed — the arguments after '--' have nowhere to go"
+        );
     }
 
     /// Runs `hooks/<name>` with cwd `dir` and `env` on top of the three pairs
@@ -1158,6 +1188,10 @@ impl Hooks {
         for (k, v) in env {
             cmd.env(k, v);
         }
+        // `--` arguments, as positional parameters — "$@" in the script. No
+        // shell touches them between the command line and here, so word
+        // boundaries survive and nothing expands.
+        cmd.args(&self.args);
         match cmd.status() {
             Ok(s) if s.success() => Ok(()),
             // No code means the hook did not exit — a signal took it down.
@@ -2200,7 +2234,7 @@ pub fn merge(
             plan.source, plan.target
         ));
     }
-    let hooks = Hooks::new(&repo, no_hooks)?;
+    let hooks = Hooks::new(&repo, no_hooks, &[])?;
     run_merge(&world, &plan, commit_msg, None, &hooks)
 }
 
@@ -2576,7 +2610,7 @@ pub fn destroy(cwd: &Path, force: bool, key: Option<&str>, no_hooks: bool) -> Cm
     };
     let plan = ctx.plan_destroy(force, key).map_err(|r| r.to_string())?;
     let targets = resolve_targets(&world, &plan)?;
-    let hooks = Hooks::new(&repo, no_hooks)?;
+    let hooks = Hooks::new(&repo, no_hooks, &[])?;
     gate_destroy(&hooks, &targets, "destroy", "\n  nothing was removed")?;
     execute_destroy(&primary_root(&repo)?, &targets, "", "destroy", &hooks)
 }
@@ -2830,7 +2864,7 @@ pub fn land(
     // half will touch still has a worktree, while nothing has happened yet.
     let preflight_targets = resolve_targets(&world, &preflight)?;
 
-    let hooks = Hooks::new(&repo, no_hooks)?;
+    let hooks = Hooks::new(&repo, no_hooks, &[])?;
     let merged = has_changes_to_merge(&world, &plan)?;
     if merged {
         run_merge(&world, &plan, commit_msg, Some(&preflight_targets), &hooks)?;

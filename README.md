@@ -123,6 +123,12 @@ A hook must leave the working tree as it found it. New files a hook leaves there
 
 Each hook gets `WTREE_HOOK`, `WTREE_REPO` and `WTREE_INTERACTIVE`, plus `WTREE_PATH` and `WTREE_BRANCH` for the worktree it concerns. `WTREE_VERB` names the verb that was typed, which is how the create pair tells `new` from `open` and the other two tell a bare verb from `land`'s. The merge pair adds `WTREE_TARGET`, `WTREE_MODE`, `WTREE_MESSAGE` and `WTREE_DIRTY`, and `WTREE_TIP` for `post-merge`. The sample lists all of them.
 
+On `new` and `open`, everything after `--` reaches the create pair as `"$@"` — word boundaries intact, nothing expanded — so a hook can start whatever the worktree was made for:
+
+```sh
+wtree new feat/login -- claude 'fix GH #322'
+```
+
 `--no-hooks` skips every hook for one run, the `pre-` ones included. It takes the place of disabling a hook file and forgetting to put it back:
 
 ```sh

@@ -982,6 +982,119 @@ fn a_hook_killed_by_a_signal_is_reported_as_one() {
     assert!(!default_dest(&fx, "feature/a").exists());
 }
 
+/// Everything after `--` belongs to the create hooks: both halves see the same
+/// "$@", word boundaries intact, nothing shell-expanded on the way — a prompt
+/// with spaces and `$`s arrives as one argument, and `--help` past the
+/// separator is an argument too, not a question to wtree.
+#[test]
+fn arguments_after_the_separator_reach_both_create_hooks() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let capture = |f: &str| format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$WTREE_REPO/{f}\"\n");
+    install_hook(&fx, "pre-create", &capture("pre.txt"));
+    install_hook(&fx, "post-create", &capture("post.txt"));
+
+    let o = run_wt(
+        &fx.repo,
+        &[
+            "new",
+            "feature/a",
+            "--",
+            "claude",
+            "fix GH #322; echo $HOME",
+            "--help",
+        ],
+    );
+    assert_ok(&o);
+    assert!(default_dest(&fx, "feature/a").is_dir());
+    let want = "claude\nfix GH #322; echo $HOME\n--help\n";
+    for f in ["pre.txt", "post.txt"] {
+        assert_eq!(fs::read_to_string(fx.repo.join(f)).unwrap(), want, "{f}");
+    }
+}
+
+/// `open` hands the same pair the same arguments.
+#[test]
+fn open_hands_the_separator_arguments_to_the_pair_too() {
+    let fx = Fixture::new();
+    write_rules(&fx, MIDDLE_CFG);
+    fx.git(&fx.repo, &["branch", "dev", "main"]);
+    install_hook(
+        &fx,
+        "post-create",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$WTREE_REPO/post.txt\"\n",
+    );
+    assert_ok(&run_wt(&fx.repo, &["open", "dev", "--", "codex", "resume"]));
+    assert_eq!(
+        fs::read_to_string(fx.repo.join("post.txt")).unwrap(),
+        "codex\nresume\n"
+    );
+}
+
+/// Arguments with no hook file to reach: warn and proceed. The worktree is the
+/// primary ask, and the same command is sound where a hook is installed.
+#[test]
+fn separator_arguments_without_a_hook_warn_and_still_create() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let o = run_wt(&fx.repo, &["new", "feature/a", "--", "claude"]);
+    assert_ok(&o);
+    assert!(default_dest(&fx, "feature/a").is_dir());
+    assert!(err(&o).contains("nowhere to go"), "{}", err(&o));
+}
+
+/// A parked hook speaks for itself: its own skipped-warning already says why
+/// the arguments went unused, so the nowhere-to-go line would say it twice.
+#[test]
+fn a_parked_hook_speaks_for_itself_when_arguments_arrive() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let hooks = fx.repo.join(".git/wtree/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(hooks.join("post-create"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(hooks.join("post-create"), fs::Permissions::from_mode(0o644)).unwrap();
+
+    let o = run_wt(&fx.repo, &["new", "feature/a", "--", "claude"]);
+    assert_ok(&o);
+    assert!(
+        err(&o).contains("is not executable") && err(&o).contains("skipped"),
+        "{}",
+        err(&o)
+    );
+    assert!(!err(&o).contains("nowhere to go"), "{}", err(&o));
+}
+
+/// "Skip the hooks" and "hand the hooks these arguments" cannot both be meant:
+/// the contradiction is refused at parse time, before anything exists.
+#[test]
+fn skipping_hooks_while_handing_them_arguments_is_refused() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let o = run_wt(
+        &fx.repo,
+        &["new", "feature/a", "--no-hooks", "--", "claude"],
+    );
+    assert_fail(&o);
+    assert!(err(&o).contains("--no-hooks"), "{}", err(&o));
+    assert!(!default_dest(&fx, "feature/a").exists());
+}
+
+/// The state file's name is an on-disk contract: an installed wtree reads
+/// records earlier runs wrote, so the literal is pinned here, not just the
+/// constant. WTREE_ is the prefix everything else uses; WT_ was cc-toolkit
+/// inheritance, retired before the first release.
+#[test]
+fn the_state_record_lives_in_wtree_head() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
+    assert!(
+        fx.repo
+            .join(".git/worktrees/feature-a/WTREE_HEAD")
+            .is_file()
+    );
+}
+
 /// pre-create runs where the branch is being forked from, and names a WTREE_PATH
 /// that does not exist yet — the one hook whose worktree is still in the future.
 #[test]

@@ -123,6 +123,12 @@ main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크
 
 모든 훅이 `WTREE_HOOK`, `WTREE_REPO`, `WTREE_INTERACTIVE`를 받고, 대상 워크트리에 대한 `WTREE_PATH`와 `WTREE_BRANCH`가 따라온다. `WTREE_VERB`는 실제로 타이핑된 동사라, create 쌍은 이것으로 `new`와 `open`을, 나머지 둘은 단독 동사와 `land`를 구분한다. 병합 훅에는 `WTREE_TARGET`, `WTREE_MODE`, `WTREE_MESSAGE`, `WTREE_DIRTY`가, `post-merge`에는 `WTREE_TIP`이 추가된다. 전체 목록은 샘플에 있다.
 
+`new`와 `open`에서 `--` 뒤의 모든 것은 create 쌍에 `"$@"`로 도착한다 — 단어 경계 그대로, 아무것도 확장되지 않은 채. 워크트리를 만든 목적이 무엇이든 훅이 그것을 바로 시작할 수 있다.
+
+```sh
+wtree new feat/login -- claude 'fix GH #322'
+```
+
 `--no-hooks`는 그 실행에 한해 `pre-` 훅을 포함한 모든 훅을 건너뛴다. 훅 파일을 잠시 꺼놓고 되돌리는 걸 잊는 상황을 대신한다.
 
 ```sh
