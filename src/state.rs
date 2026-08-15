@@ -1,4 +1,4 @@
-//! Worktree state file: `<private git dir>/WT_HEAD`. Named after git's own
+//! Worktree state file: `<private git dir>/WTREE_HEAD`. Named after git's own
 //! per-worktree pointers (`HEAD`, `ORIG_HEAD`) — it records which branch this
 //! worktree was set up for, and is compared against HEAD to detect drift.
 //!
@@ -18,7 +18,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const STATE_FILE: &str = "WT_HEAD";
+pub const STATE_FILE: &str = "WTREE_HEAD";
 pub const VERSION: &str = "1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

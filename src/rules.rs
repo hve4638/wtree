@@ -222,9 +222,12 @@ pub fn parse(text: &str, label: &str) -> (Rules, Vec<String>) {
                 errors.push(format!("empty section name '{line}' ({label}:{lineno})"));
                 continue;
             }
-            // git forbids both in a ref name, so neither can be part of a
-            // legitimate branch or group name.
+            // git forbids whitespace in a ref name and refuses a branch name
+            // that starts with '-'; a group name follows the same shape,
+            // since a dash-leading one could never be named on a command
+            // line without being read as a flag.
             if name.contains(char::is_whitespace)
+                || name.starts_with('-')
                 || (kind == SectionKind::Group && name.contains(':'))
             {
                 errors.push(format!(
@@ -408,11 +411,18 @@ impl Rules {
         self.get(SectionKind::Group, group, "ephemeral") == Some("true")
     }
 
-    /// `None` = key absent = every mode allowed. Invalid tokens are dropped
-    /// here; validation reports them as errors.
+    /// `None` = key absent = every mode allowed. `Some(vec![])` = the value
+    /// was `none` = the branch accepts no merges at all. Invalid tokens are
+    /// dropped here; validation reports them as errors.
     pub fn merge_modes(&self, kind: SectionKind, name: &str) -> Option<Vec<MergeMode>> {
-        self.get(kind, name, "merge-mode")
-            .map(|v| split_list(v).filter_map(MergeMode::parse).collect())
+        self.get(kind, name, "merge-mode").map(|v| {
+            let toks: Vec<&str> = split_list(v).collect();
+            if toks == ["none"] {
+                Vec::new()
+            } else {
+                toks.into_iter().filter_map(MergeMode::parse).collect()
+            }
+        })
     }
 
     /// Untracked files a new worktree receives from its parent's. Missing key
@@ -474,10 +484,30 @@ impl Rules {
                         }
                     }
                     "merge-mode" => {
-                        for tok in split_list(&e.value) {
-                            if MergeMode::parse(tok).is_none() {
+                        let toks: Vec<&str> = split_list(&e.value).collect();
+                        // A value like ',' has no tokens yet is not empty, so
+                        // the parser's empty-value guard misses it — and an
+                        // empty list must stay one-to-one with the word 'none'.
+                        if toks.is_empty() {
+                            errors.push(format!(
+                                "empty merge-mode list in {} — use 'none' to accept no merges ({label}:{})",
+                                s.header(),
+                                e.line
+                            ));
+                        }
+                        // 'none' next to a mode is a contradiction — the list
+                        // both refuses and allows a merge — so it stands alone.
+                        if toks.contains(&"none") && toks.len() > 1 {
+                            errors.push(format!(
+                                "merge-mode 'none' must stand alone in {} ({label}:{})",
+                                s.header(),
+                                e.line
+                            ));
+                        }
+                        for tok in toks {
+                            if tok != "none" && MergeMode::parse(tok).is_none() {
                                 errors.push(format!(
-                                    "invalid merge-mode '{tok}' in {}: expected squash, rebase, no-ff or ff ({label}:{})",
+                                    "invalid merge-mode '{tok}' in {}: expected squash, rebase, no-ff, ff, or none ({label}:{})",
                                     s.header(), e.line
                                 ));
                             }
@@ -729,6 +759,40 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
     }
 
     #[test]
+    fn merge_mode_none_is_the_empty_set() {
+        let l = load("[main]\nmerge-mode = none\n\n[group:g]\nmerge-mode = none\n");
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert_eq!(
+            l.rules.merge_modes(SectionKind::Branch, "main"),
+            Some(vec![])
+        );
+        assert_eq!(l.rules.merge_modes(SectionKind::Group, "g"), Some(vec![]));
+    }
+
+    #[test]
+    fn merge_mode_none_must_stand_alone() {
+        let l = load("[main]\nmerge-mode = none, squash\n");
+        assert!(
+            has(&l.errors, "merge-mode 'none' must stand alone in [main]"),
+            "{:?}",
+            l.errors
+        );
+        assert_eq!(l.errors.len(), 1, "{:?}", l.errors);
+    }
+
+    #[test]
+    fn merge_mode_without_tokens_is_error() {
+        // ',' survives the parser's empty-value guard but yields no tokens —
+        // it must not slip through as an implicit 'none'
+        let l = load("[main]\nmerge-mode = ,\n");
+        assert!(
+            has(&l.errors, "empty merge-mode list in [main]"),
+            "{:?}",
+            l.errors
+        );
+    }
+
+    #[test]
     fn duplicate_key_is_error() {
         let l = load("[main]\ndestroyable = false\ndestroyable = true\n");
         assert!(
@@ -774,6 +838,13 @@ copy = .env, .env.local             # 부모 워크트리에서 딸려올 미추
         assert!(has(
             &load("[group:a:b]\n").errors,
             "invalid section name 'a:b'"
+        ));
+        // git refuses dash-leading branch names, and a dash-leading group
+        // could never be named on the command line
+        assert!(has(&load("[-foo]\n").errors, "invalid section name '-foo'"));
+        assert!(has(
+            &load("[group:-urgent]\n").errors,
+            "invalid section name '-urgent'"
         ));
     }
 

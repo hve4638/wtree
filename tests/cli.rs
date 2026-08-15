@@ -648,75 +648,36 @@ fn new_refusal_prints_judge_reasons_and_creates_nothing() {
     assert_eq!(refs.trim(), "main");
 }
 
-/// Several names on one line, and nothing made unless every one of them passes.
+/// `new` names one branch. A second name is a mistake, not a second worktree.
 #[test]
-fn new_takes_many_names_and_creates_all_or_none() {
+fn new_refuses_a_second_name() {
     let fx = Fixture::new();
     write_rules(&fx, GROUP_CFG);
 
-    let o = run_wt(&fx.repo, &["new", "feature/a", "feature/b", "feature/c"]);
-    assert_ok(&o);
-    for b in ["feature/a", "feature/b", "feature/c"] {
-        assert!(default_dest(&fx, b).exists(), "{b}: {}", out(&o));
-    }
-    // One `cd` is a place to go and three are a question, so a batch prints none.
-    assert!(!out(&o).contains("cd "), "{}", out(&o));
-    assert!(out(&run_wt(&fx.repo, &["new", "feature/solo"])).contains("cd "));
-
-    // A bad name anywhere on the line leaves the good ones unmade.
-    let o = run_wt(&fx.repo, &["new", "feature/d", "junk/x"]);
-    assert_fail(&o);
-    assert!(err(&o).contains("does not match name-allow"), "{}", err(&o));
-    assert!(!default_dest(&fx, "feature/d").exists(), "d was created");
+    let o = run_wt(&fx.repo, &["new", "feature/a", "feature/b"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("unexpected extra argument"), "{}", err(&o));
+    assert!(err(&o).contains("usage: wtree new"), "{}", err(&o));
+    assert_eq!(branches(&fx), vec!["main".to_string()], "{}", err(&o));
+    assert!(!default_dest(&fx, "feature/a").exists(), "a was created");
 }
 
-/// `feature/x` and `feature-x` both fold onto `feature-x`, so a line asking for
-/// both is answered before either is made rather than halfway through.
+/// `feature/a` nests under nothing until `feature/a/b` exists, and then git
+/// cannot hold both. The refusal comes from the policy layer — `fatal: cannot
+/// lock ref` never reaches the reader.
 #[test]
-fn new_refuses_two_names_that_want_one_directory() {
-    let fx = Fixture::new();
-    write_rules(
-        &fx,
-        "[main]\nchildren = group:feat\n\n[group:feat]\nname-allow = feature/*, feature-*\n",
-    );
-    let o = run_wt(&fx.repo, &["new", "feature/x", "feature-x"]);
-    assert_fail(&o);
-    assert!(err(&o).contains("both want"), "{}", err(&o));
-    assert!(!default_dest(&fx, "feature/x").exists(), "one was created");
-}
-
-/// `feature/a` and `feature/a/b` land in different directories, so only the ref
-/// names collide — a collision git reports halfway through the batch, once the
-/// first branch is already written.
-#[test]
-fn new_refuses_two_names_that_nest_as_refs() {
+fn new_refuses_a_name_that_nests_as_a_ref() {
     let fx = Fixture::new();
     write_rules(&fx, GROUP_CFG);
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
 
-    for pair in [
-        ["feature/a", "feature/a/b"],
-        ["feature/a/b", "feature/a"], // the second one first: same answer
-    ] {
-        let o = run_wt(&fx.repo, &["new", pair[0], pair[1]]);
-        assert_fail(&o);
-        assert!(err(&o).contains("cannot both be branches"), "{}", err(&o));
-        assert_eq!(branches(&fx), vec!["main".to_string()], "{}", err(&o));
-        assert!(
-            !default_dest(&fx, pair[0]).exists(),
-            "{} was created",
-            pair[0]
-        );
-    }
-
-    // Sharing a prefix is not the same as nesting under one.
-    assert_ok(&run_wt(&fx.repo, &["new", "feature/a", "feature/ab"]));
-
-    // A branch already on disk nests by the same rule, and is answered by the
-    // same layer — `fatal: cannot lock ref` never reaches the reader.
     let o = run_wt(&fx.repo, &["new", "feature/a/b"]);
     assert_fail(&o);
     assert!(err(&o).starts_with("refusal:"), "{}", err(&o));
     assert!(!err(&o).contains("fatal:"), "{}", err(&o));
+
+    // Sharing a prefix is not the same as nesting under one.
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/ab"]));
 }
 
 /// The occupant is named, because "already exists" fits three situations that
@@ -777,14 +738,7 @@ fn new_dir_renames_the_directory_but_not_the_place() {
     assert!(!default_dest(&fx, "feature/b").exists(), "{}", out(&o));
 
     for (args, want) in [
-        (
-            vec!["new", "feature/c", "feature/d", "--dir", "x"],
-            "--dir names one directory",
-        ),
-        (
-            vec!["new", "feature/c", "--dir", "../escape"],
-            "not a path",
-        ),
+        (vec!["new", "feature/c", "--dir", "../escape"], "not a path"),
         (vec!["new", "feature/c", "--dir", ".."], "not a path"),
         (vec!["new", "feature/c", "--dir", ""], "not a path"),
     ] {
@@ -825,12 +779,27 @@ fn new_placement_settings_override() {
     assert!(err(&o).contains("unknown key 'worktreedir'"), "{}", err(&o));
 }
 
-fn install_hook(fx: &Fixture, body: &str) {
+fn install_hook(fx: &Fixture, name: &str, body: &str) {
     let hooks = fx.repo.join(".git/wtree/hooks");
     fs::create_dir_all(&hooks).unwrap();
-    let hook = hooks.join("post-create");
+    let hook = hooks.join(name);
     fs::write(&hook, body).unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A hook that appends one line per run to `<repo>/hook.log`, so a test can
+/// read back both whether it ran and what it was told. `fields` is a shell
+/// format string over the WTREE_* variables.
+fn logging_hook(fields: &str) -> String {
+    format!("#!/bin/sh\nprintf '%s\\n' \"{fields}\" >> \"$WTREE_REPO/hook.log\"\n")
+}
+
+fn hook_log(fx: &Fixture) -> Vec<String> {
+    fs::read_to_string(fx.repo.join("hook.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 #[test]
@@ -839,7 +808,8 @@ fn new_runs_post_create_hook_with_wt_env() {
     write_rules(&fx, GROUP_CFG);
     install_hook(
         &fx,
-        "#!/bin/sh\nprintf '%s|%s|%s|%s|%s' \"$WT_BRANCH\" \"$WT_PARENT\" \"$WT_REPO\" \"$WT_INTERACTIVE\" \"$(pwd)\" > \"$WT_PATH/hook-ran\"\n",
+        "post-create",
+        "#!/bin/sh\nprintf '%s|%s|%s|%s|%s' \"$WTREE_BRANCH\" \"$WTREE_PARENT\" \"$WTREE_REPO\" \"$WTREE_INTERACTIVE\" \"$(pwd)\" > \"$WTREE_PATH/hook-ran\"\n",
     );
     assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
     let dest = default_dest(&fx, "feature/a");
@@ -850,7 +820,7 @@ fn new_runs_post_create_hook_with_wt_env() {
     assert_eq!(
         Path::new(parts[2]).canonicalize().unwrap(),
         fx.repo.canonicalize().unwrap(),
-        "WT_REPO must be the primary worktree root"
+        "WTREE_REPO must be the primary worktree root"
     );
     assert_eq!(parts[3], "0", "captured output is non-interactive");
     assert_eq!(
@@ -864,7 +834,7 @@ fn new_runs_post_create_hook_with_wt_env() {
 fn new_hook_failure_warns_but_keeps_worktree() {
     let fx = Fixture::new();
     write_rules(&fx, GROUP_CFG);
-    install_hook(&fx, "#!/bin/sh\nexit 3\n");
+    install_hook(&fx, "post-create", "#!/bin/sh\nexit 3\n");
     let o = run_wt(&fx.repo, &["new", "feature/a"]);
     assert_ok(&o); // hook failure is not a verb failure
     assert!(
@@ -878,6 +848,282 @@ fn new_hook_failure_warns_but_keeps_worktree() {
         state::read(&repo::private_git_dir(&dest).unwrap()),
         StateRead::Valid(_)
     ));
+}
+
+/// `copy` and `post-create` split one job between them — the parent's files
+/// cross, then the hook makes what has to be generated here — so the hook has
+/// to find the copied files already in place. Pinned in both verbs that create
+/// a worktree, because the order is invisible until a hook reads one.
+#[test]
+fn the_copy_list_lands_before_post_create_runs() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = dev\ncopy = .env\n\n[dev]\nchildren = group:feat\ncopy = .env\n\n[group:feat]\nname-allow = feature/*\ncopy = .env\n",
+    );
+    fs::write(fx.repo.join(".env"), "SECRET=1\n").unwrap();
+    // Reads what `copy` was supposed to bring; empty when it has not run yet.
+    install_hook(
+        &fx,
+        "post-create",
+        "#!/bin/sh\nprintf '%s\\n' \"$WTREE_VERB:$(cat .env 2>/dev/null || echo MISSING)\" >> \"$WTREE_REPO/hook.log\"\n",
+    );
+
+    fx.git(&fx.repo, &["branch", "dev", "main"]);
+    assert_ok(&run_wt(&fx.repo, &["open", "dev"]));
+    assert_ok(&run_wt(&default_dest(&fx, "dev"), &["new", "feature/a"]));
+
+    assert_eq!(
+        hook_log(&fx),
+        vec!["open:SECRET=1", "new:SECRET=1"],
+        "the hook must see the copied .env, not MISSING"
+    );
+}
+
+/// `open` makes a worktree the same way `new` does, so it answers to the same
+/// pair. `WTREE_VERB` is the only thing that separates them, and a branch the
+/// policy has not declared has no parent to name.
+#[test]
+fn open_runs_the_create_pair_and_says_which_verb_it_is() {
+    let fx = Fixture::new();
+    write_rules(&fx, MIDDLE_CFG);
+    let fields = "$WTREE_HOOK|$WTREE_VERB|$WTREE_BRANCH|$WTREE_PARENT";
+    install_hook(&fx, "pre-create", &logging_hook(fields));
+    install_hook(&fx, "post-create", &logging_hook(fields));
+
+    // A declared branch: the policy names its parent.
+    fx.git(&fx.repo, &["branch", "dev", "main"]);
+    assert_ok(&run_wt(&fx.repo, &["open", "dev"]));
+    // An undeclared one: managed by nobody, so there is no parent to hand over.
+    fx.git(&fx.repo, &["branch", "stray", "main"]);
+    assert_ok(&run_wt(&fx.repo, &["open", "stray"]));
+
+    assert_eq!(
+        hook_log(&fx),
+        vec![
+            "pre-create|open|dev|main",
+            "post-create|open|dev|main",
+            "pre-create|open|stray|",
+            "post-create|open|stray|",
+        ]
+    );
+    // The same pair under `new` says `new`, which is the whole point of the
+    // field. `feature/*` belongs under dev, so it is cut from the worktree the
+    // first `open` just made.
+    assert_ok(&run_wt(&default_dest(&fx, "dev"), &["new", "feature/a"]));
+    assert_eq!(
+        hook_log(&fx)[4..],
+        [
+            "pre-create|new|feature/a|dev",
+            "post-create|new|feature/a|dev"
+        ]
+    );
+}
+
+/// A gate is a gate wherever it runs: `open` keeps nothing when pre-create
+/// refuses, and the branch it would have attached is left alone.
+#[test]
+fn pre_create_refusal_opens_nothing() {
+    let fx = Fixture::new();
+    write_rules(&fx, MIDDLE_CFG);
+    fx.git(&fx.repo, &["branch", "dev", "main"]);
+    install_hook(&fx, "pre-create", "#!/bin/sh\nexit 1\n");
+
+    let o = run_wt(&fx.repo, &["open", "dev"]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("pre-create hook failed") && err(&o).contains("nothing was opened"),
+        "{}",
+        err(&o)
+    );
+    assert!(!default_dest(&fx, "dev").exists());
+    // open never touches the branch, and a refusal must not either
+    assert!(branches(&fx).contains(&"dev".to_string()));
+
+    // and --no-hooks gets past it
+    assert_ok(&run_wt(&fx.repo, &["open", "dev", "--no-hooks"]));
+    assert!(default_dest(&fx, "dev").is_dir());
+}
+
+/// The other half of the contract: a `pre-` hook is a gate, so its refusal has
+/// to leave the repo exactly as it was — no worktree, no branch, not even the
+/// placement folder that `new` would otherwise create.
+#[test]
+fn pre_create_refusal_creates_nothing() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    install_hook(&fx, "pre-create", "#!/bin/sh\nexit 1\n");
+    let o = run_wt(&fx.repo, &["new", "feature/a"]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("pre-create hook failed (exit 1)") && err(&o).contains("nothing was"),
+        "{}",
+        err(&o)
+    );
+    assert!(!default_dest(&fx, "feature/a").exists());
+    assert!(!fx.tmp.0.join("repo.worktrees").exists());
+    assert_eq!(branches(&fx), vec!["main".to_string()]);
+}
+
+/// A hook that dies of a signal has no exit code; "exit -1" would send the
+/// reader looking for a status no shell ever returned.
+#[test]
+fn a_hook_killed_by_a_signal_is_reported_as_one() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    install_hook(&fx, "pre-create", "#!/bin/sh\nkill -9 $$\n");
+    let o = run_wt(&fx.repo, &["new", "feature/a"]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("pre-create hook failed (signal 9)"),
+        "{}",
+        err(&o)
+    );
+    assert!(!default_dest(&fx, "feature/a").exists());
+}
+
+/// Everything after `--` belongs to the create hooks: both halves see the same
+/// "$@", word boundaries intact, nothing shell-expanded on the way — a prompt
+/// with spaces and `$`s arrives as one argument, and `--help` past the
+/// separator is an argument too, not a question to wtree.
+#[test]
+fn arguments_after_the_separator_reach_both_create_hooks() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let capture = |f: &str| format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$WTREE_REPO/{f}\"\n");
+    install_hook(&fx, "pre-create", &capture("pre.txt"));
+    install_hook(&fx, "post-create", &capture("post.txt"));
+
+    let o = run_wt(
+        &fx.repo,
+        &[
+            "new",
+            "feature/a",
+            "--",
+            "claude",
+            "fix GH #322; echo $HOME",
+            "--help",
+        ],
+    );
+    assert_ok(&o);
+    assert!(default_dest(&fx, "feature/a").is_dir());
+    let want = "claude\nfix GH #322; echo $HOME\n--help\n";
+    for f in ["pre.txt", "post.txt"] {
+        assert_eq!(fs::read_to_string(fx.repo.join(f)).unwrap(), want, "{f}");
+    }
+}
+
+/// `open` hands the same pair the same arguments.
+#[test]
+fn open_hands_the_separator_arguments_to_the_pair_too() {
+    let fx = Fixture::new();
+    write_rules(&fx, MIDDLE_CFG);
+    fx.git(&fx.repo, &["branch", "dev", "main"]);
+    install_hook(
+        &fx,
+        "post-create",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$WTREE_REPO/post.txt\"\n",
+    );
+    assert_ok(&run_wt(&fx.repo, &["open", "dev", "--", "codex", "resume"]));
+    assert_eq!(
+        fs::read_to_string(fx.repo.join("post.txt")).unwrap(),
+        "codex\nresume\n"
+    );
+}
+
+/// Arguments with no hook file to reach: warn and proceed. The worktree is the
+/// primary ask, and the same command is sound where a hook is installed.
+#[test]
+fn separator_arguments_without_a_hook_warn_and_still_create() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let o = run_wt(&fx.repo, &["new", "feature/a", "--", "claude"]);
+    assert_ok(&o);
+    assert!(default_dest(&fx, "feature/a").is_dir());
+    assert!(err(&o).contains("nowhere to go"), "{}", err(&o));
+}
+
+/// A parked hook speaks for itself: its own skipped-warning already says why
+/// the arguments went unused, so the nowhere-to-go line would say it twice.
+#[test]
+fn a_parked_hook_speaks_for_itself_when_arguments_arrive() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let hooks = fx.repo.join(".git/wtree/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(hooks.join("post-create"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(hooks.join("post-create"), fs::Permissions::from_mode(0o644)).unwrap();
+
+    let o = run_wt(&fx.repo, &["new", "feature/a", "--", "claude"]);
+    assert_ok(&o);
+    assert!(
+        err(&o).contains("is not executable") && err(&o).contains("skipped"),
+        "{}",
+        err(&o)
+    );
+    assert!(!err(&o).contains("nowhere to go"), "{}", err(&o));
+}
+
+/// "Skip the hooks" and "hand the hooks these arguments" cannot both be meant:
+/// the contradiction is refused at parse time, before anything exists.
+#[test]
+fn skipping_hooks_while_handing_them_arguments_is_refused() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let o = run_wt(
+        &fx.repo,
+        &["new", "feature/a", "--no-hooks", "--", "claude"],
+    );
+    assert_fail(&o);
+    assert!(err(&o).contains("--no-hooks"), "{}", err(&o));
+    assert!(!default_dest(&fx, "feature/a").exists());
+}
+
+/// The state file's name is an on-disk contract: an installed wtree reads
+/// records earlier runs wrote, so the literal is pinned here, not just the
+/// constant. WTREE_ is the prefix everything else uses; WT_ was cc-toolkit
+/// inheritance, retired before the first release.
+#[test]
+fn the_state_record_lives_in_wtree_head() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
+    assert!(
+        fx.repo
+            .join(".git/worktrees/feature-a/WTREE_HEAD")
+            .is_file()
+    );
+}
+
+/// pre-create runs where the branch is being forked from, and names a WTREE_PATH
+/// that does not exist yet — the one hook whose worktree is still in the future.
+#[test]
+fn pre_create_runs_in_the_parent_with_the_future_path() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    install_hook(
+        &fx,
+        "pre-create",
+        &logging_hook(
+            "$WTREE_HOOK|$WTREE_BRANCH|$WTREE_PARENT|$WTREE_PATH|$(pwd)|$([ -e \"$WTREE_PATH\" ] && echo exists || echo absent)",
+        ),
+    );
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
+    let log = hook_log(&fx);
+    assert_eq!(log.len(), 1, "{log:?}");
+    let f: Vec<&str> = log[0].split('|').collect();
+    assert_eq!(&f[..3], &["pre-create", "feature/a", "main"]);
+    assert_eq!(
+        Path::new(f[3]),
+        default_dest(&fx, "feature/a"),
+        "WTREE_PATH is where the worktree will be"
+    );
+    assert_eq!(
+        Path::new(f[4]).canonicalize().unwrap(),
+        fx.repo.canonicalize().unwrap(),
+        "cwd is the worktree being forked from"
+    );
+    assert_eq!(f[5], "absent", "the new worktree does not exist yet");
 }
 
 // ------------------------------------------------------------------- copy ----
@@ -1087,9 +1333,15 @@ fn list_shows_identities_unknowns_and_bare_branches() {
     let stdout = out(&o);
     // Parentage is position in the tree now, not a `parent: X` column. Piped
     // output uses the ASCII glyphs.
-    assert!(stdout.contains("* main         fixed       repo"), "{stdout}");
+    assert!(
+        stdout.contains("* main         fixed       repo"),
+        "{stdout}"
+    );
     assert!(stdout.contains("`-+ feature/a  group:feat"), "{stdout}");
-    assert!(stdout.contains("|-. dev        fixed"), "declared, no worktree:\n{stdout}");
+    assert!(
+        stdout.contains("|-. dev        fixed"),
+        "declared, no worktree:\n{stdout}"
+    );
     // An unmanaged worktree has no identity, so no parent, so no place in the
     // tree. Plain `list` only says how many there are; the entries and their
     // entries wait behind `--unmanaged` rather than crowding the tree.
@@ -1125,7 +1377,9 @@ fn list_shows_identities_unknowns_and_bare_branches() {
     // The worktree row leads with the path in full — an unmanaged checkout
     // sits wherever it was made. The branch row is just the branch.
     assert!(
-        entries.lines().any(|l| l.starts_with('/') && l.ends_with("  junk")),
+        entries
+            .lines()
+            .any(|l| l.starts_with('/') && l.ends_with("  junk")),
         "absolute path then branch:\n{entries}"
     );
     assert!(entries.contains("\nloose\n"), "{entries}");
@@ -1170,7 +1424,8 @@ fn list_keeps_the_divergence_column_when_a_row_has_no_directory() {
             .lines()
             .find(|l| l.contains(branch))
             .unwrap_or_else(|| panic!("no row for {branch}:\n{stdout}"));
-        l.find('v').unwrap_or_else(|| panic!("no divergence on {l:?}:\n{stdout}"))
+        l.find('v')
+            .unwrap_or_else(|| panic!("no divergence on {l:?}:\n{stdout}"))
     };
     assert_eq!(
         col("stage"),
@@ -1194,7 +1449,11 @@ fn list_indents_a_grandchild_under_its_own_parent() {
 
     let stdout = out(&run_wt(&fx.repo, &["list"]));
     let l: Vec<&str> = stdout.lines().collect();
-    assert_eq!(l.len(), 4, "one row per branch, no section headers:\n{stdout}");
+    assert_eq!(
+        l.len(),
+        4,
+        "one row per branch, no section headers:\n{stdout}"
+    );
     assert!(l[0].starts_with("* main"), "{stdout}");
     assert!(l[1].starts_with("|-+ dev"), "{stdout}");
     // the leading `|` is main's line continuing past dev down to feature/b
@@ -2682,6 +2941,858 @@ fn land_with_nothing_to_merge_goes_straight_to_destroy() {
     assert_eq!(branches(&fx), vec!["main".to_string()]);
 }
 
+// ------------------------------------------------- hooks: merge / destroy ----
+//
+// The create pair is covered up in the `new` section. What is left is the two
+// pairs that wrap operations with something to lose, and the flag that skips
+// all of them.
+
+/// pre-merge is the gate a test suite would sit behind, so its refusal has to
+/// mean the target never moved and the branch was never rewritten.
+#[test]
+fn pre_merge_refusal_leaves_both_branches_alone() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    let (main_before, feat_before) = (rev(&fx, "main"), rev(&fx, "feature/a"));
+
+    install_hook(&fx, "pre-merge", "#!/bin/sh\nexit 2\n");
+    let o = run_wt(&wt, &["merge", "-m", "feat: a"]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("pre-merge hook failed (exit 2)")
+            && err(&o).contains("nothing was changed"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(rev(&fx, "main"), main_before);
+    assert_eq!(rev(&fx, "feature/a"), feat_before, "no squash was applied");
+}
+
+/// The merge pair's environment, including the one field only post-merge gets.
+#[test]
+fn merge_hooks_report_mode_target_and_tip() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    let fields = "$WTREE_HOOK|$WTREE_BRANCH|$WTREE_TARGET|$WTREE_MODE|$WTREE_MESSAGE|$WTREE_VERB|$WTREE_TIP|$(pwd)";
+    install_hook(&fx, "pre-merge", &logging_hook(fields));
+    install_hook(&fx, "post-merge", &logging_hook(fields));
+
+    assert_ok(&run_wt(&wt, &["merge", "-m", "feat: a"]));
+    let log = hook_log(&fx);
+    assert_eq!(log.len(), 2, "both halves run: {log:?}");
+    let pre: Vec<&str> = log[0].split('|').collect();
+    let post: Vec<&str> = log[1].split('|').collect();
+    assert_eq!(
+        &pre[..6],
+        &[
+            "pre-merge",
+            "feature/a",
+            "main",
+            "squash",
+            "feat: a",
+            "merge"
+        ]
+    );
+    assert_eq!(pre[6], "", "the tip is not known before the merge");
+    assert_eq!(post[0], "post-merge");
+    assert_eq!(
+        rev(&fx, "main")[..post[6].len()].to_string(),
+        post[6],
+        "WTREE_TIP is the commit the merge produced"
+    );
+    for h in [&pre, &post] {
+        assert_eq!(
+            Path::new(h[7]).canonicalize().unwrap(),
+            wt.canonicalize().unwrap(),
+            "merge hooks run in the worktree being merged"
+        );
+    }
+}
+
+/// --ff returns from `run_merge` before the precheck, the stash and the
+/// rewrite, so it reaches its own post-merge call. Both halves still run, and
+/// the mode that takes no message reports an empty one.
+#[test]
+fn merge_hooks_run_on_the_ff_path_too() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("ff"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    let fields = "$WTREE_HOOK|$WTREE_MODE|$WTREE_MESSAGE|$WTREE_TIP";
+    install_hook(&fx, "pre-merge", &logging_hook(fields));
+    install_hook(&fx, "post-merge", &logging_hook(fields));
+
+    assert_ok(&run_wt(&wt, &["merge"]));
+    let log = hook_log(&fx);
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[0], "pre-merge|ff||", "--ff carries no -m text");
+    let post: Vec<&str> = log[1].split('|').collect();
+    assert_eq!(&post[..3], &["post-merge", "ff", ""]);
+    assert_eq!(rev(&fx, "main")[..post[3].len()].to_string(), post[3]);
+}
+
+/// The `post-` contract away from `new`: a failure is a warning naming what
+/// stands, and the verb still succeeds. The merge and the destroy have
+/// different things standing, so each says its own.
+#[test]
+fn post_hook_failure_warns_without_undoing_the_verb() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    install_hook(&fx, "post-merge", "#!/bin/sh\nexit 4\n");
+    install_hook(&fx, "post-destroy", "#!/bin/sh\nexit 5\n");
+
+    let o = run_wt(&wt, &["merge", "-m", "feat: a"]);
+    assert_ok(&o);
+    assert!(
+        err(&o).contains("post-merge hook failed (exit 4); the merge already happened"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(rev(&fx, "main"), rev(&fx, "feature/a"), "the merge stands");
+
+    let o = run_wt(&wt, &["destroy"]);
+    assert_ok(&o);
+    assert!(
+        err(&o).contains("post-destroy hook failed (exit 5); the branch was already removed"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(branches(&fx), vec!["main".to_string()]);
+}
+
+/// A hook file that is present but not executable is the shape a half-finished
+/// install leaves behind. It is called out rather than run or ignored, and it
+/// does not refuse for the `pre-` half — an unrunnable gate is not a verdict.
+#[test]
+fn a_non_executable_hook_is_reported_and_skipped() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let hooks = fx.repo.join(".git/wtree/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(hooks.join("pre-create"), "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(hooks.join("pre-create"), fs::Permissions::from_mode(0o644)).unwrap();
+
+    let o = run_wt(&fx.repo, &["new", "feature/a"]);
+    assert_ok(&o);
+    assert!(
+        err(&o).contains("is not executable") && err(&o).contains("skipped"),
+        "{}",
+        err(&o)
+    );
+    assert!(default_dest(&fx, "feature/a").is_dir());
+}
+
+/// A cascade removes several branches, so every gate has to clear before the
+/// first removal — a hook that refused halfway could not put back what was
+/// already gone.
+#[test]
+fn pre_destroy_refuses_the_whole_cascade_before_removing_anything() {
+    let fx = Fixture::new();
+    write_rules(&fx, EPH_CFG);
+    let mid = member(&fx, "mid/a", "mid", "main");
+    let e1 = member(&fx, "eph/1", "eph", "mid/a");
+    // Clears for the leaf, refuses for its parent: the refusal is reached only
+    // after a gate has already passed, which is where a partial run would show.
+    install_hook(
+        &fx,
+        "pre-destroy",
+        "#!/bin/sh\ncase \"$WTREE_BRANCH\" in mid/*) exit 1 ;; *) exit 0 ;; esac\n",
+    );
+    let o = run_wt(&mid, &["destroy"]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("pre-destroy hook failed") && err(&o).contains("nothing was removed"),
+        "{}",
+        err(&o)
+    );
+    assert!(mid.exists() && e1.exists());
+    assert_eq!(
+        branches(&fx),
+        vec!["eph/1".to_string(), "main".to_string(), "mid/a".to_string()]
+    );
+}
+
+/// post-destroy has nowhere to stand but the repo root, and the path it is
+/// handed is one that has just stopped existing.
+#[test]
+fn post_destroy_runs_from_the_root_after_the_worktree_is_gone() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let wt = member(&fx, "feature/a", "feat", "main");
+    install_hook(
+        &fx,
+        "post-destroy",
+        &logging_hook(
+            "$WTREE_HOOK|$WTREE_BRANCH|$WTREE_VERB|$(pwd)|$([ -e \"$WTREE_PATH\" ] && echo exists || echo absent)",
+        ),
+    );
+    assert_ok(&run_wt(&wt, &["destroy"]));
+    let log = hook_log(&fx);
+    assert_eq!(log.len(), 1, "{log:?}");
+    let f: Vec<&str> = log[0].split('|').collect();
+    assert_eq!(&f[..3], &["post-destroy", "feature/a", "destroy"]);
+    assert_eq!(
+        Path::new(f[3]).canonicalize().unwrap(),
+        fx.repo.canonicalize().unwrap()
+    );
+    assert_eq!(f[4], "absent", "the worktree is already removed");
+}
+
+/// The destroy pair is per branch, not per command: a cascade fires it once
+/// for each, in the order the removals happen.
+#[test]
+fn destroy_hooks_fire_once_per_branch_in_a_cascade() {
+    let fx = Fixture::new();
+    write_rules(&fx, EPH_CFG);
+    let mid = member(&fx, "mid/a", "mid", "main");
+    member(&fx, "eph/1", "eph", "mid/a");
+    for h in ["pre-destroy", "post-destroy"] {
+        install_hook(&fx, h, &logging_hook("$WTREE_HOOK|$WTREE_BRANCH"));
+    }
+    assert_ok(&run_wt(&mid, &["destroy"]));
+    assert_eq!(
+        hook_log(&fx),
+        vec![
+            // every gate first, leaf first, then the removals in the same order
+            "pre-destroy|eph/1",
+            "pre-destroy|mid/a",
+            "post-destroy|eph/1",
+            "post-destroy|mid/a",
+        ]
+    );
+}
+
+/// `land` is a merge and a destroy, so it fires both pairs; WTREE_VERB is how a
+/// hook tells it apart from the verbs it is made of. Both gates come before
+/// the merge — the same both-or-neither reason the preflight judges both
+/// halves: a pre-destroy veto after the merge could no longer abort the verb.
+#[test]
+fn land_fires_both_pairs_and_names_itself() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    for h in ["pre-merge", "post-merge", "pre-destroy", "post-destroy"] {
+        install_hook(&fx, h, &logging_hook("$WTREE_HOOK|$WTREE_VERB"));
+    }
+    assert_ok(&run_wt(&wt, &["land", "-m", "feat: a"]));
+    assert_eq!(
+        hook_log(&fx),
+        vec![
+            "pre-merge|land",
+            "pre-destroy|land",
+            "post-merge|land",
+            "post-destroy|land",
+        ]
+    );
+}
+
+/// The escape hatch: one run with neither gate nor report, so a broken hook
+/// never has to be chmod-ed off and remembered back.
+#[test]
+fn no_hooks_skips_both_halves() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    for h in [
+        "pre-create",
+        "post-create",
+        "pre-merge",
+        "post-merge",
+        "pre-destroy",
+        "post-destroy",
+    ] {
+        // Refuses and logs: --no-hooks has to defeat both halves of every pair.
+        install_hook(
+            &fx,
+            h,
+            &format!("{}exit 1\n", logging_hook("$WTREE_HOOK|ran")),
+        );
+    }
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a", "--no-hooks"]));
+    let wt = default_dest(&fx, "feature/a");
+    fx.commit(&wt, "one");
+    assert_ok(&run_wt(&wt, &["merge", "-m", "feat: a", "--no-hooks"]));
+    assert_ok(&run_wt(&wt, &["destroy", "--no-hooks"]));
+    assert!(hook_log(&fx).is_empty(), "{:?}", hook_log(&fx));
+    assert_eq!(branches(&fx), vec!["main".to_string()]);
+}
+
+/// The two verbs that move nothing of the caller's own making stay silent:
+/// hooks wrap operations with something to lose, and these have none.
+#[test]
+fn sync_and_close_run_no_hooks() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    commit_other(&fx, &fx.repo.clone(), "p.txt", "parent moved");
+    for h in [
+        "pre-create",
+        "post-create",
+        "pre-merge",
+        "post-merge",
+        "pre-destroy",
+        "post-destroy",
+    ] {
+        install_hook(&fx, h, &logging_hook("$WTREE_HOOK"));
+    }
+    assert_ok(&run_wt(&wt, &["sync"]));
+    assert_ok(&run_wt(&wt, &["close"]));
+    assert!(hook_log(&fx).is_empty(), "{:?}", hook_log(&fx));
+}
+
+/// The gate fires before the stash machinery: a veto must leave the working
+/// tree exactly as it was, with nothing parked in the stash.
+#[test]
+fn a_pre_merge_veto_stashes_nothing() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    fs::write(wt.join("wip.txt"), "work in progress\n").unwrap();
+    install_hook(&fx, "pre-merge", "#!/bin/sh\nexit 2\n");
+    let o = run_wt(&wt, &["merge", "-m", "feat: a"]);
+    assert_fail(&o);
+    assert_eq!(
+        fs::read_to_string(wt.join("wip.txt")).unwrap(),
+        "work in progress\n",
+        "the veto must leave the working tree as it was"
+    );
+    assert_eq!(
+        fx.git(&wt, &["stash", "list"]).trim(),
+        "",
+        "a veto must not park the caller's work in the stash"
+    );
+}
+
+/// WTREE_MODE names the mode that actually ran, and WTREE_TIP the commit the
+/// merge produced — on the modes the squash-centric tests don't touch.
+#[test]
+fn merge_hooks_name_rebase_and_no_ff() {
+    for (mode, args) in [
+        ("rebase", vec!["merge", "--rebase"]),
+        ("no-ff", vec!["merge", "--no-ff", "-m", "feat: a"]),
+    ] {
+        let fx = Fixture::new();
+        write_rules(&fx, &merge_cfg("squash, rebase, no-ff, ff"));
+        let wt = member(&fx, "feature/a", "feat", "main");
+        fx.commit(&wt, "one");
+        let fields = "$WTREE_HOOK|$WTREE_MODE|$WTREE_MESSAGE|$WTREE_TIP";
+        install_hook(&fx, "pre-merge", &logging_hook(fields));
+        install_hook(&fx, "post-merge", &logging_hook(fields));
+        let o = run_wt(&wt, &args);
+        assert_ok(&o);
+        let log = hook_log(&fx);
+        assert_eq!(log.len(), 2, "{mode}: {log:?}");
+        let pre: Vec<&str> = log[0].split('|').collect();
+        let post: Vec<&str> = log[1].split('|').collect();
+        assert_eq!(pre[1], mode, "pre WTREE_MODE: {log:?}");
+        assert_eq!(post[1], mode, "post WTREE_MODE: {log:?}");
+        assert_eq!(pre[3], "", "the tip is not known before the merge");
+        assert_eq!(
+            rev(&fx, "main")[..post[3].len()].to_string(),
+            post[3],
+            "{mode}: WTREE_TIP is the commit the merge produced"
+        );
+    }
+}
+
+/// "nothing to merge; going straight to destroy" skips the merge pair along
+/// with the merge, but the destroy pair still wraps the removal.
+#[test]
+fn land_with_nothing_to_merge_runs_only_the_destroy_pair() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    for h in ["pre-merge", "post-merge", "pre-destroy", "post-destroy"] {
+        install_hook(&fx, h, &logging_hook("$WTREE_HOOK"));
+    }
+    assert_ok(&run_wt(&wt, &["land", "-m", "feat: a"]));
+    assert_eq!(hook_log(&fx), vec!["pre-destroy", "post-destroy"]);
+}
+
+/// `nothing to merge` is decided before the gate: a refusal there would blame
+/// a hook for a merge that was never going to happen.
+#[test]
+fn merge_with_nothing_to_merge_never_reaches_the_gate() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    install_hook(&fx, "pre-merge", &logging_hook("$WTREE_HOOK"));
+    let o = run_wt(&wt, &["merge", "-m", "feat: a"]);
+    assert_fail(&o);
+    assert!(hook_log(&fx).is_empty(), "{:?}", hook_log(&fx));
+}
+
+#[test]
+fn open_no_hooks_skips_the_post_half() {
+    let fx = Fixture::new();
+    write_rules(&fx, MIDDLE_CFG);
+    fx.git(&fx.repo, &["branch", "dev", "main"]);
+    install_hook(&fx, "post-create", &logging_hook("$WTREE_HOOK"));
+    assert_ok(&run_wt(&fx.repo, &["open", "dev", "--no-hooks"]));
+    assert!(hook_log(&fx).is_empty(), "{:?}", hook_log(&fx));
+}
+
+#[test]
+fn land_no_hooks_skips_every_pair() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    for h in ["pre-merge", "post-merge", "pre-destroy", "post-destroy"] {
+        install_hook(&fx, h, &format!("{}exit 1\n", logging_hook("$WTREE_HOOK")));
+    }
+    assert_ok(&run_wt(&wt, &["land", "-m", "feat: a", "--no-hooks"]));
+    assert!(hook_log(&fx).is_empty(), "{:?}", hook_log(&fx));
+    assert_eq!(branches(&fx), vec!["main".to_string()]);
+}
+
+/// The merge pair addresses the worktree being merged, not wherever the
+/// command happens to run.
+#[test]
+fn merge_hooks_get_the_worktree_path() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    install_hook(&fx, "pre-merge", &logging_hook("$WTREE_HOOK|$WTREE_PATH"));
+    assert_ok(&run_wt(&wt, &["merge", "-m", "feat: a"]));
+    let f: Vec<String> = hook_log(&fx)[0].split('|').map(str::to_string).collect();
+    assert_eq!(
+        Path::new(&f[1]).canonicalize().unwrap(),
+        wt.canonicalize().unwrap()
+    );
+}
+
+/// The gate runs while the worktree still exists — a last look before removal.
+#[test]
+fn pre_destroy_gets_the_worktree_that_is_still_there() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let wt = member(&fx, "feature/a", "feat", "main");
+    install_hook(
+        &fx,
+        "pre-destroy",
+        &logging_hook("$WTREE_PATH|$([ -e \"$WTREE_PATH\" ] && echo exists || echo absent)"),
+    );
+    assert_ok(&run_wt(&wt, &["destroy"]));
+    let f: Vec<String> = hook_log(&fx)[0].split('|').map(str::to_string).collect();
+    assert_eq!(f[1], "exists", "the worktree is still there under the gate");
+    assert_eq!(Path::new(&f[0]), wt);
+}
+
+/// A hook that exists but cannot run (broken shebang) is a refusal for the
+/// pre- half, not a silent pass: the gate's absence must be deliberate.
+#[test]
+fn an_unrunnable_hook_refuses_for_the_pre_half() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    install_hook(&fx, "pre-create", "#!/nonexistent/interpreter\n");
+    let o = run_wt(&fx.repo, &["new", "feature/a"]);
+    assert_fail(&o);
+    assert!(
+        err(&o).contains("cannot run pre-create hook"),
+        "{}",
+        err(&o)
+    );
+    assert!(!default_dest(&fx, "feature/a").exists());
+}
+
+/// --force is spent only on what the plan approved. Dirt that appears after
+/// the judgment — here, a gate hook's own file — was confirmed by nothing,
+/// so the removal refuses instead of discarding it.
+#[test]
+fn destroy_refuses_dirt_a_gate_hook_just_made() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let wt = member(&fx, "feature/a", "feat", "main");
+    install_hook(
+        &fx,
+        "pre-destroy",
+        "#!/bin/sh\nprintf x > \"$WTREE_PATH/made.tmp\"\n",
+    );
+    let o = run_wt(&wt, &["destroy"]);
+    assert_fail(&o);
+    assert!(
+        wt.join("made.tmp").exists(),
+        "the file must survive:\n{}",
+        err(&o)
+    );
+    assert!(
+        err(&o).contains("changed since its removal was approved"),
+        "{}",
+        err(&o)
+    );
+}
+
+/// The gates ran against the preflight's target set: a destroy target that
+/// appears afterwards (here, a hook creating an ephemeral child mid-land)
+/// has had no gate, so land refuses to remove anything at all.
+#[test]
+fn land_refuses_a_destroy_target_that_appeared_after_the_gates() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:mid\nmerge-mode = squash\n\n\
+         [group:mid]\nname-allow = mid/*\nchildren = group:eph\n\n\
+         [group:eph]\nname-allow = eph/*\nephemeral = true\n",
+    );
+    let mid = member(&fx, "mid/a", "mid", "main");
+    fx.commit(&mid, "one");
+    install_hook(
+        &fx,
+        "post-merge",
+        &format!(
+            "#!/bin/sh\n{} new eph/1 >/dev/null\n",
+            env!("CARGO_BIN_EXE_wtree")
+        ),
+    );
+    let o = run_wt(&mid, &["land", "-m", "feat: a"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("eph/1"), "{}", err(&o));
+    assert_eq!(rev(&fx, "main"), rev(&fx, "mid/a"), "the merge stands");
+    assert!(mid.is_dir(), "nothing was destroyed");
+    assert!(
+        default_dest(&fx, "eph/1").is_dir(),
+        "the ungated child survives"
+    );
+}
+
+/// "nothing to merge" is decided before the gates run; a gate hook that
+/// commits reverses that decision, and the destroy would discard the commit
+/// on land's own key. The question is re-asked after the gates.
+#[test]
+fn land_with_nothing_to_merge_stops_when_a_gate_commits() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    install_hook(
+        &fx,
+        "pre-destroy",
+        "#!/bin/sh\ncd \"$WTREE_PATH\" && printf x > s.txt && git add s.txt && git commit -q -m stray\n",
+    );
+    let o = run_wt(&wt, &["land", "-m", "feat: a"]);
+    assert_fail(&o);
+    assert!(err(&o).starts_with("stopped:"), "{}", err(&o));
+    assert!(err(&o).contains("stray"), "{}", err(&o));
+    assert!(wt.is_dir(), "the worktree survives");
+    assert!(
+        branches(&fx).contains(&"feature/a".to_string()),
+        "the branch keeps the commit"
+    );
+}
+
+/// A commit made during the run (a version-bump post-merge hook, a replaced
+/// source with new history) moves the source past the merge result, and the
+/// destroy half would discard it on the strength of land's own key. land
+/// verifies the merge's outcome still holds — source reflected in target —
+/// before removing anything.
+#[test]
+fn land_stops_when_the_source_moved_past_the_merge_result() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    install_hook(
+        &fx,
+        "post-merge",
+        "#!/bin/sh\ncd \"$WTREE_PATH\" && printf x > bump.txt && git add bump.txt && git commit -q -m 'v2: bump'\n",
+    );
+    let o = run_wt(&wt, &["land", "-m", "feat: a"]);
+    assert_fail(&o);
+    assert!(err(&o).starts_with("stopped:"), "{}", err(&o));
+    assert!(err(&o).contains("bump"), "{}", err(&o));
+    assert!(wt.is_dir(), "the worktree survives");
+    assert_ne!(
+        rev(&fx, "feature/a"),
+        rev(&fx, "main"),
+        "the stray commit is kept on the branch"
+    );
+}
+
+/// Same-name replacement is not the same target: a hook that destroys a
+/// gated child and recreates the branch leaves the name in the plan but the
+/// gate's judgment behind, so land refuses the destroy half whole.
+#[test]
+fn land_refuses_a_gated_target_that_was_replaced() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:mid\nmerge-mode = squash\n\n\
+         [group:mid]\nname-allow = mid/*\nchildren = group:eph\n\n\
+         [group:eph]\nname-allow = eph/*\nephemeral = true\n",
+    );
+    let mid = member(&fx, "mid/a", "mid", "main");
+    let kid = member(&fx, "eph/1", "eph", "mid/a");
+    fx.commit(&mid, "one");
+    let bin = env!("CARGO_BIN_EXE_wtree");
+    install_hook(
+        &fx,
+        "post-merge",
+        &format!(
+            "#!/bin/sh\ncd {} && {bin} destroy >/dev/null\ncd \"$WTREE_PATH\" && {bin} new eph/1 >/dev/null\n",
+            kid.display()
+        ),
+    );
+    let o = run_wt(&mid, &["land", "-m", "feat: a"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("eph/1"), "{}", err(&o));
+    assert_eq!(rev(&fx, "main"), rev(&fx, "mid/a"), "the merge stands");
+    assert!(mid.is_dir(), "nothing was destroyed");
+    assert!(
+        default_dest(&fx, "eph/1").is_dir(),
+        "the replacement survives"
+    );
+}
+
+/// A commit is clean by every dirtiness test, but it is still state the plan
+/// never judged: a post-destroy hook committing into a later cascade target
+/// must stop that target's removal, not watch branch -D discard the commit.
+#[test]
+fn removal_refuses_a_commit_made_behind_the_plan() {
+    let fx = Fixture::new();
+    write_rules(&fx, EPH_CFG);
+    let mid = member(&fx, "mid/a", "mid", "main");
+    member(&fx, "eph/1", "eph", "mid/a");
+    install_hook(
+        &fx,
+        "post-destroy",
+        &format!(
+            "#!/bin/sh\ncd {} && printf x > s.txt && git add s.txt && git commit -q -m stray\n",
+            mid.display()
+        ),
+    );
+    let o = run_wt(&mid, &["destroy"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("changed since"), "{}", err(&o));
+    assert!(
+        branches(&fx).contains(&"mid/a".to_string()),
+        "the branch keeps the commit: {:?}",
+        branches(&fx)
+    );
+}
+
+/// The key confirms one exact state. A hook that writes between the key's
+/// acceptance and the removal changes that state, so the force the key
+/// earned no longer applies — to the hook's file or to anything else.
+#[test]
+fn a_confirmed_key_does_not_cover_what_a_hook_adds_after_it() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fs::write(wt.join("mine.txt"), "precious\n").unwrap();
+    let o = run_wt(&wt, &["destroy"]);
+    assert_fail(&o);
+    let key = err(&o)
+        .split("--key ")
+        .nth(1)
+        .expect("the refusal names the key")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    install_hook(
+        &fx,
+        "pre-destroy",
+        "#!/bin/sh\nprintf x > \"$WTREE_PATH/extra.tmp\"\n",
+    );
+    let o = run_wt(&wt, &["destroy", "--key", &key]);
+    assert_fail(&o);
+    assert!(err(&o).contains("changed since"), "{}", err(&o));
+    assert!(
+        wt.join("mine.txt").exists() && wt.join("extra.tmp").exists(),
+        "both files survive:\n{}",
+        err(&o)
+    );
+}
+
+/// The seam checks look at every worktree the destroy half will touch, not
+/// just the one being merged: a gate that dirties an ephemeral child also
+/// stops land while the merge has not started.
+#[test]
+fn land_stops_before_the_merge_when_a_gate_dirties_a_child() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:mid\nmerge-mode = squash\n\n\
+         [group:mid]\nname-allow = mid/*\nchildren = group:eph\n\n\
+         [group:eph]\nname-allow = eph/*\nephemeral = true\n",
+    );
+    let mid = member(&fx, "mid/a", "mid", "main");
+    let kid = member(&fx, "eph/1", "eph", "mid/a");
+    fx.commit(&mid, "one");
+    let before = rev(&fx, "main");
+    install_hook(
+        &fx,
+        "pre-destroy",
+        "#!/bin/sh\n[ \"$WTREE_BRANCH\" = eph/1 ] || exit 0\nprintf x > \"$WTREE_PATH/kid.tmp\"\n",
+    );
+    let o = run_wt(&mid, &["land", "-m", "feat: a"]);
+    assert_fail(&o);
+    assert!(err(&o).starts_with("stopped:"), "{}", err(&o));
+    assert!(err(&o).contains("kid.tmp"), "{}", err(&o));
+    assert_eq!(rev(&fx, "main"), before, "the merge must not start");
+    assert!(
+        kid.join("kid.tmp").exists(),
+        "the file survives for inspection"
+    );
+}
+
+/// A hook sees only its own invocation's values: names another pair sets, or
+/// a WTREE_* the calling shell happens to export (say, wtree run from inside
+/// a hook), arrive empty rather than leaking through.
+#[test]
+fn a_hook_does_not_inherit_another_invocations_env() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    install_hook(
+        &fx,
+        "pre-destroy",
+        &logging_hook("$WTREE_TARGET|$WTREE_MODE|$WTREE_TIP"),
+    );
+    let wt = member(&fx, "feature/a", "feat", "main");
+    let o = Command::new(env!("CARGO_BIN_EXE_wtree"))
+        .current_dir(&wt)
+        .args(["destroy"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("WTREE_TARGET", "stale-target")
+        .env("WTREE_MODE", "stale-mode")
+        .env("WTREE_TIP", "stale-tip")
+        .output()
+        .expect("failed to spawn wtree");
+    assert_ok(&o);
+    assert_eq!(hook_log(&fx), vec!["||"]);
+}
+
+/// Only "not there" means "not installed": a hooks/ that answers anything
+/// else to the lookup (here, a file where the directory should be) must not
+/// wave the gate through as if no hook existed.
+#[test]
+fn an_unreadable_hooks_dir_refuses_instead_of_passing_silently() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let dir = fx.repo.join(".git/wtree/hooks");
+    let _ = fs::remove_dir_all(&dir);
+    fs::write(&dir, "not a directory").unwrap();
+    let o = run_wt(&fx.repo, &["new", "feature/a"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("cannot read"), "{}", err(&o));
+    assert!(!default_dest(&fx, "feature/a").exists());
+}
+
+/// The state land's destroy half sees after a file-writing hook, under the
+/// verb it is made of: a bare destroy refuses it with a work-loss refusal.
+#[test]
+fn destroy_refuses_an_untracked_file_as_work_loss() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fs::write(wt.join("artifact.txt"), "precious\n").unwrap();
+    let o = run_wt(&wt, &["destroy"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("work-loss risk"), "{}", err(&o));
+}
+
+/// The gates run before the merge, so a file a gate hook leaves behind stops
+/// `land` while "nothing was changed" is still true: no merge, no stash, the
+/// file itself kept for inspection — never swept into the squash commit or
+/// force-deleted by the destroy half.
+#[test]
+fn land_stops_before_the_merge_when_a_gate_dirties_the_tree() {
+    for hook in ["pre-merge", "pre-destroy"] {
+        let fx = Fixture::new();
+        write_rules(&fx, &merge_cfg("squash"));
+        let wt = member(&fx, "feature/a", "feat", "main");
+        fx.commit(&wt, "one");
+        let before = rev(&fx, "main");
+        install_hook(
+            &fx,
+            hook,
+            "#!/bin/sh\nprintf 'precious\\n' > \"$WTREE_PATH/artifact.txt\"\n",
+        );
+        let o = run_wt(&wt, &["land", "-m", "feat: a"]);
+        assert_fail(&o);
+        assert!(err(&o).starts_with("stopped:"), "{hook}: {}", err(&o));
+        assert!(err(&o).contains("artifact.txt"), "{hook}: {}", err(&o));
+        assert!(err(&o).contains(hook), "{hook} not named:\n{}", err(&o));
+        assert_eq!(rev(&fx, "main"), before, "{hook}: the merge must not start");
+        assert_eq!(
+            fs::read_to_string(wt.join("artifact.txt")).unwrap(),
+            "precious\n",
+            "{hook}: the file survives for inspection"
+        );
+    }
+}
+
+/// After the merge only `post-merge` has the pen. Its dirt stops the destroy
+/// half: the merge stands (a report cannot un-merge), the worktree and the
+/// file stay, and the message hands over to `wtree destroy`, whose
+/// confirmation key is the mechanism for approving the discard.
+#[test]
+fn land_keeps_the_merge_but_stops_the_destroy_on_post_merge_dirt() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    install_hook(
+        &fx,
+        "post-merge",
+        "#!/bin/sh\nprintf 'precious\\n' > \"$WTREE_PATH/artifact.txt\"\n",
+    );
+    let o = run_wt(&wt, &["land", "-m", "feat: a"]);
+    assert_fail(&o);
+    assert!(err(&o).starts_with("stopped:"), "{}", err(&o));
+    assert!(err(&o).contains("artifact.txt"), "{}", err(&o));
+    assert!(err(&o).contains("wtree destroy"), "{}", err(&o));
+    assert_eq!(rev(&fx, "main"), rev(&fx, "feature/a"), "the merge stands");
+    assert!(wt.is_dir(), "the worktree survives");
+    assert_eq!(
+        fs::read_to_string(wt.join("artifact.txt")).unwrap(),
+        "precious\n"
+    );
+}
+
+/// A pre-destroy veto under `land` aborts the whole verb before the merge —
+/// the gate would be pointless where it can no longer stop anything.
+#[test]
+fn a_pre_destroy_veto_under_land_aborts_before_the_merge() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    let before = rev(&fx, "main");
+    install_hook(&fx, "pre-destroy", "#!/bin/sh\nexit 1\n");
+    let o = run_wt(&wt, &["land", "-m", "feat: a"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("nothing was changed"), "{}", err(&o));
+    assert_eq!(rev(&fx, "main"), before, "the merge must not have run");
+    assert!(wt.is_dir(), "the worktree survives");
+}
+
+/// Only commits are merged, but the gate runs on the working tree: WTREE_DIRTY
+/// is how a suite-running hook learns the two differ and declines to judge.
+#[test]
+fn wtree_dirty_tells_the_gate_about_uncommitted_changes() {
+    let fx = Fixture::new();
+    write_rules(&fx, &merge_cfg("squash"));
+    let wt = member(&fx, "feature/a", "feat", "main");
+    fx.commit(&wt, "one");
+    install_hook(&fx, "pre-merge", &logging_hook("$WTREE_DIRTY"));
+    assert_ok(&run_wt(&wt, &["merge", "-m", "feat: a"]));
+    fx.commit(&wt, "two");
+    fs::write(wt.join("wip.txt"), "wip\n").unwrap();
+    assert_ok(&run_wt(&wt, &["merge", "-m", "feat: a"]));
+    assert_eq!(hook_log(&fx), vec!["0", "1"]);
+}
+
 // ------------------------------------------------------------ rules gating ----
 
 #[test]
@@ -2915,6 +4026,42 @@ fn the_menu_spells_merge_modes_but_never_key_or_force() {
 }
 
 #[test]
+fn merge_mode_none_refuses_and_stays_out_of_the_menu() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:feat\nmerge-mode = none\n\n\
+         [group:feat]\nname-allow = feature/*\n",
+    );
+    assert_ok(&run_wt(&fx.repo, &["new", "feature/a"]));
+    let wt = default_dest(&fx, "feature/a");
+    fx.commit(&wt, "work");
+
+    let e = err(&run_wt(&wt, &["merge", "-m", "up"]));
+    assert!(e.contains("'main': accepts no merges"), "{e}");
+    assert!(e.contains("rule: merge-mode = none"), "{e}");
+    let e = err(&run_wt(&wt, &["land", "-m", "up"]));
+    assert!(e.contains("'main': accepts no merges"), "{e}");
+
+    // the menu offers neither merge nor land, but sync stays — merge-mode
+    // rules what main takes in, not what this branch pulls down
+    let menu = out(&run_wt(&wt, &[]));
+    assert!(
+        !menu
+            .lines()
+            .any(|l| l.trim_start().starts_with("merge") || l.trim_start().starts_with("land")),
+        "{menu}"
+    );
+    assert!(menu.contains("sync"), "{menu}");
+
+    let info = out(&run_wt(&wt, &["info"]));
+    assert!(
+        info.contains("merge to 'main': none — accepts no merges"),
+        "{info}"
+    );
+}
+
+#[test]
 fn an_unmanaged_worktree_offers_only_the_way_back() {
     let fx = Fixture::new();
     write_rules(&fx, GROUP_CFG);
@@ -3064,7 +4211,10 @@ fn the_help_verb_answers_without_being_advertised() {
     let fx = Fixture::new();
     write_rules(&fx, "[main]\nchildren = group:feat\n\n[group:feat]\n");
 
-    assert_eq!(out(&run_wt(&fx.repo, &["help"])), out(&run_wt(&fx.repo, &[])));
+    assert_eq!(
+        out(&run_wt(&fx.repo, &["help"])),
+        out(&run_wt(&fx.repo, &[]))
+    );
     assert_eq!(
         out(&run_wt(&fx.repo, &["help", "--all"])),
         out(&run_wt(&fx.repo, &["-h"]))
@@ -3112,12 +4262,12 @@ fn a_non_utf8_argument_is_refused_instead_of_panicking() {
     assert!(err(&o).starts_with("error:"), "{}", err(&o));
 }
 
-/// Two words carry the diagnostics — `refusal:` for what the policy declines
-/// and `error:` for everything else that went wrong — and the exit code says
-/// separately whether the line or the run was at fault. A third word for the
-/// failures main answers by itself would be a second system to learn.
+/// Three words carry the diagnostics — `refusal:` for what the policy
+/// declines, `stopped:` for a verb that halted between its steps with part of
+/// its work standing, and `error:` for everything else that went wrong — and
+/// the exit code says separately whether the line or the run was at fault.
 #[test]
-fn every_diagnostic_wears_one_of_the_two_words() {
+fn every_diagnostic_wears_one_of_the_three_words() {
     let fx = Fixture::new();
     write_rules(&fx, GROUP_CFG);
 
