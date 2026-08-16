@@ -1614,8 +1614,94 @@ fn info_unknown_shows_reasons_and_adopt_hint() {
     assert!(stdout.contains("not a declared [branch]"), "{stdout}");
     assert!(stdout.contains("wtree adopt"), "{stdout}");
     assert!(
-        stdout.contains("allowed verbs here: open, close, list, info, init, save, adopt"),
+        stdout.contains("allowed verbs here: open, close, list, info, rule, init, save, adopt"),
         "{stdout}"
+    );
+}
+
+// -------------------------------------------------------------------- rule ----
+
+/// One line per line of the screen, runs of spaces collapsed, so the assertions
+/// read a key and its value without owning the column widths.
+fn flat_lines(o: &Output) -> Vec<String> {
+    out(o)
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+#[test]
+fn rule_prints_every_key_and_marks_the_filled_in_ones() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:feat\nmerge-mode = squash\n\n\
+         [group:feat]\nname-allow = feature/*\nephemeral = true\n",
+    );
+    let o = run_wt(&fx.repo, &["rule"]);
+    assert_ok(&o);
+    let lines = flat_lines(&o);
+    let stdout = out(&o);
+    let has = |s: &str| lines.iter().any(|l| l == s);
+    assert!(stdout.starts_with(".git/wtree/rules\n"), "{stdout}");
+    for want in [
+        "[main]",
+        "children = group:feat",
+        "merge-mode = squash",
+        // absent from the file, and judged by all the same
+        "destroyable = true (default)",
+        "copy = (none) (default)",
+        "description = (none) (default)",
+        "[group:feat]",
+        "name-allow = feature/*",
+        "ephemeral = true",
+        // no merge-mode means every mode, not none
+        "merge-mode = squash, rebase, no-ff, ff (default)",
+        // an empty allow-list takes any name; an empty deny-list denies nothing
+        "name-deny = (none) (default)",
+        "children = (none) (default)",
+    ] {
+        assert!(has(want), "missing '{want}':\n{stdout}");
+    }
+    // `merge-mode = none` is a declared refusal of every mode, not an absence
+    write_rules(&fx, "[main]\nchildren = *\nmerge-mode = none\n");
+    assert!(
+        flat_lines(&run_wt(&fx.repo, &["rule"]))
+            .iter()
+            .any(|l| l == "merge-mode = none"),
+        "{}",
+        out(&run_wt(&fx.repo, &["rule"]))
+    );
+}
+
+/// The policy does not depend on where it is read from: an unmanaged worktree
+/// gets the same screen, since nothing here is judged against an identity.
+#[test]
+fn rule_reads_the_same_from_an_unmanaged_worktree_and_takes_no_arguments() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let junk = fx.add_worktree("junk", "main");
+    let o = run_wt(&junk, &["rule"]);
+    assert_ok(&o);
+    assert_eq!(flat_lines(&o), flat_lines(&run_wt(&fx.repo, &["rule"])));
+
+    let o = run_wt(&fx.repo, &["rule", "--all"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("takes no arguments"), "{}", err(&o));
+}
+
+/// A rules file with nothing in it loads, so the screen has to say that it is
+/// the policy that is empty and not the command that gave up.
+#[test]
+fn rule_says_so_when_nothing_is_declared() {
+    let fx = Fixture::new();
+    write_rules(&fx, "# emptied by hand\n");
+    let o = run_wt(&fx.repo, &["rule"]);
+    assert_ok(&o);
+    assert!(
+        out(&o).contains("no rule — nothing is declared"),
+        "{}",
+        out(&o)
     );
 }
 
@@ -3799,7 +3885,7 @@ fn wtree_dirty_tells_the_gate_about_uncommitted_changes() {
 fn verbs_require_init_and_valid_rules() {
     let fx = Fixture::new();
     // no rules yet
-    for verb in ["list", "info", "new"] {
+    for verb in ["list", "info", "rule", "new"] {
         let o = if verb == "new" {
             run_wt(&fx.repo, &["new", "feature/a"])
         } else {
@@ -3812,16 +3898,20 @@ fn verbs_require_init_and_valid_rules() {
             err(&o)
         );
     }
-    // a rules with errors blocks execution, citing label:line
+    // a rules with errors blocks execution, citing label:line. `rule` among
+    // them: a policy that does not parse is not one to be read out as if the
+    // verbs would go by it.
     write_rules(&fx, "[main]\nchildren = group:ghost\n");
-    let o = run_wt(&fx.repo, &["list"]);
-    assert_fail(&o);
-    let stderr = err(&o);
-    assert!(
-        stderr.contains("undeclared group 'group:ghost'"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("(.git/wtree/rules:2)"), "{stderr}");
+    for verb in ["list", "rule"] {
+        let o = run_wt(&fx.repo, &[verb]);
+        assert_fail(&o);
+        let stderr = err(&o);
+        assert!(
+            stderr.contains("undeclared group 'group:ghost'"),
+            "{verb}: {stderr}"
+        );
+        assert!(stderr.contains("(.git/wtree/rules:2)"), "{verb}: {stderr}");
+    }
 }
 
 #[test]

@@ -300,14 +300,18 @@ pub fn parse(text: &str, label: &str) -> (Rules, Vec<String>) {
 
 // `description` is free text, printed and never acted on — the one key with no
 // valid set to validate against.
-const BRANCH_KEYS: &[&str] = &[
+//
+// Public because `wtree rule` prints a section key by key: the list that decides
+// what validation accepts is the one that has to be walked, or a key added here
+// would quietly stop being shown.
+pub const BRANCH_KEYS: &[&str] = &[
     "children",
     "destroyable",
     "merge-mode",
     "copy",
     "description",
 ];
-const GROUP_KEYS: &[&str] = &[
+pub const GROUP_KEYS: &[&str] = &[
     "children",
     "name-allow",
     "name-deny",

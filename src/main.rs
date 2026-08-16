@@ -172,6 +172,13 @@ fn main() -> ExitCode {
             }
         },
         "info" => verbs::info(&cwd),
+        "rule" => {
+            if args.len() > 1 {
+                eprintln!("error: takes no arguments");
+                return ExitCode::from(2);
+            }
+            verbs::rule(&cwd)
+        }
         v => {
             eprintln!("error: unknown verb '{v}'");
             eprintln!("wtree      verbs available where you are");
@@ -618,6 +625,11 @@ const ROWS: &[(&str, &str, &str)] = &[
         "info",
         "usage: wtree info",
         "rules and previews for one worktree",
+    ),
+    (
+        "rule",
+        "usage: wtree rule",
+        "the whole policy, defaults filled in",
     ),
     (
         "init",

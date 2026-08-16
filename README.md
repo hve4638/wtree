@@ -70,6 +70,7 @@ That squash-merges into main and cleans up the worktree and the branch. To merge
 | `destroy` | remove the branch and its worktree |
 | `adopt` | bring an existing branch under the policy |
 | `list` / `info` | what exists, and what is allowed here |
+| `rule` | the whole policy, defaults filled in |
 | `init --new` | write the starter files |
 | `init --load [path]` | take the rules from a `.wtree/` instead |
 | `save [path]` | copy the rules out to a `.wtree/` you can commit |

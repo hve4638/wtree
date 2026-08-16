@@ -19,7 +19,7 @@ use console::style;
 use crate::judge::{self, Affordance, Ctx, DestroyPlan, Identity, MergePlan, NewPlan};
 use crate::prompt;
 use crate::repo::{self, Repo};
-use crate::rules::{self, CopyPattern, MergeMode, Rules, SectionKind};
+use crate::rules::{self, CopyPattern, MergeMode, Rules, Section, SectionKind};
 use crate::settings::{self, SETTINGS_LABEL, Settings};
 use crate::state::{self, Kind, State};
 
@@ -686,6 +686,83 @@ pub fn save(cwd: &Path, dest: Option<&Path>, force: bool) -> CmdResult {
     }
     println!("commit it to share the policy; `wtree init --load` reads it back");
     Ok(())
+}
+
+// ------------------------------------------------------------------ rule ----
+
+/// The whole policy, every key spelled out. What a section leaves out is still
+/// judged by something, and a reader who has to know the source to know what an
+/// absent `destroyable` means cannot check a branch against the file — so the
+/// filled-in values are printed alongside the declared ones and marked.
+///
+/// Sections in file order, keys in the order validation lists them, so a
+/// section reads the way it was written and a key added there shows up here.
+///
+/// Rules that do not parse are refused here as everywhere else. The parse is
+/// best-effort and printing what survived it would be possible, but the screen
+/// would be a policy no verb is going by — the errors are the answer to what
+/// applies right now.
+pub fn rule(cwd: &Path) -> CmdResult {
+    let repo = Repo::discover(cwd)?;
+    let cfg = load_rules(&repo)?;
+    println!("{RULES_LABEL}");
+    // A file with no sections is a readable one, so nothing above this refuses
+    // — and an empty screen would read as a command that failed rather than a
+    // policy that declares nothing.
+    if cfg.sections.is_empty() {
+        println!("\nno rule — nothing is declared");
+        return Ok(());
+    }
+    for s in &cfg.sections {
+        let keys = match s.kind {
+            SectionKind::Branch => rules::BRANCH_KEYS,
+            SectionKind::Group => rules::GROUP_KEYS,
+        };
+        let rows: Vec<(&str, String, bool)> = keys
+            .iter()
+            .map(|k| {
+                let (v, declared) = effective_value(s, k);
+                (*k, v, declared)
+            })
+            .collect();
+        let kw = keys.iter().map(|k| k.len()).max().unwrap_or(0);
+        // Marked rows line up with each other, not with the widest value in the
+        // section: one long `name-allow` would otherwise push every marker off
+        // to the right of a screen of short ones.
+        let vw = rows
+            .iter()
+            .filter(|(_, _, declared)| !declared)
+            .map(|(_, v, _)| v.chars().count())
+            .max()
+            .unwrap_or(0);
+        println!("\n{}", s.header());
+        for (key, value, declared) in &rows {
+            match declared {
+                true => println!("  {key:kw$} = {value}"),
+                false => println!("  {key:kw$} = {value:vw$}  (default)"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A key's value in `s`, and whether the file is where it came from. The
+/// defaults mirror the accessors on `Rules`; the catch-all arm holds for every
+/// key whose absence means an empty list, which is all of the rest.
+fn effective_value(s: &Section, key: &str) -> (String, bool) {
+    if let Some(e) = s.entry(key) {
+        return (e.value.clone(), true);
+    }
+    let d = match key {
+        "destroyable" => "true",
+        "ephemeral" => "false",
+        // Absent means every mode is allowed, which the file would spell out.
+        "merge-mode" => "squash, rebase, no-ff, ff",
+        // The one empty list that constrains nothing rather than everything.
+        "name-allow" => "(any)",
+        _ => "(none)",
+    };
+    (d.to_string(), false)
 }
 
 // ------------------------------------------------------------------- new ----
@@ -1829,8 +1906,8 @@ pub fn info(cwd: &Path) -> CmdResult {
             println!("  - {r}");
         }
         let allowed: Vec<&str> = [
-            "new", "open", "merge", "sync", "land", "destroy", "close", "list", "info", "init",
-            "save", "adopt",
+            "new", "open", "merge", "sync", "land", "destroy", "close", "list", "info", "rule",
+            "init", "save", "adopt",
         ]
         .into_iter()
         .filter(|v| judge::verb_allowed_when_unknown(v))
@@ -2023,6 +2100,10 @@ pub fn help(cwd: &Path) -> CmdResult {
     rows.push((
         "info".to_string(),
         "rules and previews for this worktree".to_string(),
+    ));
+    rows.push((
+        "rule".to_string(),
+        "the whole policy, defaults filled in".to_string(),
     ));
     rows.push((
         "save".to_string(),

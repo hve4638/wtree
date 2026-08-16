@@ -275,7 +275,7 @@ pub enum Affordance {
 pub fn verb_allowed_when_unknown(verb: &str) -> bool {
     matches!(
         verb,
-        "adopt" | "list" | "info" | "init" | "save" | "open" | "close"
+        "adopt" | "list" | "info" | "rule" | "init" | "save" | "open" | "close"
     )
 }
 
@@ -2436,7 +2436,9 @@ mod tests {
                 "{verb} must be refused when unknown"
             );
         }
-        for verb in ["adopt", "list", "info", "init", "save", "open", "close"] {
+        for verb in [
+            "adopt", "list", "info", "rule", "init", "save", "open", "close",
+        ] {
             assert!(
                 verb_allowed_when_unknown(verb),
                 "{verb} must be allowed when unknown"
