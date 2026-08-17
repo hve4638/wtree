@@ -1845,7 +1845,7 @@ pub fn info(cwd: &Path) -> CmdResult {
         }
         let allowed: Vec<&str> = [
             "new", "open", "merge", "sync", "land", "destroy", "close", "list", "info", "rule",
-            "init", "save", "adopt", "llm",
+            "init", "save", "adopt", "llms.txt",
         ]
         .into_iter()
         .filter(|v| judge::verb_allowed_when_unknown(v))
@@ -1966,7 +1966,7 @@ pub fn help(cwd: &Path) -> CmdResult {
         println!("  init                      ask where {RULES_LABEL} should come from");
         println!("  init --new                write a starter one");
         println!("  init --load [path]        take one from a .wtree/");
-        println!("\n'wtree llm' for how to work under wtree, written for coding agents");
+        println!("\n'wtree llms.txt' for how to work under wtree, written for coding agents");
         return Ok(());
     }
     let cfg = load_rules(&repo)?;
@@ -2054,7 +2054,7 @@ pub fn help(cwd: &Path) -> CmdResult {
         println!("  {usage:width$}  {note}");
     }
     println!("\nwtree -h for every verb, whether or not it applies here");
-    println!("'wtree llm' for how to work under wtree, written for coding agents");
+    println!("'wtree llms.txt' for how to work under wtree, written for coding agents");
     Ok(())
 }
 

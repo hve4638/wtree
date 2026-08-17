@@ -55,7 +55,7 @@ wtree land -m "feat: add something"
 
 main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크트리를 남기고 병합만 하려면 `wtree merge`를 쓴다. `squash`와 `no-ff`는 새 커밋을 만들기 때문에 `-m`이 필요하다.
 
-`wtree`만 실행하면 현재 워크트리에서 정책을 통과할 동사만 보여준다. 전체 매뉴얼은 `wtree help --all`이다. 코딩 에이전트에게는 `wtree llm` 브리핑을 읽히면 된다.
+`wtree`만 실행하면 현재 워크트리에서 정책을 통과할 동사만 보여준다. 전체 매뉴얼은 `wtree help --all`이다. 코딩 에이전트에게는 `wtree llms.txt` 브리핑을 읽히면 된다.
 
 ## 동사
 
@@ -71,7 +71,7 @@ main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크
 | `adopt` | 기존 브랜치를 정책 아래로 편입 |
 | `list` / `info` | 무엇이 있고 여기서 무엇이 허용되는지 표시 |
 | `rule` | 정책 전체를 생략된 기본값까지 채워서 표시 |
-| `llm` | 코딩 에이전트를 위한 wtree 사용 브리핑 |
+| `llms.txt` | 코딩 에이전트를 위한 wtree 사용 브리핑 |
 | `init --new` | 초기 설정 파일을 생성 |
 | `init --load [path]` | 대신 `.wtree/`에서 규칙을 가져옴 |
 | `save [path]` | 규칙을 커밋할 수 있는 `.wtree/`로 복사 |

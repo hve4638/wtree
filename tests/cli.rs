@@ -1623,7 +1623,7 @@ fn info_unknown_shows_reasons_and_adopt_hint() {
     assert!(stdout.contains("not a declared [branch]"), "{stdout}");
     assert!(stdout.contains("wtree adopt"), "{stdout}");
     assert!(
-        stdout.contains("allowed verbs here: open, close, list, info, rule, init, save, adopt, llm"),
+        stdout.contains("allowed verbs here: open, close, list, info, rule, init, save, adopt, llms.txt"),
         "{stdout}"
     );
 }
@@ -4249,36 +4249,36 @@ fn the_manual_needs_neither_a_repo_nor_a_readable_rules() {
 #[test]
 fn llm_prints_the_briefing_anywhere_and_both_screens_point_at_it() {
     let fx = Fixture::new();
-    let o = run_wt(&fx.tmp.0, &["llm"]);
+    let o = run_wt(&fx.tmp.0, &["llms.txt"]);
     assert_ok(&o);
     let text = out(&o);
     assert!(text.contains("a briefing for coding agents"), "{text}");
     assert!(text.contains("wtree info"), "{text}");
 
     // The one topic: the rules-file reference, pointing back at `wtree rule`.
-    let o = run_wt(&fx.tmp.0, &["llm", "rule"]);
+    let o = run_wt(&fx.tmp.0, &["llms.txt", "rule"]);
     assert_ok(&o);
     let text = out(&o);
     assert!(text.contains("the rules file reference"), "{text}");
     assert!(text.contains("merge-mode"), "{text}");
 
     // A wrong topic is answered with the registry, not a silent briefing.
-    let o = run_wt(&fx.tmp.0, &["llm", "extra"]);
+    let o = run_wt(&fx.tmp.0, &["llms.txt", "extra"]);
     assert_eq!(o.status.code(), Some(2), "{}", err(&o));
-    assert!(err(&o).contains("wtree llm [rule]"), "{}", err(&o));
-    let o = run_wt(&fx.tmp.0, &["llm", "rule", "extra"]);
+    assert!(err(&o).contains("wtree llms.txt [rule]"), "{}", err(&o));
+    let o = run_wt(&fx.tmp.0, &["llms.txt", "rule", "extra"]);
     assert_eq!(o.status.code(), Some(2), "{}", err(&o));
 
     // ... and past a rules file that cannot load, like the manual.
     write_rules(&fx, "[main]\nchildren = group:ghost\nbogus-key = 1\n");
-    assert_ok(&run_wt(&fx.repo, &["llm"]));
-    assert_ok(&run_wt(&fx.repo, &["llm", "rule"]));
+    assert_ok(&run_wt(&fx.repo, &["llms.txt"]));
+    assert_ok(&run_wt(&fx.repo, &["llms.txt", "rule"]));
 
     write_rules(&fx, GROUP_CFG);
     let menu = out(&run_wt(&fx.repo, &[]));
-    assert!(menu.contains("wtree llm"), "{menu}");
+    assert!(menu.contains("wtree llms.txt"), "{menu}");
     let manual = out(&run_wt(&fx.repo, &["-h"]));
-    assert!(manual.contains("wtree llm"), "{manual}");
+    assert!(manual.contains("wtree llms.txt"), "{manual}");
 }
 
 /// `--help` used to be read as an argument: verbs that parse their flags called
@@ -4460,5 +4460,5 @@ fn an_uninitialized_repo_is_pointed_at_init() {
     assert!(stdout.contains("no wtree policy yet"), "{stdout}");
     assert!(stdout.contains("init"), "{stdout}");
     // The briefing explains setup, so this screen must point at it too.
-    assert!(stdout.contains("wtree llm"), "{stdout}");
+    assert!(stdout.contains("wtree llms.txt"), "{stdout}");
 }

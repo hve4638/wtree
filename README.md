@@ -55,7 +55,7 @@ wtree land -m "feat: add something"
 
 That squash-merges into main and cleans up the worktree and the branch. To merge and keep the worktree, use `wtree merge`. `squash` and `no-ff` create a new commit, so they need `-m`.
 
-`wtree` on its own lists only the verbs that would get past the policy where you are standing. `wtree -h` is the full manual, and `wtree <verb> -h` is one verb's line. `wtree llm` is the briefing to hand a coding agent.
+`wtree` on its own lists only the verbs that would get past the policy where you are standing. `wtree -h` is the full manual, and `wtree <verb> -h` is one verb's line. `wtree llms.txt` is the briefing to hand a coding agent.
 
 ## Verbs
 
@@ -71,7 +71,7 @@ That squash-merges into main and cleans up the worktree and the branch. To merge
 | `adopt` | bring an existing branch under the policy |
 | `list` / `info` | what exists, and what is allowed here |
 | `rule` | the whole policy, defaults filled in |
-| `llm` | how to work under wtree, for coding agents |
+| `llms.txt` | how to work under wtree, for coding agents |
 | `init --new` | write the starter files |
 | `init --load [path]` | take the rules from a `.wtree/` instead |
 | `save [path]` | copy the rules out to a `.wtree/` you can commit |

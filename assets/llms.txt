@@ -8,7 +8,7 @@ wtree is a policy layer over git worktree. A repository declares its branch tree
 
 wtree's policy is stored in .git/wtree/.
 - settings: where worktrees are created, and the like.
-- rules: branches and merge rules. `wtree llm rule` explains how to write it. `wtree rule` shows the rules currently in effect.
+- rules: branches and merge rules. `wtree llms.txt rule` explains how to write it. `wtree rule` shows the rules currently in effect.
 
 ## Checking available commands
 
