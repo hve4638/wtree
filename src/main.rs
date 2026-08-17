@@ -181,11 +181,12 @@ fn main() -> ExitCode {
         }
         // Like the manual: no repo, no rules. The briefing is static on
         // purpose — everything repo-specific it defers to `wtree info` and
-        // `wtree rule`.
-        "llm" => {
+        // `wtree rule`. Named after the llms.txt convention so it reads as
+        // the document it prints, not as a feature an LLM powers.
+        "llms.txt" => {
             match rest {
-                [] => print!("{}", include_str!("../assets/llm.md")),
-                [t] if t == "rule" => print!("{}", include_str!("../assets/llm.rule.md")),
+                [] => print!("{}", include_str!("../assets/llms.txt")),
+                [t] if t == "rule" => print!("{}", include_str!("../assets/llms.rule.txt")),
                 [t] => {
                     eprintln!("error: unknown topic '{t}'\n{LLM_USAGE}");
                     return ExitCode::from(2);
@@ -497,7 +498,7 @@ const LIST_USAGE: &str = "usage: wtree list [--unmanaged]";
 
 /// `rule` is the only topic today; the list in this line is the registry a
 /// wrong topic is answered with.
-const LLM_USAGE: &str = "usage: wtree llm [rule]";
+const LLM_USAGE: &str = "usage: wtree llms.txt [rule]";
 
 /// The unmanaged block is folded to a count by default. It is the one part of
 /// the listing wtree did not arrange, and each entry costs several lines of
@@ -654,7 +655,7 @@ const ROWS: &[(&str, &str, &str)] = &[
         "the whole policy, defaults filled in",
     ),
     (
-        "llm",
+        "llms.txt",
         LLM_USAGE,
         "how to work under wtree, for coding agents",
     ),
@@ -754,14 +755,17 @@ mod tests {
     #[test]
     fn the_briefings_name_only_verbs_the_manual_has() {
         for (name, text) in [
-            ("llm.md", include_str!("../assets/llm.md")),
-            ("llm.rule.md", include_str!("../assets/llm.rule.md")),
+            ("llms.txt", include_str!("../assets/llms.txt")),
+            ("llms.rule.txt", include_str!("../assets/llms.rule.txt")),
         ] {
             let mut seen = 0;
             for (i, key) in text.match_indices("`wtree ") {
+                // '.' rides along for llms.txt; no verb ends with one, so the
+                // scan never swallows a sentence period (it sits after the
+                // closing backtick).
                 let word: String = text[i + key.len()..]
                     .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
                     .collect();
                 if word.is_empty() || word == "-h" {
                     continue;
