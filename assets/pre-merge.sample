@@ -1,0 +1,22 @@
+#!/usr/bin/env sh
+# Called before `wtree merge` and the merge half of `wtree land`
+# A non-zero exit blocks the verb
+# Under `land`, pre-merge and pre-destroy both run before the merge
+# New files a hook leaves stop `land` (`stopped:`); leave the tree as found
+#
+# cwd = $WTREE_PATH
+#
+#   WTREE_HOOK         pre-merge
+#   WTREE_REPO         primary worktree root
+#   WTREE_INTERACTIVE  1 when stdout is a terminal, else 0
+#   WTREE_PATH         the worktree being merged
+#   WTREE_BRANCH       source branch
+#   WTREE_TARGET       target branch
+#   WTREE_MODE         squash | rebase | no-ff | ff
+#   WTREE_MESSAGE      -m text; empty under --rebase and --ff
+#   WTREE_VERB         merge | land
+#   WTREE_DIRTY        1 when the tree has uncommitted changes, else 0
+#
+# To enable this hook, rename this file to "pre-merge"
+
+set -eu

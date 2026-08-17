@@ -90,11 +90,11 @@ fn init_creates_template_and_refuses_rerun() {
 
 /// The two knobs `init` cannot prefill with anything useful still have to be
 /// discoverable, so it leaves a commented file at each. Neither may take effect
-/// on its own: the settings file must load as defaults, and the hook sample
+/// on its own: the settings file must load as defaults, and the hook samples
 /// must not be found by `new` (hence git's `.sample` spelling — a file named
 /// `post-create` would warn about not being executable on every run).
 #[test]
-fn init_seeds_a_commented_settings_file_and_an_inert_hook_sample() {
+fn init_seeds_a_commented_settings_file_and_inert_hook_samples() {
     let fx = Fixture::new();
     assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
 
@@ -110,17 +110,26 @@ fn init_seeds_a_commented_settings_file_and_an_inert_hook_sample() {
         "every line must be a comment:\n{sett}"
     );
 
-    let sample = fx.repo.join(".git/wtree/hooks/post-create.sample");
-    assert!(sample.is_file(), "hook sample written");
-    assert!(
-        !fx.repo.join(".git/wtree/hooks/post-create").exists(),
-        "not enabled"
-    );
-    assert_ne!(
-        fs::metadata(&sample).unwrap().permissions().mode() & 0o111,
-        0,
-        "already executable, so enabling it is a rename"
-    );
+    for hook in [
+        "pre-create",
+        "post-create",
+        "pre-merge",
+        "post-merge",
+        "pre-destroy",
+        "post-destroy",
+    ] {
+        let sample = fx.repo.join(format!(".git/wtree/hooks/{hook}.sample"));
+        assert!(sample.is_file(), "{hook} sample written");
+        assert!(
+            !fx.repo.join(".git/wtree/hooks").join(hook).exists(),
+            "{hook} not enabled"
+        );
+        assert_ne!(
+            fs::metadata(&sample).unwrap().permissions().mode() & 0o111,
+            0,
+            "already executable, so enabling {hook} is a rename"
+        );
+    }
 
     // The defaults still apply and nothing warns about the sample.
     write_rules(
@@ -4232,6 +4241,44 @@ fn the_manual_needs_neither_a_repo_nor_a_readable_rules() {
 
     // The contextual menu cannot be built from that rules, and says so.
     assert_fail(&run_wt(&fx.repo, &[]));
+}
+
+/// The briefing is static and reads nothing, so it answers anywhere — even
+/// outside a repo. Both entry screens point at it, since an agent arrives
+/// through one of them.
+#[test]
+fn llm_prints_the_briefing_anywhere_and_both_screens_point_at_it() {
+    let fx = Fixture::new();
+    let o = run_wt(&fx.tmp.0, &["llm"]);
+    assert_ok(&o);
+    let text = out(&o);
+    assert!(text.contains("a briefing for coding agents"), "{text}");
+    assert!(text.contains("wtree info"), "{text}");
+
+    // The one topic: the rules-file reference, pointing back at `wtree rule`.
+    let o = run_wt(&fx.tmp.0, &["llm", "rule"]);
+    assert_ok(&o);
+    let text = out(&o);
+    assert!(text.contains("the rules file reference"), "{text}");
+    assert!(text.contains("merge-mode"), "{text}");
+
+    // A wrong topic is answered with the registry, not a silent briefing.
+    let o = run_wt(&fx.tmp.0, &["llm", "extra"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("wtree llm [rule]"), "{}", err(&o));
+    let o = run_wt(&fx.tmp.0, &["llm", "rule", "extra"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+
+    // ... and past a rules file that cannot load, like the manual.
+    write_rules(&fx, "[main]\nchildren = group:ghost\nbogus-key = 1\n");
+    assert_ok(&run_wt(&fx.repo, &["llm"]));
+    assert_ok(&run_wt(&fx.repo, &["llm", "rule"]));
+
+    write_rules(&fx, GROUP_CFG);
+    let menu = out(&run_wt(&fx.repo, &[]));
+    assert!(menu.contains("wtree llm"), "{menu}");
+    let manual = out(&run_wt(&fx.repo, &["-h"]));
+    assert!(manual.contains("wtree llm"), "{manual}");
 }
 
 /// `--help` used to be read as an argument: verbs that parse their flags called

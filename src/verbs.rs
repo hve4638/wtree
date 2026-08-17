@@ -196,9 +196,10 @@ pub fn init(cwd: &Path, mode: InitMode, force: bool) -> CmdResult {
     fs::create_dir_all(&hooks).map_err(|e| format!("cannot create {}: {e}", hooks.display()))?;
     // `.sample`, as git spells its own hook templates: a file named
     // `post-create` would be found on every `new` and warned about for not
-    // being executable. Executable already, so enabling it is a rename.
-    let sample = hooks.join("post-create.sample");
-    write_if_absent(&sample, HOOK_SAMPLE, 0o755)?;
+    // being executable. Executable already, so enabling one is a rename.
+    for (name, body) in HOOK_SAMPLES {
+        write_if_absent(&hooks.join(name), body, 0o755)?;
+    }
 
     let rules_file = rules_path(&repo.common_dir);
     let sett = settings_path(&repo.common_dir);
@@ -237,8 +238,8 @@ pub fn init(cwd: &Path, mode: InitMode, force: bool) -> CmdResult {
         }
     );
     println!(
-        "  {}  (rename to any hook name to enable; it documents all six)",
-        sample.display()
+        "  {}  (a sample per hook; rename one to enable it)",
+        hooks.join("*.sample").display()
     );
     if let Some(b) = backup {
         println!(
@@ -470,7 +471,7 @@ fn write_new(path: &Path, body: &str, mode: u32) -> Result<(), String> {
 }
 
 /// Only fills a gap; `false` when something was already there. Used for the
-/// hook sample, which survives every `init` because a hook someone wrote is not
+/// hook samples, which survive every `init` because a hook someone wrote is not
 /// this command's to replace, and for the settings template when a load has no
 /// settings of its own to put in its place.
 fn write_if_absent(path: &Path, body: &str, mode: u32) -> Result<bool, String> {
@@ -502,77 +503,14 @@ const SETTINGS_TEMPLATE: &str = "\
 # worktree-dir = ../wts
 ";
 
-const HOOK_SAMPLE: &str = "\
-#!/usr/bin/env sh
-# Rename this file to one of the six hook names to enable it, or link it under
-# several and branch on $WTREE_HOOK. Six hooks, in pairs:
-#
-#   pre-create   post-create    `wtree new` and `wtree open`
-#   pre-merge    post-merge     `wtree merge`, and the merge half of `wtree land`
-#   pre-destroy  post-destroy   `wtree destroy`, and the destroy half of `land`
-#
-# A `pre-` hook is a gate: a non-zero exit aborts before anything is touched.
-# A `post-` hook only reports, so a non-zero exit is a warning and what the
-# verb did stands. `set -e` is how a failure gets noticed either way.
-# `wtree <verb> --no-hooks` skips both halves for one run.
-#
-# Under `land` both gates run before the merge, so either can still abort the
-# whole verb. Leave the working tree as you found it: new files a hook leaves
-# there make `land` stop (`stopped:`) rather than force-delete them — write
-# scratch output outside the worktree, or clean it up before exiting.
-#
-# Every hook gets:
-#   WTREE_HOOK         which of the six is running
-#   WTREE_REPO         primary worktree root
-#   WTREE_INTERACTIVE  1 when stdout is a terminal, else 0
-# Names a pair does not set arrive empty, never with another run's values.
-#
-# create hooks, cwd = the new worktree (the one you are in, for pre-create):
-#   WTREE_PATH         the worktree — under pre-create, where it will be
-#   WTREE_BRANCH       branch the worktree is for
-#   WTREE_PARENT       its parent; empty under `open` when none is declared
-#   WTREE_VERB         new | open
-# Everything after `--` on the `new`/`open` command line arrives here as \"$@\":
-# the same arguments to both halves, word boundaries intact, nothing expanded.
-#
-# merge hooks, cwd = the worktree being merged:
-#   WTREE_PATH         that worktree
-#   WTREE_BRANCH       branch being merged
-#   WTREE_TARGET       branch it lands on
-#   WTREE_MODE         squash | rebase | no-ff | ff
-#   WTREE_MESSAGE      -m text; empty under --rebase and --ff
-#   WTREE_VERB         merge | land
-#   WTREE_DIRTY        1 when the working tree has uncommitted changes, else 0
-#   WTREE_TIP          post-merge only: the target's tip after the merge
-#
-# destroy hooks, cwd = the worktree (post-destroy: the repo root, it is gone):
-#   WTREE_PATH         the worktree — under post-destroy it no longer exists
-#   WTREE_BRANCH       branch being removed
-#   WTREE_VERB         destroy | land
-#
-# A cascade removes several branches, so the destroy hooks run once per branch.
-# Every pre-destroy runs before the first removal.
-#
-# Files the parent already has belong in the rules' `copy` key; a hook
-# is for what has to be generated here.
-
-set -eu
-
-# case \"$WTREE_HOOK\" in
-# post-create)
-#   cat > .cargo/config.toml <<CFG
-# [build]
-# target-dir = \"$WTREE_REPO/../.wtree-target\"
-# CFG
-#   ;;
-# pre-merge)
-#   # Only commits are merged. A dirty tree would make the suite test
-#   # something other than what lands, so refuse to judge it.
-#   [ \"$WTREE_DIRTY\" = 0 ] || { echo 'uncommitted changes; commit first'; exit 1; }
-#   cargo test
-#   ;;
-# esac
-";
+const HOOK_SAMPLES: [(&str, &str); 6] = [
+    ("pre-create.sample", include_str!("../assets/pre-create.sample")),
+    ("post-create.sample", include_str!("../assets/post-create.sample")),
+    ("pre-merge.sample", include_str!("../assets/pre-merge.sample")),
+    ("post-merge.sample", include_str!("../assets/post-merge.sample")),
+    ("pre-destroy.sample", include_str!("../assets/pre-destroy.sample")),
+    ("post-destroy.sample", include_str!("../assets/post-destroy.sample")),
+];
 
 /// DESIGN "root seeding": origin/HEAD symref -> main/master existence ->
 /// current branch. Used only to prefill the init template.
@@ -2115,6 +2053,7 @@ pub fn help(cwd: &Path) -> CmdResult {
         println!("  {usage:width$}  {note}");
     }
     println!("\nwtree -h for every verb, whether or not it applies here");
+    println!("wtree llm for how to work under wtree, written for coding agents");
     Ok(())
 }
 
@@ -3341,6 +3280,29 @@ fn short_head(wt: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The samples live in assets/ as real shell scripts, so edits over
+    /// there never go through a compiler. This is what catches a typo.
+    #[test]
+    fn hook_samples_are_valid_shell() {
+        for (name, body) in HOOK_SAMPLES {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets")
+                .join(name);
+            let status = std::process::Command::new("sh")
+                .arg("-n")
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name}");
+            // A swapped include_str! pairing would compile and seed fine.
+            let hook = name.trim_end_matches(".sample");
+            assert!(
+                body.contains(&format!("rename this file to \"{hook}\"")),
+                "{name} carries another hook's body"
+            );
+        }
+    }
 
     /// The cut has to land on a character boundary and inside the budget, and
     /// a wide character that would straddle the last column has to be dropped

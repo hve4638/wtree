@@ -55,7 +55,7 @@ wtree land -m "feat: add something"
 
 That squash-merges into main and cleans up the worktree and the branch. To merge and keep the worktree, use `wtree merge`. `squash` and `no-ff` create a new commit, so they need `-m`.
 
-`wtree` on its own lists only the verbs that would get past the policy where you are standing. `wtree -h` is the full manual, and `wtree <verb> -h` is one verb's line.
+`wtree` on its own lists only the verbs that would get past the policy where you are standing. `wtree -h` is the full manual, and `wtree <verb> -h` is one verb's line. `wtree llm` is the briefing to hand a coding agent.
 
 ## Verbs
 
@@ -71,6 +71,7 @@ That squash-merges into main and cleans up the worktree and the branch. To merge
 | `adopt` | bring an existing branch under the policy |
 | `list` / `info` | what exists, and what is allowed here |
 | `rule` | the whole policy, defaults filled in |
+| `llm` | how to work under wtree, for coding agents |
 | `init --new` | write the starter files |
 | `init --load [path]` | take the rules from a `.wtree/` instead |
 | `save [path]` | copy the rules out to a `.wtree/` you can commit |
@@ -110,7 +111,7 @@ What each `merge-mode` leaves in the parent:
 
 ## Hooks
 
-Executables in `hooks/`, named after the moment they run at. `init` writes a `post-create.sample` documenting the whole contract; rename it to enable it, or link it under several names and branch on `$WTREE_HOOK`.
+Executables in `hooks/`, named after the moment they run at. `init` writes a `.sample` for each hook; rename one to enable it, or link one script under several names and branch on `$WTREE_HOOK`.
 
 | hook | runs |
 |---|---|
@@ -122,7 +123,7 @@ A `pre-` hook is a gate: a non-zero exit aborts the verb before anything has bee
 
 A hook must leave the working tree as it found it. New files a hook leaves there make `land` stop (`stopped:`, naming the files and the hooks that ran) rather than force-delete them; `wtree destroy` then finishes the job once they are dealt with.
 
-Each hook gets `WTREE_HOOK`, `WTREE_REPO` and `WTREE_INTERACTIVE`, plus `WTREE_PATH` and `WTREE_BRANCH` for the worktree it concerns. `WTREE_VERB` names the verb that was typed, which is how the create pair tells `new` from `open` and the other two tell a bare verb from `land`'s. The merge pair adds `WTREE_TARGET`, `WTREE_MODE`, `WTREE_MESSAGE` and `WTREE_DIRTY`, and `WTREE_TIP` for `post-merge`. The sample lists all of them.
+Each hook gets `WTREE_HOOK`, `WTREE_REPO` and `WTREE_INTERACTIVE`, plus `WTREE_PATH` and `WTREE_BRANCH` for the worktree it concerns. `WTREE_VERB` names the verb that was typed, which is how the create pair tells `new` from `open` and the other two tell a bare verb from `land`'s. The merge pair adds `WTREE_TARGET`, `WTREE_MODE`, `WTREE_MESSAGE` and `WTREE_DIRTY`, and `WTREE_TIP` for `post-merge`. Each sample lists the ones its hook gets. Names a hook's pair does not set arrive empty, never with another run's values.
 
 On `new` and `open`, everything after `--` reaches the create pair as `"$@"` — word boundaries intact, nothing expanded — so a hook can start whatever the worktree was made for:
 

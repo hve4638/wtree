@@ -55,7 +55,7 @@ wtree land -m "feat: add something"
 
 main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크트리를 남기고 병합만 하려면 `wtree merge`를 쓴다. `squash`와 `no-ff`는 새 커밋을 만들기 때문에 `-m`이 필요하다.
 
-`wtree`만 실행하면 현재 워크트리에서 정책을 통과할 동사만 보여준다. 전체 매뉴얼은 `wtree help --all`이다.
+`wtree`만 실행하면 현재 워크트리에서 정책을 통과할 동사만 보여준다. 전체 매뉴얼은 `wtree help --all`이다. 코딩 에이전트에게는 `wtree llm` 브리핑을 읽히면 된다.
 
 ## 동사
 
@@ -71,6 +71,7 @@ main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크
 | `adopt` | 기존 브랜치를 정책 아래로 편입 |
 | `list` / `info` | 무엇이 있고 여기서 무엇이 허용되는지 표시 |
 | `rule` | 정책 전체를 생략된 기본값까지 채워서 표시 |
+| `llm` | 코딩 에이전트를 위한 wtree 사용 브리핑 |
 | `init --new` | 초기 설정 파일을 생성 |
 | `init --load [path]` | 대신 `.wtree/`에서 규칙을 가져옴 |
 | `save [path]` | 규칙을 커밋할 수 있는 `.wtree/`로 복사 |
@@ -110,7 +111,7 @@ main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크
 
 ## 훅
 
-`hooks/` 안의 실행 파일이고, 이름이 곧 실행 시점이다. `init`이 전체 계약을 설명하는 `post-create.sample`을 써 두므로 이름만 바꾸면 켜진다. 여러 이름으로 링크해두고 `$WTREE_HOOK`으로 분기해도 된다.
+`hooks/` 안의 실행 파일이고, 이름이 곧 실행 시점이다. `init`이 훅마다 `.sample`을 써 두므로 이름만 바꾸면 켜진다. 한 스크립트를 여러 이름으로 링크해두고 `$WTREE_HOOK`으로 분기해도 된다.
 
 | 훅 | 실행 시점 |
 |---|---|
@@ -122,7 +123,7 @@ main으로 squash 병합하고 워크트리와 브랜치를 정리한다. 워크
 
 훅은 워킹트리를 원래대로 두고 나와야 한다. 훅이 새 파일을 남기면 `land`는 그것을 지우는 대신 멈춘다(`stopped:`, 파일과 실행된 훅을 나열). 파일을 처리한 뒤 `wtree destroy`로 마무리하면 된다.
 
-모든 훅이 `WTREE_HOOK`, `WTREE_REPO`, `WTREE_INTERACTIVE`를 받고, 대상 워크트리에 대한 `WTREE_PATH`와 `WTREE_BRANCH`가 따라온다. `WTREE_VERB`는 실제로 타이핑된 동사라, create 쌍은 이것으로 `new`와 `open`을, 나머지 둘은 단독 동사와 `land`를 구분한다. 병합 훅에는 `WTREE_TARGET`, `WTREE_MODE`, `WTREE_MESSAGE`, `WTREE_DIRTY`가, `post-merge`에는 `WTREE_TIP`이 추가된다. 전체 목록은 샘플에 있다.
+모든 훅이 `WTREE_HOOK`, `WTREE_REPO`, `WTREE_INTERACTIVE`를 받고, 대상 워크트리에 대한 `WTREE_PATH`와 `WTREE_BRANCH`가 따라온다. `WTREE_VERB`는 실제로 타이핑된 동사라, create 쌍은 이것으로 `new`와 `open`을, 나머지 둘은 단독 동사와 `land`를 구분한다. 병합 훅에는 `WTREE_TARGET`, `WTREE_MODE`, `WTREE_MESSAGE`, `WTREE_DIRTY`가, `post-merge`에는 `WTREE_TIP`이 추가된다. 각 샘플이 자기 훅이 받는 목록을 담고 있다. 짝이 설정하지 않는 이름은 빈 값으로 오며, 다른 실행의 값이 새어 들어오는 일은 없다.
 
 `new`와 `open`에서 `--` 뒤의 모든 것은 create 쌍에 `"$@"`로 도착한다 — 단어 경계 그대로, 아무것도 확장되지 않은 채. 워크트리를 만든 목적이 무엇이든 훅이 그것을 바로 시작할 수 있다.
 
