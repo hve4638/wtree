@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+# Called before `wtree destroy` and the destroy half of `wtree land`
+# A non-zero exit blocks the verb
+# Under `land`, pre-merge and pre-destroy both run before the merge
+# A cascade runs this once per branch, all before the first removal
+#
+# cwd = $WTREE_PATH
+#
+#   WTREE_HOOK         pre-destroy
+#   WTREE_REPO         primary worktree root
+#   WTREE_INTERACTIVE  1 when stdout is a terminal, else 0
+#   WTREE_PATH         the worktree about to go
+#   WTREE_BRANCH       branch being removed
+#   WTREE_VERB         destroy | land
+#
+# To enable this hook, rename this file to "pre-destroy"
+
+set -eu

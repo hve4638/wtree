@@ -90,11 +90,11 @@ fn init_creates_template_and_refuses_rerun() {
 
 /// The two knobs `init` cannot prefill with anything useful still have to be
 /// discoverable, so it leaves a commented file at each. Neither may take effect
-/// on its own: the settings file must load as defaults, and the hook sample
+/// on its own: the settings file must load as defaults, and the hook samples
 /// must not be found by `new` (hence git's `.sample` spelling — a file named
 /// `post-create` would warn about not being executable on every run).
 #[test]
-fn init_seeds_a_commented_settings_file_and_an_inert_hook_sample() {
+fn init_seeds_a_commented_settings_file_and_inert_hook_samples() {
     let fx = Fixture::new();
     assert_ok(&run_wt(&fx.repo, &["init", "--new"]));
 
@@ -110,17 +110,26 @@ fn init_seeds_a_commented_settings_file_and_an_inert_hook_sample() {
         "every line must be a comment:\n{sett}"
     );
 
-    let sample = fx.repo.join(".git/wtree/hooks/post-create.sample");
-    assert!(sample.is_file(), "hook sample written");
-    assert!(
-        !fx.repo.join(".git/wtree/hooks/post-create").exists(),
-        "not enabled"
-    );
-    assert_ne!(
-        fs::metadata(&sample).unwrap().permissions().mode() & 0o111,
-        0,
-        "already executable, so enabling it is a rename"
-    );
+    for hook in [
+        "pre-create",
+        "post-create",
+        "pre-merge",
+        "post-merge",
+        "pre-destroy",
+        "post-destroy",
+    ] {
+        let sample = fx.repo.join(format!(".git/wtree/hooks/{hook}.sample"));
+        assert!(sample.is_file(), "{hook} sample written");
+        assert!(
+            !fx.repo.join(".git/wtree/hooks").join(hook).exists(),
+            "{hook} not enabled"
+        );
+        assert_ne!(
+            fs::metadata(&sample).unwrap().permissions().mode() & 0o111,
+            0,
+            "already executable, so enabling {hook} is a rename"
+        );
+    }
 
     // The defaults still apply and nothing warns about the sample.
     write_rules(
@@ -1614,8 +1623,94 @@ fn info_unknown_shows_reasons_and_adopt_hint() {
     assert!(stdout.contains("not a declared [branch]"), "{stdout}");
     assert!(stdout.contains("wtree adopt"), "{stdout}");
     assert!(
-        stdout.contains("allowed verbs here: open, close, list, info, init, save, adopt"),
+        stdout.contains("allowed verbs here: open, close, list, info, rule, init, save, adopt, llm"),
         "{stdout}"
+    );
+}
+
+// -------------------------------------------------------------------- rule ----
+
+/// One line per line of the screen, runs of spaces collapsed, so the assertions
+/// read a key and its value without owning the column widths.
+fn flat_lines(o: &Output) -> Vec<String> {
+    out(o)
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+#[test]
+fn rule_prints_every_key_and_marks_the_filled_in_ones() {
+    let fx = Fixture::new();
+    write_rules(
+        &fx,
+        "[main]\nchildren = group:feat\nmerge-mode = squash\n\n\
+         [group:feat]\nname-allow = feature/*\nephemeral = true\n",
+    );
+    let o = run_wt(&fx.repo, &["rule"]);
+    assert_ok(&o);
+    let lines = flat_lines(&o);
+    let stdout = out(&o);
+    let has = |s: &str| lines.iter().any(|l| l == s);
+    assert!(stdout.starts_with(".git/wtree/rules\n"), "{stdout}");
+    for want in [
+        "[main]",
+        "children = group:feat",
+        "merge-mode = squash",
+        // absent from the file, and judged by all the same
+        "destroyable = true (default)",
+        "copy = (none) (default)",
+        "description = (none) (default)",
+        "[group:feat]",
+        "name-allow = feature/*",
+        "ephemeral = true",
+        // no merge-mode means every mode, not none
+        "merge-mode = squash, rebase, no-ff, ff (default)",
+        // an empty allow-list takes any name; an empty deny-list denies nothing
+        "name-deny = (none) (default)",
+        "children = (none) (default)",
+    ] {
+        assert!(has(want), "missing '{want}':\n{stdout}");
+    }
+    // `merge-mode = none` is a declared refusal of every mode, not an absence
+    write_rules(&fx, "[main]\nchildren = *\nmerge-mode = none\n");
+    assert!(
+        flat_lines(&run_wt(&fx.repo, &["rule"]))
+            .iter()
+            .any(|l| l == "merge-mode = none"),
+        "{}",
+        out(&run_wt(&fx.repo, &["rule"]))
+    );
+}
+
+/// The policy does not depend on where it is read from: an unmanaged worktree
+/// gets the same screen, since nothing here is judged against an identity.
+#[test]
+fn rule_reads_the_same_from_an_unmanaged_worktree_and_takes_no_arguments() {
+    let fx = Fixture::new();
+    write_rules(&fx, GROUP_CFG);
+    let junk = fx.add_worktree("junk", "main");
+    let o = run_wt(&junk, &["rule"]);
+    assert_ok(&o);
+    assert_eq!(flat_lines(&o), flat_lines(&run_wt(&fx.repo, &["rule"])));
+
+    let o = run_wt(&fx.repo, &["rule", "--all"]);
+    assert_fail(&o);
+    assert!(err(&o).contains("takes no arguments"), "{}", err(&o));
+}
+
+/// A rules file with nothing in it loads, so the screen has to say that it is
+/// the policy that is empty and not the command that gave up.
+#[test]
+fn rule_says_so_when_nothing_is_declared() {
+    let fx = Fixture::new();
+    write_rules(&fx, "# emptied by hand\n");
+    let o = run_wt(&fx.repo, &["rule"]);
+    assert_ok(&o);
+    assert!(
+        out(&o).contains("no rule — nothing is declared"),
+        "{}",
+        out(&o)
     );
 }
 
@@ -3799,7 +3894,7 @@ fn wtree_dirty_tells_the_gate_about_uncommitted_changes() {
 fn verbs_require_init_and_valid_rules() {
     let fx = Fixture::new();
     // no rules yet
-    for verb in ["list", "info", "new"] {
+    for verb in ["list", "info", "rule", "new"] {
         let o = if verb == "new" {
             run_wt(&fx.repo, &["new", "feature/a"])
         } else {
@@ -3812,16 +3907,20 @@ fn verbs_require_init_and_valid_rules() {
             err(&o)
         );
     }
-    // a rules with errors blocks execution, citing label:line
+    // a rules with errors blocks execution, citing label:line. `rule` among
+    // them: a policy that does not parse is not one to be read out as if the
+    // verbs would go by it.
     write_rules(&fx, "[main]\nchildren = group:ghost\n");
-    let o = run_wt(&fx.repo, &["list"]);
-    assert_fail(&o);
-    let stderr = err(&o);
-    assert!(
-        stderr.contains("undeclared group 'group:ghost'"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("(.git/wtree/rules:2)"), "{stderr}");
+    for verb in ["list", "rule"] {
+        let o = run_wt(&fx.repo, &[verb]);
+        assert_fail(&o);
+        let stderr = err(&o);
+        assert!(
+            stderr.contains("undeclared group 'group:ghost'"),
+            "{verb}: {stderr}"
+        );
+        assert!(stderr.contains("(.git/wtree/rules:2)"), "{verb}: {stderr}");
+    }
 }
 
 #[test]
@@ -4144,6 +4243,44 @@ fn the_manual_needs_neither_a_repo_nor_a_readable_rules() {
     assert_fail(&run_wt(&fx.repo, &[]));
 }
 
+/// The briefing is static and reads nothing, so it answers anywhere — even
+/// outside a repo. Both entry screens point at it, since an agent arrives
+/// through one of them.
+#[test]
+fn llm_prints_the_briefing_anywhere_and_both_screens_point_at_it() {
+    let fx = Fixture::new();
+    let o = run_wt(&fx.tmp.0, &["llm"]);
+    assert_ok(&o);
+    let text = out(&o);
+    assert!(text.contains("a briefing for coding agents"), "{text}");
+    assert!(text.contains("wtree info"), "{text}");
+
+    // The one topic: the rules-file reference, pointing back at `wtree rule`.
+    let o = run_wt(&fx.tmp.0, &["llm", "rule"]);
+    assert_ok(&o);
+    let text = out(&o);
+    assert!(text.contains("the rules file reference"), "{text}");
+    assert!(text.contains("merge-mode"), "{text}");
+
+    // A wrong topic is answered with the registry, not a silent briefing.
+    let o = run_wt(&fx.tmp.0, &["llm", "extra"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+    assert!(err(&o).contains("wtree llm [rule]"), "{}", err(&o));
+    let o = run_wt(&fx.tmp.0, &["llm", "rule", "extra"]);
+    assert_eq!(o.status.code(), Some(2), "{}", err(&o));
+
+    // ... and past a rules file that cannot load, like the manual.
+    write_rules(&fx, "[main]\nchildren = group:ghost\nbogus-key = 1\n");
+    assert_ok(&run_wt(&fx.repo, &["llm"]));
+    assert_ok(&run_wt(&fx.repo, &["llm", "rule"]));
+
+    write_rules(&fx, GROUP_CFG);
+    let menu = out(&run_wt(&fx.repo, &[]));
+    assert!(menu.contains("wtree llm"), "{menu}");
+    let manual = out(&run_wt(&fx.repo, &["-h"]));
+    assert!(manual.contains("wtree llm"), "{manual}");
+}
+
 /// `--help` used to be read as an argument: verbs that parse their flags called
 /// it unknown, and the ones that ignore theirs (`list`, `info`) just ran. Both
 /// are wrong — a user reaching for `--help` gets help, and nothing else happens.
@@ -4322,4 +4459,6 @@ fn an_uninitialized_repo_is_pointed_at_init() {
     let stdout = out(&o);
     assert!(stdout.contains("no wtree policy yet"), "{stdout}");
     assert!(stdout.contains("init"), "{stdout}");
+    // The briefing explains setup, so this screen must point at it too.
+    assert!(stdout.contains("wtree llm"), "{stdout}");
 }

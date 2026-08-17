@@ -172,6 +172,31 @@ fn main() -> ExitCode {
             }
         },
         "info" => verbs::info(&cwd),
+        "rule" => {
+            if args.len() > 1 {
+                eprintln!("error: takes no arguments");
+                return ExitCode::from(2);
+            }
+            verbs::rule(&cwd)
+        }
+        // Like the manual: no repo, no rules. The briefing is static on
+        // purpose — everything repo-specific it defers to `wtree info` and
+        // `wtree rule`.
+        "llm" => {
+            match rest {
+                [] => print!("{}", include_str!("../assets/llm.md")),
+                [t] if t == "rule" => print!("{}", include_str!("../assets/llm.rule.md")),
+                [t] => {
+                    eprintln!("error: unknown topic '{t}'\n{LLM_USAGE}");
+                    return ExitCode::from(2);
+                }
+                _ => {
+                    eprintln!("error: takes one topic at most\n{LLM_USAGE}");
+                    return ExitCode::from(2);
+                }
+            }
+            return ExitCode::SUCCESS;
+        }
         v => {
             eprintln!("error: unknown verb '{v}'");
             eprintln!("wtree      verbs available where you are");
@@ -470,6 +495,10 @@ fn parse_merge_args(
 
 const LIST_USAGE: &str = "usage: wtree list [--unmanaged]";
 
+/// `rule` is the only topic today; the list in this line is the registry a
+/// wrong topic is answered with.
+const LLM_USAGE: &str = "usage: wtree llm [rule]";
+
 /// The unmanaged block is folded to a count by default. It is the one part of
 /// the listing wtree did not arrange, and each entry costs several lines of
 /// recovery advice nobody asked for; the count keeps them from being forgotten
@@ -620,6 +649,16 @@ const ROWS: &[(&str, &str, &str)] = &[
         "rules and previews for one worktree",
     ),
     (
+        "rule",
+        "usage: wtree rule",
+        "the whole policy, defaults filled in",
+    ),
+    (
+        "llm",
+        LLM_USAGE,
+        "how to work under wtree, for coding agents",
+    ),
+    (
         "init",
         INIT_USAGE,
         "write starter rules, or load them from a .wtree/ (asks when given neither)",
@@ -706,6 +745,35 @@ mod tests {
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The briefings are prose with no compiler behind them, so this pins
+    /// their commands to the manual: every backticked `wtree <verb>` they
+    /// show must name a verb ROWS knows. `` `wtree` `` alone never matches
+    /// the scan key, so bare mentions stay out of it.
+    #[test]
+    fn the_briefings_name_only_verbs_the_manual_has() {
+        for (name, text) in [
+            ("llm.md", include_str!("../assets/llm.md")),
+            ("llm.rule.md", include_str!("../assets/llm.rule.md")),
+        ] {
+            let mut seen = 0;
+            for (i, key) in text.match_indices("`wtree ") {
+                let word: String = text[i + key.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                if word.is_empty() || word == "-h" {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    ROWS.iter().any(|(v, ..)| *v == word),
+                    "{name} shows 'wtree {word}', which is no verb"
+                );
+            }
+            assert!(seen >= 3, "{name}: the scan found too few commands: {seen}");
+        }
     }
 
     /// `--load` takes an optional path, so the parser has to tell a directory

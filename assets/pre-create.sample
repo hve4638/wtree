@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+# Called before `wtree new` and `wtree open`
+# A non-zero exit blocks the verb
+#
+# cwd = the worktree the verb was run from; $WTREE_PATH does not exist yet
+# Everything after `--` on the command line arrives as "$@"
+#
+#   WTREE_HOOK         pre-create
+#   WTREE_REPO         primary worktree root
+#   WTREE_INTERACTIVE  1 when stdout is a terminal, else 0
+#   WTREE_PATH         where the new worktree will be
+#   WTREE_BRANCH       branch it will be for
+#   WTREE_PARENT       parent branch; empty under `open` when none is declared
+#   WTREE_VERB         new | open
+#
+# To enable this hook, rename this file to "pre-create"
+
+set -eu

@@ -1,0 +1,31 @@
+# wtree — a briefing for coding agents
+
+wtree is a policy layer over git worktree. A repository declares its branch tree in a rules file: each branch's parent, the names its children may take, the merge methods the parent accepts. wtree performs only what falls inside the policy. So a branch's origin and merge destination are always fixed.
+
+`wtree init` inside a repository sets wtree up.
+
+## Policy
+
+wtree's policy is stored in .git/wtree/.
+- settings: where worktrees are created, and the like.
+- rules: branches and merge rules. `wtree llm rule` explains how to write it. `wtree rule` shows the rules currently in effect.
+
+## Checking available commands
+
+`wtree` with no subcommand shows what is possible where you stand. For example, when the policy does not allow creating a branch from the current one, the new command does not appear. When only squash is allowed for merging to the parent, the other options do not appear.
+
+`wtree info` prints the current worktree and a preview per verb. `wtree -h` is the full manual.
+
+## wtree hooks
+
+Hooks are executables under .git/wtree/hooks. They run around each wtree command (new/open, merge, destroy; `land` runs the merge and destroy pairs). Samples are in .git/wtree/hooks; renaming one to drop the `.sample` suffix enables it, as long as it stays executable.
+
+Hooks can run tests, perform work, install dependencies. For example, a post-create hook can be written as "if inside a tmux session, open a new window at the created worktree and run claude".
+
+## Forbidden operations
+
+Where wtree is used, handle the branch lifecycle through wtree alone. Do not use `git worktree`, `git merge`, `git branch -d`, `git switch` on managed branches. They leave state wtree cannot track. One exception: when a merge or sync predicts a conflict, wtree's message names the `git merge <parent>` to run inside this worktree — follow it. Ordinary work inside a worktree is free: edit, commit, diff, log.
+
+## A record for the next session
+
+If you keep working in this repository, it is recommended to leave a record for the next agent session in a context file such as AGENTS.md: this repository uses wtree, and git's merge/switch/branch/worktree are not to be used.

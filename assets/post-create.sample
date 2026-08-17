@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+# Called after `wtree new` and `wtree open`
+# A non-zero exit is a non-blocking warning
+#
+# cwd = $WTREE_PATH
+# Everything after `--` on the command line arrives as "$@"
+#
+#   WTREE_HOOK         post-create
+#   WTREE_REPO         primary worktree root
+#   WTREE_INTERACTIVE  1 when stdout is a terminal, else 0
+#   WTREE_PATH         the new worktree
+#   WTREE_BRANCH       its branch
+#   WTREE_PARENT       parent branch; empty under `open` when none is declared
+#   WTREE_VERB         new | open
+#
+# To enable this hook, rename this file to "post-create"
+
+set -eu

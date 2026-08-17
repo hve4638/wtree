@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+# Called after `wtree destroy` and the destroy half of `wtree land`
+# A non-zero exit is a non-blocking warning
+# A cascade runs this once per branch
+#
+# cwd = $WTREE_REPO; $WTREE_PATH is already gone
+#
+#   WTREE_HOOK         post-destroy
+#   WTREE_REPO         primary worktree root
+#   WTREE_INTERACTIVE  1 when stdout is a terminal, else 0
+#   WTREE_PATH         where the worktree was
+#   WTREE_BRANCH       removed branch
+#   WTREE_VERB         destroy | land
+#
+# To enable this hook, rename this file to "post-destroy"
+
+set -eu

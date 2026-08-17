@@ -1,0 +1,31 @@
+# wtree — 코딩 에이전트를 위한 브리핑
+
+wtree는 git worktree 위의 정책 계층이다. 저장소는 rules 파일에 브랜치 트리를 선언한다. 각 브랜치의 부모, 자식 이름의 규칙, 부모가 받아들이는 병합 방식이 거기 있다. wtree는 정책 안의 동작만 수행한다. 그래서 브랜치의 출처와 병합 목적지는 항상 정해져 있다.
+
+저장소 안에서 `wtree init`로 wtree를 사용할 수 있다.
+
+## 정책
+
+wtree의 정책은 .git/wtree/ 에 저장된다.
+- settings: 워크트리 생성 위치 등을 다룬다.
+- rules: 브랜치, 머지 규칙을 다룬다. 'wtree llm rule'로 자세한 내용 확인. 현재 적용되는 규칙은 'wtree rule'로 확인
+
+## 가능한 명령 확인
+
+subcommand 없이 `wtree`를 실행하면 현 위치에서 가능한 동작을 보여준다. 예를 들어 현재 브랜치에서 브랜치 생성을 정책이 허용하지 않는 경우, new 명령은 보이지 않는다. 부모 브랜치로의 merge에 squash만 허용되었다면 그 외의 옵션은 보이지 않는다.
+
+`wtree info`는 현재 워크트리와 동사별 미리보기를 출력한다. `wtree -h`는 전체 매뉴얼이다.
+
+## wtree 훅
+
+훅은 .git/wtree/hooks 아래의 실행 파일이다. 각 wtree 명령(new/open, merge, destroy — land는 merge와 destroy 쌍을 모두 실행) 전후로 돈다. .git/wtree/hooks 에서 sample을 확인할 수 있다. sample에서 `.sample`을 뗀 이름으로 바꾸면 켜지며, 실행 권한은 유지해야 한다.
+
+훅을 이용해 테스트, 작업 수행, 의존성 설치 등을 수행할 수 있다. 예를 들어, post-create 훅에 '지금 tmux 세션 안이라면 생성한 워크트리 위치로 새 윈도우를 열고 claude를 실행'과 같이 작성할 수 있다.
+
+## 금지되는 작업
+
+wtree 사용 시 브랜치 수명주기는 wtree로만 다뤄라. 관리되는 브랜치에 `git worktree`, `git merge`, `git branch -d`, `git switch`를 쓰지 마라. 이는 wtree가 추적하지 못하는 상태를 남긴다. 예외는 하나다. merge나 sync가 충돌을 예고하면 wtree가 이 워크트리에서 실행할 `git merge <부모>`를 메시지로 알려주며, 그 안내는 따르면 된다. 워크트리 안의 일반 작업은 자유다: 편집, 커밋, diff, log.
+
+## 다음 세션을 위한 기록
+
+이 저장소를 지속적으로 작업한다면 다음 에이전트 작업 세션을 위해 AGENTS.md 와 같은 컨텍스트 파일에 wtree를 사용하며 git의 merge/switch/branch/worktree 는 사용하지 말라는 기록을 남기는 것을 권장한다.
