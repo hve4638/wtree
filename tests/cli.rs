@@ -1623,7 +1623,7 @@ fn info_unknown_shows_reasons_and_adopt_hint() {
     assert!(stdout.contains("not a declared [branch]"), "{stdout}");
     assert!(stdout.contains("wtree adopt"), "{stdout}");
     assert!(
-        stdout.contains("allowed verbs here: open, close, list, info, rule, init, save, adopt"),
+        stdout.contains("allowed verbs here: open, close, list, info, rule, init, save, adopt, llm"),
         "{stdout}"
     );
 }
@@ -4459,4 +4459,6 @@ fn an_uninitialized_repo_is_pointed_at_init() {
     let stdout = out(&o);
     assert!(stdout.contains("no wtree policy yet"), "{stdout}");
     assert!(stdout.contains("init"), "{stdout}");
+    // The briefing explains setup, so this screen must point at it too.
+    assert!(stdout.contains("wtree llm"), "{stdout}");
 }
